@@ -27,7 +27,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
 logger = logging.getLogger(__name__)
@@ -980,11 +980,25 @@ async def qr_login(
     *,
     bot_type: str = "3",
     timeout_seconds: int = 480,
+    on_qr: Optional[Callable[[str], Awaitable[None]]] = None,
+    on_state: Optional[Callable[[str, Optional[Dict[str, Any]]], Awaitable[None]]] = None,
 ) -> Optional[Dict[str, str]]:
     """
     Run the interactive iLink QR login flow.
 
     Returns a credential dict on success, or ``None`` if login fails or times out.
+
+    Optional callbacks (when non-None) let embedders drive their own UI
+    without capturing stdout:
+      on_qr(url) fires with the scannable URL at initial display and after
+        every refresh.
+      on_state(status, payload) fires on vendor status transitions:
+        "scaned", "scaned_but_redirect" ({"redirect_host": str}),
+        "expired_refreshing" ({"refresh_count": int}),
+        "expired_final" ({"refresh_count": int}),
+        "confirmed" (credential dict),
+        "timeout" (None).
+    Behaviour is unchanged when both callbacks are None.
     """
     if not AIOHTTP_AVAILABLE:
         raise RuntimeError("aiohttp is required for Weixin QR login")
@@ -1010,6 +1024,12 @@ async def qr_login(
         # qrcode_url is the full scannable liteapp URL; qrcode_value is just the hex token
         # WeChat needs to scan the full URL, not the raw hex string
         qr_scan_data = qrcode_url if qrcode_url else qrcode_value
+
+        if on_qr is not None and qr_scan_data:
+            try:
+                await on_qr(qr_scan_data)
+            except Exception as exc:
+                logger.warning("weixin: on_qr callback raised: %s", exc)
 
         print("\n请使用微信扫描以下二维码：")
         if qrcode_url:
@@ -1049,16 +1069,36 @@ async def qr_login(
                 print(".", end="", flush=True)
             elif status == "scaned":
                 print("\n已扫码，请在微信里确认...")
+                if on_state is not None:
+                    try:
+                        await on_state("scaned", None)
+                    except Exception as exc:
+                        logger.warning("weixin: on_state callback raised: %s", exc)
             elif status == "scaned_but_redirect":
                 redirect_host = str(status_resp.get("redirect_host") or "")
                 if redirect_host:
                     current_base_url = f"https://{redirect_host}"
+                if on_state is not None:
+                    try:
+                        await on_state("scaned_but_redirect", {"redirect_host": redirect_host})
+                    except Exception as exc:
+                        logger.warning("weixin: on_state callback raised: %s", exc)
             elif status == "expired":
                 refresh_count += 1
                 if refresh_count > 3:
                     print("\n二维码多次过期，请重新执行登录。")
+                    if on_state is not None:
+                        try:
+                            await on_state("expired_final", {"refresh_count": refresh_count})
+                        except Exception as exc:
+                            logger.warning("weixin: on_state callback raised: %s", exc)
                     return None
                 print(f"\n二维码已过期，正在刷新... ({refresh_count}/3)")
+                if on_state is not None:
+                    try:
+                        await on_state("expired_refreshing", {"refresh_count": refresh_count})
+                    except Exception as exc:
+                        logger.warning("weixin: on_state callback raised: %s", exc)
                 try:
                     qr_resp = await _api_get(
                         session,
@@ -1069,6 +1109,11 @@ async def qr_login(
                     qrcode_value = str(qr_resp.get("qrcode") or "")
                     qrcode_url = str(qr_resp.get("qrcode_img_content") or "")
                     qr_scan_data = qrcode_url if qrcode_url else qrcode_value
+                    if on_qr is not None and qr_scan_data:
+                        try:
+                            await on_qr(qr_scan_data)
+                        except Exception as exc:
+                            logger.warning("weixin: on_qr callback raised: %s", exc)
                     if qrcode_url:
                         print(qrcode_url)
                     try:
@@ -1098,15 +1143,26 @@ async def qr_login(
                     user_id=user_id,
                 )
                 print(f"\n微信连接成功，account_id={account_id}")
-                return {
+                creds = {
                     "account_id": account_id,
                     "token": token,
                     "base_url": base_url,
                     "user_id": user_id,
                 }
+                if on_state is not None:
+                    try:
+                        await on_state("confirmed", creds)
+                    except Exception as exc:
+                        logger.warning("weixin: on_state callback raised: %s", exc)
+                return creds
             await asyncio.sleep(1)
 
         print("\n微信登录超时。")
+        if on_state is not None:
+            try:
+                await on_state("timeout", None)
+            except Exception as exc:
+                logger.warning("weixin: on_state callback raised: %s", exc)
         return None
 
 
