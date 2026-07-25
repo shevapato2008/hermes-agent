@@ -1570,3 +1570,483 @@ class TestApprovalTimeoutIsNotConsent:
         assert last_post.get("choice") == "timeout", (
             f"hook choice should be 'timeout' on no-response, got {last_post.get('choice')!r}"
         )
+
+
+# =========================================================================
+# Challenge-addressed approval (SmartBox) — backward compatible with FIFO
+# =========================================================================
+
+class TestChallengeAddressedApproval:
+    """Challenge-addressed approval resolution, alongside legacy FIFO.
+
+    Covers: timeout default/coercion/clamping and the shared deadline value,
+    two concurrent approvals resolved independently by challenge_id,
+    wrong/replayed challenge rejection, timeout/disconnect deny, and that
+    every existing FIFO caller (resolve_gateway_approval with no
+    challenge_id) is completely unaffected.
+    """
+
+    SESSION_KEY = "test-challenge-session"
+
+    def setup_method(self):
+        from tools import approval as mod
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+        mod._session_approved.clear()
+        mod._permanent_approved.clear()
+        mod._pending.clear()
+
+        self._saved_env = {
+            k: os.environ.get(k)
+            for k in ("HERMES_GATEWAY_SESSION", "HERMES_CRON_SESSION",
+                      "HERMES_YOLO_MODE",
+                      "HERMES_SESSION_KEY", "HERMES_INTERACTIVE")
+        }
+        os.environ.pop("HERMES_YOLO_MODE", None)
+        os.environ.pop("HERMES_INTERACTIVE", None)
+        os.environ.pop("HERMES_CRON_SESSION", None)
+        os.environ["HERMES_GATEWAY_SESSION"] = "1"
+        os.environ["HERMES_SESSION_KEY"] = self.SESSION_KEY
+
+    def teardown_method(self):
+        from tools import approval as mod
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+        for k, v in self._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # -- _ApprovalEntry.challenge_id ------------------------------------
+
+    def test_entry_generates_nonempty_challenge_id_under_128_bytes(self):
+        from tools import approval as mod
+        entry = mod._ApprovalEntry({"command": "ls"})
+        assert entry.challenge_id
+        assert isinstance(entry.challenge_id, str)
+        assert len(entry.challenge_id.encode("utf-8")) <= 128
+
+    def test_two_entries_get_distinct_challenge_ids(self):
+        from tools import approval as mod
+        a = mod._ApprovalEntry({"command": "ls"})
+        b = mod._ApprovalEntry({"command": "pwd"})
+        assert a.challenge_id != b.challenge_id
+
+    # -- timeout resolution: default / coercion / clamping --------------
+
+    def test_default_timeout_is_300_and_matches_notify_payload(self, monkeypatch):
+        from tools import approval as mod
+        monkeypatch.setattr(mod, "_get_approval_config", lambda: {})
+
+        notified = {}
+        mod.register_gateway_notify(
+            self.SESSION_KEY, lambda data: notified.update(data)
+        )
+        # Resolve immediately from another thread so the wait returns fast;
+        # we only care about the notify payload / entry bookkeeping here.
+        def _resolve_soon():
+            for _ in range(50):
+                if mod._gateway_queues.get(self.SESSION_KEY):
+                    break
+                time.sleep(0.02)
+            mod.resolve_gateway_approval(self.SESSION_KEY, "once")
+
+        threading.Thread(target=_resolve_soon).start()
+        mod._await_gateway_decision(
+            self.SESSION_KEY, mod._gateway_notify_cbs[self.SESSION_KEY],
+            {"command": "ls", "description": "d", "pattern_key": "k"},
+        )
+        assert notified["timeout_seconds"] == 300
+        assert notified["challenge_id"]
+
+    def test_invalid_timeout_coerces_to_300(self, monkeypatch):
+        from tools import approval as mod
+        monkeypatch.setattr(
+            mod, "_get_approval_config",
+            lambda: {"gateway_timeout": "not-a-number"},
+        )
+        notified = {}
+        mod.register_gateway_notify(
+            self.SESSION_KEY, lambda data: notified.update(data)
+        )
+
+        def _resolve_soon():
+            for _ in range(50):
+                if mod._gateway_queues.get(self.SESSION_KEY):
+                    break
+                time.sleep(0.02)
+            mod.resolve_gateway_approval(self.SESSION_KEY, "once")
+
+        threading.Thread(target=_resolve_soon).start()
+        mod._await_gateway_decision(
+            self.SESSION_KEY, mod._gateway_notify_cbs[self.SESSION_KEY],
+            {"command": "ls", "description": "d", "pattern_key": "k"},
+        )
+        assert notified["timeout_seconds"] == 300
+
+    def test_timeout_over_300_is_clamped_down(self, monkeypatch):
+        from tools import approval as mod
+        monkeypatch.setattr(
+            mod, "_get_approval_config",
+            lambda: {"gateway_timeout": 10_000},
+        )
+        notified = {}
+        mod.register_gateway_notify(
+            self.SESSION_KEY, lambda data: notified.update(data)
+        )
+
+        def _resolve_soon():
+            for _ in range(50):
+                if mod._gateway_queues.get(self.SESSION_KEY):
+                    break
+                time.sleep(0.02)
+            mod.resolve_gateway_approval(self.SESSION_KEY, "once")
+
+        threading.Thread(target=_resolve_soon).start()
+        mod._await_gateway_decision(
+            self.SESSION_KEY, mod._gateway_notify_cbs[self.SESSION_KEY],
+            {"command": "ls", "description": "d", "pattern_key": "k"},
+        )
+        assert notified["timeout_seconds"] == 300
+
+    def test_timeout_below_1_is_clamped_up(self, monkeypatch):
+        from tools import approval as mod
+        monkeypatch.setattr(
+            mod, "_get_approval_config",
+            lambda: {"gateway_timeout": -5},
+        )
+        notified = {}
+        mod.register_gateway_notify(
+            self.SESSION_KEY, lambda data: notified.update(data)
+        )
+
+        result_holder = {}
+        def _run():
+            result_holder["r"] = mod._await_gateway_decision(
+                self.SESSION_KEY, mod._gateway_notify_cbs[self.SESSION_KEY],
+                {"command": "ls", "description": "d", "pattern_key": "k"},
+            )
+        t = threading.Thread(target=_run)
+        t.start()
+        t.join(timeout=5)
+        assert notified["timeout_seconds"] == 1
+        assert result_holder["r"]["resolved"] is False  # timed out almost instantly
+
+    def test_notify_payload_timeout_equals_actual_wait_deadline(self, monkeypatch):
+        """The SAME resolved integer must define both the notify payload's
+        timeout_seconds and the real wait deadline -- they can never drift."""
+        from tools import approval as mod
+        monkeypatch.setattr(
+            mod, "_get_approval_config",
+            lambda: {"gateway_timeout": 1},
+        )
+        notified = {}
+        mod.register_gateway_notify(
+            self.SESSION_KEY, lambda data: notified.update(data)
+        )
+
+        start = time.monotonic()
+        result = mod._await_gateway_decision(
+            self.SESSION_KEY, mod._gateway_notify_cbs[self.SESSION_KEY],
+            {"command": "ls", "description": "d", "pattern_key": "k"},
+        )
+        elapsed = time.monotonic() - start
+
+        assert notified["timeout_seconds"] == 1
+        assert result["resolved"] is False
+        # Wait actually took ~timeout_seconds, not some unrelated value.
+        assert 0.9 <= elapsed <= 3.0
+
+    def test_notify_payload_preserves_legacy_fields(self, monkeypatch):
+        """challenge_id/timeout_seconds are ADDED to a copy -- nothing legacy
+        is dropped, and the caller's own dict is never mutated."""
+        from tools import approval as mod
+        self._force_fast(monkeypatch)
+        original = {
+            "command": "rm -rf /tmp/x",
+            "description": "dangerous deletion",
+            "pattern_key": "rm_recursive",
+            "pattern_keys": ["rm_recursive"],
+        }
+        notified = {}
+        mod.register_gateway_notify(
+            self.SESSION_KEY, lambda data: notified.update(data)
+        )
+
+        def _resolve_soon():
+            for _ in range(50):
+                if mod._gateway_queues.get(self.SESSION_KEY):
+                    break
+                time.sleep(0.02)
+            mod.resolve_gateway_approval(self.SESSION_KEY, "once")
+
+        threading.Thread(target=_resolve_soon).start()
+        mod._await_gateway_decision(
+            self.SESSION_KEY, mod._gateway_notify_cbs[self.SESSION_KEY], original,
+        )
+        for key, value in original.items():
+            assert notified[key] == value
+        # original dict passed in by the caller must be untouched.
+        assert "challenge_id" not in original
+        assert "timeout_seconds" not in original
+
+    def _force_fast(self, monkeypatch, seconds=5):
+        from tools import approval as mod
+        monkeypatch.setattr(
+            mod, "_get_approval_config",
+            lambda: {"mode": "manual", "gateway_timeout": seconds},
+        )
+
+    # -- two concurrent approvals, resolved independently by challenge --
+
+    def test_two_concurrent_approvals_resolve_independently_by_challenge(self, monkeypatch):
+        from tools import approval as mod
+        self._force_fast(monkeypatch, seconds=10)
+
+        notifications = []
+        mod.register_gateway_notify(
+            self.SESSION_KEY, lambda data: notifications.append(data)
+        )
+
+        results = {}
+
+        def _run(name, command):
+            results[name] = mod._await_gateway_decision(
+                self.SESSION_KEY, mod._gateway_notify_cbs[self.SESSION_KEY],
+                {"command": command, "description": "d", "pattern_key": "k"},
+            )
+
+        t1 = threading.Thread(target=_run, args=("first", "rm -rf a"))
+        t1.start()
+        # Wait for the first entry to be queued+notified before starting the
+        # second, so we deterministically get two distinct queued entries.
+        for _ in range(50):
+            if len(notifications) >= 1:
+                break
+            time.sleep(0.02)
+        t2 = threading.Thread(target=_run, args=("second", "rm -rf b"))
+        t2.start()
+        for _ in range(50):
+            if len(notifications) >= 2:
+                break
+            time.sleep(0.02)
+
+        assert len(notifications) == 2
+        assert mod._gateway_queues.get(self.SESSION_KEY) and len(
+            mod._gateway_queues[self.SESSION_KEY]
+        ) == 2
+
+        first_challenge = notifications[0]["challenge_id"]
+        second_challenge = notifications[1]["challenge_id"]
+        assert first_challenge != second_challenge
+
+        # Resolve the SECOND one first, by its exact challenge -- must not
+        # touch the first (proves this isn't secretly FIFO).
+        count = mod.resolve_gateway_approval(
+            self.SESSION_KEY, "once", challenge_id=second_challenge,
+        )
+        assert count == 1
+        t2.join(timeout=5)
+        assert results["second"]["resolved"] is True
+        assert results["second"]["choice"] == "once"
+        assert "r" not in results.get("first", {})  # first still pending
+
+        count = mod.resolve_gateway_approval(
+            self.SESSION_KEY, "deny", challenge_id=first_challenge,
+        )
+        assert count == 1
+        t1.join(timeout=5)
+        assert results["first"]["resolved"] is True
+        assert results["first"]["choice"] == "deny"
+
+    # -- wrong / replayed challenge is rejected --------------------------
+
+    def test_wrong_challenge_id_resolves_nothing(self, monkeypatch):
+        from tools import approval as mod
+        self._force_fast(monkeypatch, seconds=2)
+
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: None)
+
+        result_holder = {}
+        def _run():
+            result_holder["r"] = mod._await_gateway_decision(
+                self.SESSION_KEY, mod._gateway_notify_cbs[self.SESSION_KEY],
+                {"command": "ls", "description": "d", "pattern_key": "k"},
+            )
+        t = threading.Thread(target=_run)
+        t.start()
+
+        for _ in range(50):
+            if mod._gateway_queues.get(self.SESSION_KEY):
+                break
+            time.sleep(0.02)
+
+        count = mod.resolve_gateway_approval(
+            self.SESSION_KEY, "once", challenge_id="not-the-real-challenge",
+        )
+        assert count == 0
+        # The real entry is still pending -- untouched by the bad challenge.
+        assert mod._gateway_queues.get(self.SESSION_KEY)
+
+        t.join(timeout=5)
+        assert result_holder["r"]["resolved"] is False  # timed out, never resolved
+
+    def test_replayed_challenge_id_resolves_nothing_second_time(self, monkeypatch):
+        from tools import approval as mod
+        self._force_fast(monkeypatch, seconds=5)
+
+        notified = {}
+        mod.register_gateway_notify(
+            self.SESSION_KEY, lambda data: notified.update(data)
+        )
+
+        result_holder = {}
+        def _run():
+            result_holder["r"] = mod._await_gateway_decision(
+                self.SESSION_KEY, mod._gateway_notify_cbs[self.SESSION_KEY],
+                {"command": "ls", "description": "d", "pattern_key": "k"},
+            )
+        t = threading.Thread(target=_run)
+        t.start()
+        for _ in range(50):
+            if notified:
+                break
+            time.sleep(0.02)
+        challenge_id = notified["challenge_id"]
+
+        first_count = mod.resolve_gateway_approval(
+            self.SESSION_KEY, "once", challenge_id=challenge_id,
+        )
+        assert first_count == 1
+        t.join(timeout=5)
+        assert result_holder["r"]["choice"] == "once"
+
+        # Replay of the SAME challenge_id after it already resolved: no
+        # matching entry left in the queue -> resolves nothing.
+        replay_count = mod.resolve_gateway_approval(
+            self.SESSION_KEY, "once", challenge_id=challenge_id,
+        )
+        assert replay_count == 0
+
+    # -- timeout / disconnect deny ---------------------------------------
+
+    def test_timeout_produces_deny_shaped_outcome(self, monkeypatch):
+        from tools import approval as mod
+        self._force_fast(monkeypatch, seconds=1)
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: None)
+
+        result = mod._await_gateway_decision(
+            self.SESSION_KEY, mod._gateway_notify_cbs[self.SESSION_KEY],
+            {"command": "ls", "description": "d", "pattern_key": "k"},
+        )
+        assert result["resolved"] is False
+        assert result["choice"] is None
+
+    def test_disconnect_via_unregister_denies_pending_challenge(self, monkeypatch):
+        """Simulates SmartBox's UDS connection dropping mid-approval: the
+        adapter (or unregister_gateway_notify on full session teardown) must
+        unblock the waiting thread with a deny-shaped outcome, not a hang."""
+        from tools import approval as mod
+        self._force_fast(monkeypatch, seconds=30)
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: None)
+
+        result_holder = {}
+        def _run():
+            result_holder["r"] = mod._await_gateway_decision(
+                self.SESSION_KEY, mod._gateway_notify_cbs[self.SESSION_KEY],
+                {"command": "ls", "description": "d", "pattern_key": "k"},
+            )
+        t = threading.Thread(target=_run)
+        t.start()
+        for _ in range(50):
+            if mod._gateway_queues.get(self.SESSION_KEY):
+                break
+            time.sleep(0.02)
+
+        # "Disconnect": explicitly deny by exact challenge, mirroring what
+        # the SmartBox adapter's connection-lost handler does.
+        challenge_id = mod._gateway_queues[self.SESSION_KEY][0].challenge_id
+        count = mod.resolve_gateway_approval(
+            self.SESSION_KEY, "deny", challenge_id=challenge_id,
+        )
+        assert count == 1
+        t.join(timeout=5)
+        assert result_holder["r"]["resolved"] is True
+        assert result_holder["r"]["choice"] == "deny"
+
+    # -- legacy FIFO callers are completely unaffected --------------------
+
+    def test_legacy_resolve_without_challenge_id_still_fifo(self, monkeypatch):
+        from tools import approval as mod
+        self._force_fast(monkeypatch, seconds=10)
+
+        notifications = []
+        mod.register_gateway_notify(
+            self.SESSION_KEY, lambda data: notifications.append(data)
+        )
+        results = {}
+
+        def _run(name, command):
+            results[name] = mod._await_gateway_decision(
+                self.SESSION_KEY, mod._gateway_notify_cbs[self.SESSION_KEY],
+                {"command": command, "description": "d", "pattern_key": "k"},
+            )
+
+        t1 = threading.Thread(target=_run, args=("first", "cmd-a"))
+        t1.start()
+        for _ in range(50):
+            if len(notifications) >= 1:
+                break
+            time.sleep(0.02)
+        t2 = threading.Thread(target=_run, args=("second", "cmd-b"))
+        t2.start()
+        for _ in range(50):
+            if len(notifications) >= 2:
+                break
+            time.sleep(0.02)
+
+        # Legacy call: no challenge_id at all -- resolves the OLDEST (FIFO).
+        count = mod.resolve_gateway_approval(self.SESSION_KEY, "once")
+        assert count == 1
+        t1.join(timeout=5)
+        assert results["first"]["resolved"] is True
+        assert results["first"]["choice"] == "once"
+
+        mod.resolve_gateway_approval(self.SESSION_KEY, "deny")
+        t2.join(timeout=5)
+        assert results["second"]["resolved"] is True
+        assert results["second"]["choice"] == "deny"
+
+    def test_resolve_all_still_works_without_challenge_id(self, monkeypatch):
+        from tools import approval as mod
+        self._force_fast(monkeypatch, seconds=10)
+        notifications = []
+        mod.register_gateway_notify(
+            self.SESSION_KEY, lambda data: notifications.append(data)
+        )
+        results = {}
+
+        def _run(name, command):
+            results[name] = mod._await_gateway_decision(
+                self.SESSION_KEY, mod._gateway_notify_cbs[self.SESSION_KEY],
+                {"command": command, "description": "d", "pattern_key": "k"},
+            )
+
+        threads = [
+            threading.Thread(target=_run, args=(f"t{i}", f"cmd-{i}"))
+            for i in range(3)
+        ]
+        for t in threads:
+            t.start()
+        for _ in range(100):
+            if len(notifications) >= 3:
+                break
+            time.sleep(0.02)
+
+        count = mod.resolve_gateway_approval(self.SESSION_KEY, "once", resolve_all=True)
+        assert count == 3
+        for t in threads:
+            t.join(timeout=5)
+        for i in range(3):
+            assert results[f"t{i}"]["choice"] == "once"

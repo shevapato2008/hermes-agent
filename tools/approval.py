@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import unicodedata
+import uuid
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -579,12 +580,17 @@ _permanent_approved: set = set()
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result")
+    __slots__ = ("event", "data", "result", "challenge_id")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
         self.data = data          # command, description, pattern_keys, …
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
+        # Generated once per entry so a challenge-addressed client (e.g.
+        # SmartBox's local voice adapter) can resolve THIS exact pending
+        # approval instead of relying on FIFO order. uuid4 hex is 32 bytes —
+        # non-empty and well under the 128-byte cap.
+        self.challenge_id: str = uuid.uuid4().hex
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
@@ -617,21 +623,39 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
-                             resolve_all: bool = False) -> int:
+                             resolve_all: bool = False,
+                             challenge_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
-    When *resolve_all* is True every pending approval in the session is
-    resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    When *challenge_id* is given, resolves ONLY the pending entry whose
+    generated challenge_id matches exactly — SmartBox's challenge-addressed
+    flow — and *resolve_all* is ignored in that case. An unknown or replayed
+    challenge_id (wrong session, stale/duplicate client message, already
+    resolved) matches nothing and resolves 0 entries; it never falls back to
+    FIFO, so a bad challenge can never resolve the *wrong* pending request.
 
-    Returns the number of approvals resolved (0 means nothing was pending).
+    When *challenge_id* is None (the default — every existing FIFO caller:
+    Telegram inline buttons, Matrix reactions, Slack/Feishu buttons, the
+    ``/approve``/``/approve all``/``/deny`` text commands), behavior is
+    unchanged: *resolve_all* True resolves every pending approval in the
+    session at once (``/approve all``); otherwise only the oldest one is
+    resolved (FIFO).
+
+    Returns the number of approvals resolved (0 means nothing was pending,
+    or — for a challenge_id lookup — nothing matched).
     """
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
+        if challenge_id is not None:
+            targets = [e for e in queue if e.challenge_id == challenge_id]
+            if not targets:
+                return 0
+            for entry in targets:
+                queue.remove(entry)
+        elif resolve_all:
             targets = list(queue)
             queue.clear()
         else:
@@ -1132,6 +1156,24 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     the execute_code guard (``check_execute_code_guard``) so the fiddly
     heartbeat-polling wait loop lives in one place.
 
+    Before the entry is enqueued or the user is notified, the configured
+    gateway approval timeout is resolved exactly ONCE: invalid config values
+    coerce to the 300s default, and the result is always clamped to
+    ``[1, 300]``. That single resolved integer is used both for the
+    notify_cb payload's ``timeout_seconds`` and to define the wait deadline
+    below, so the two can never drift apart — a challenge-addressed client
+    (SmartBox) can render/enforce a countdown that matches the gateway's
+    actual wait exactly.
+
+    ``notify_cb`` receives a COPY of *approval_data* augmented with the
+    generated ``challenge_id`` (see ``_ApprovalEntry``) and the resolved
+    ``timeout_seconds`` — every legacy field (``command``, ``description``,
+    ``pattern_key``, ``pattern_keys``, …) is preserved untouched, and the
+    caller's own *approval_data* dict is never mutated. Existing FIFO-style
+    notify_cb implementations (Telegram/Matrix/Slack/Feishu button prompts,
+    the plain-text fallback) simply ignore the two new keys and keep working
+    byte-for-byte; only capability-aware callbacks read them.
+
     Returns ``{"resolved": bool, "choice": str|None}`` on completion, or
     ``{"resolved": False, "choice": None, "notify_failed": True}`` if the
     notify callback raised.  Persistence of an approved choice and building
@@ -1141,6 +1183,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
+
+    # Resolve the gateway approval timeout ONCE, before the entry is queued
+    # or the user is notified. Invalid config coerces to 300s; the result is
+    # always clamped to [1, 300] regardless of what config.yaml contains.
+    _raw_timeout = _get_approval_config().get("gateway_timeout", 300)
+    try:
+        timeout = int(_raw_timeout)
+    except (ValueError, TypeError):
+        timeout = 300
+    timeout = max(1, min(300, timeout))
 
     entry = _ApprovalEntry(approval_data)
     with _lock:
@@ -1166,31 +1218,30 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
     )
 
-    # Notify the user (bridges sync agent thread → async gateway)
+    # Notify the user (bridges sync agent thread → async gateway). See the
+    # docstring above — notify_payload is a copy, never the original dict.
+    notify_payload = dict(approval_data)
+    notify_payload["challenge_id"] = entry.challenge_id
+    notify_payload["timeout_seconds"] = timeout
     try:
-        notify_cb(approval_data)
+        notify_cb(notify_payload)
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()
         return {"resolved": False, "choice": None, "notify_failed": True}
 
-    # Block until the user responds or timeout (default 5 min). Poll in short
-    # slices so we can fire activity heartbeats every ~10s to the agent's
-    # inactivity tracker — otherwise the gateway watchdog kills the agent
-    # while the user is still responding. Mirrors _wait_for_process() cadence.
-    timeout = _get_approval_config().get("gateway_timeout", 300)
-    try:
-        timeout = int(timeout)
-    except (ValueError, TypeError):
-        timeout = 300
-
+    # Block until the user responds or timeout (resolved above, default 5
+    # min). Poll in short slices so we can fire activity heartbeats every
+    # ~10s to the agent's inactivity tracker — otherwise the gateway
+    # watchdog kills the agent while the user is still responding. Mirrors
+    # _wait_for_process() cadence.
     try:
         from tools.environments.base import touch_activity_if_due
     except Exception:  # pragma: no cover
         touch_activity_if_due = None
 
     _now = time.monotonic()
-    _deadline = _now + max(timeout, 0)
+    _deadline = _now + timeout
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
     while True:

@@ -54,6 +54,23 @@ def _hash_chat_id(value: str) -> str:
     return _hash_id(value)
 
 
+def session_revision(session_key: str, current_session_id: str) -> str:
+    """Return a short, stable revision fingerprint for a gateway session.
+
+    ``sha256(session_key + NUL + current_session_id)[:24]`` (first 24 hex
+    characters of the digest — same truncation convention as ``_hash_id``
+    above). Pure function of its two inputs: no I/O, no cache, no second
+    session store. It changes if and only if the authoritative gateway
+    session id changes (e.g. ``/new``, ``/reset``, a fresh
+    ``SessionStore.get_or_create_session`` id) — a client (e.g. SmartBox's
+    local voice adapter) can use it to detect "the gateway session under me
+    was reset" without polling ``SessionEntry`` internals or maintaining its
+    own duplicate session table.
+    """
+    payload = f"{session_key}\x00{current_session_id}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:24]
+
+
 from .config import (
     Platform,
     GatewayConfig,

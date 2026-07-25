@@ -1188,6 +1188,118 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _dispatch_exec_approval(
+    adapter,
+    approval_data: dict,
+    *,
+    chat_id: str,
+    session_key: str,
+    metadata: Optional[dict],
+    loop,
+) -> None:
+    """Capability-dispatch an exec-approval notification to *adapter*.
+
+    Extracted as a standalone, unit-testable function so the single
+    per-session ``_approval_notify_sync`` callback (registered once via
+    ``register_gateway_notify`` inside the agent-turn method below) stays
+    the ONE owner of exec-approval delivery — this is not a second callback,
+    just the dispatch logic pulled out of that closure for testability.
+
+    Capability dispatch:
+      * If the adapter CLASS implements ``send_exec_approval_event`` (the
+        typed, challenge-addressed capability — currently only SmartBox's
+        local voice adapter), build ``ApprovalRequired.from_notification``
+        and schedule that coroutine on *loop*. This path is used INSTEAD of
+        the legacy path below, not as a fallback from it.
+      * Otherwise, run the legacy ``send_exec_approval`` (button UX) /
+        plain-text fallback path byte-for-byte, exactly as before this
+        capability existed.
+
+    Checks the *class* for each method, not the instance — avoids false
+    positives from MagicMock auto-attribute creation in tests (mirrors the
+    existing ``send_exec_approval`` capability check this extends).
+    """
+    if getattr(type(adapter), "send_exec_approval_event", None) is not None:
+        from gateway.stream_events import ApprovalRequired
+
+        approval_obj = ApprovalRequired.from_notification(approval_data)
+        fut = safe_schedule_threadsafe(
+            adapter.send_exec_approval_event(
+                chat_id=chat_id,
+                approval=approval_obj,
+                session_key=session_key,
+                metadata=metadata,
+            ),
+            loop,
+            logger=logger,
+            log_message="send_exec_approval_event scheduling error",
+        )
+        if fut is None:
+            raise RuntimeError("send_exec_approval_event: loop unavailable")
+        fut.result(timeout=15)
+        return
+
+    # ---- Legacy path (byte-for-byte unchanged) -----------------------
+    cmd = approval_data.get("command", "")
+    desc = approval_data.get("description", "dangerous command")
+
+    # Prefer button-based approval when the adapter supports it.
+    # Check the *class* for the method, not the instance — avoids false
+    # positives from MagicMock auto-attribute creation in tests.
+    if getattr(type(adapter), "send_exec_approval", None) is not None:
+        try:
+            _approval_fut = safe_schedule_threadsafe(
+                adapter.send_exec_approval(
+                    chat_id=chat_id,
+                    command=cmd,
+                    session_key=session_key,
+                    description=desc,
+                    metadata=metadata,
+                ),
+                loop,
+                logger=logger,
+                log_message="send_exec_approval scheduling error",
+            )
+            if _approval_fut is None:
+                raise RuntimeError("send_exec_approval: loop unavailable")
+            _approval_result = _approval_fut.result(timeout=15)
+            if _approval_result.success:
+                return
+            logger.warning(
+                "Button-based approval failed (send returned error), falling back to text: %s",
+                _approval_result.error,
+            )
+        except Exception as _e:
+            logger.warning(
+                "Button-based approval failed, falling back to text: %s", _e
+            )
+
+    # Fallback: plain text approval prompt
+    cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
+    msg = (
+        f"⚠️ **Dangerous command requires approval:**\n"
+        f"```\n{cmd_preview}\n```\n"
+        f"Reason: {desc}\n\n"
+        f"Reply `/approve` to execute, `/approve session` to approve this pattern "
+        f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
+    )
+    try:
+        _approval_send_fut = safe_schedule_threadsafe(
+            adapter.send(
+                chat_id,
+                msg,
+                metadata=metadata,
+            ),
+            loop,
+            logger=logger,
+            log_message="Approval text-send scheduling error",
+        )
+        if _approval_send_fut is not None:
+            _approval_send_fut.result(timeout=15)
+    except Exception as _e:
+        logger.error("Failed to send approval request: %s", _e)
+
+
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
@@ -6075,6 +6187,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Yuanbao: websockets not installed. Run: pip install websockets")
                 return None
             return YuanbaoAdapter(config)
+
+        elif platform == Platform.SMARTBOX_VOICE:
+            from gateway.platforms.smartbox_voice import (
+                SmartBoxVoiceAdapter,
+                check_smartbox_voice_requirements,
+            )
+            if not check_smartbox_voice_requirements():
+                logger.warning("SmartBox voice: requirements not met")
+                return None
+            return SmartBoxVoiceAdapter(config)
 
         return None
 
@@ -13869,10 +13991,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _approval_notify_sync(approval_data: dict) -> None:
                 """Send the approval request to the user from the agent thread.
 
-                If the adapter supports interactive button-based approvals
-                (e.g. Discord's ``send_exec_approval``), use that for a richer
-                UX.  Otherwise fall back to a plain text message with
-                ``/approve`` instructions.
+                Single per-session callback owner (registered below via
+                ``register_gateway_notify``). Capability dispatch — see
+                ``_dispatch_exec_approval`` at module scope: if the adapter
+                implements the typed ``send_exec_approval_event`` capability
+                (currently SmartBox's local voice adapter), that is used
+                with the typed, challenge-addressed ``ApprovalRequired``
+                object. Otherwise this runs the legacy interactive
+                button-based approval (e.g. Discord's ``send_exec_approval``)
+                falling back to a plain text message with ``/approve``
+                instructions — byte-for-byte identical to before this
+                capability existed.
                 """
                 # Pause the typing indicator while the agent waits for
                 # user approval.  Critical for Slack's Assistant API where
@@ -13883,64 +14012,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Typing resumes in _handle_approve_command/_handle_deny_command.
                 _status_adapter.pause_typing_for_chat(_status_chat_id)
 
-                cmd = approval_data.get("command", "")
-                desc = approval_data.get("description", "dangerous command")
-
-                # Prefer button-based approval when the adapter supports it.
-                # Check the *class* for the method, not the instance — avoids
-                # false positives from MagicMock auto-attribute creation in tests.
-                if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
-                    try:
-                        _approval_fut = safe_schedule_threadsafe(
-                            _status_adapter.send_exec_approval(
-                                chat_id=_status_chat_id,
-                                command=cmd,
-                                session_key=_approval_session_key,
-                                description=desc,
-                                metadata=_status_thread_metadata,
-                            ),
-                            _loop_for_step,
-                            logger=logger,
-                            log_message="send_exec_approval scheduling error",
-                        )
-                        if _approval_fut is None:
-                            raise RuntimeError("send_exec_approval: loop unavailable")
-                        _approval_result = _approval_fut.result(timeout=15)
-                        if _approval_result.success:
-                            return
-                        logger.warning(
-                            "Button-based approval failed (send returned error), falling back to text: %s",
-                            _approval_result.error,
-                        )
-                    except Exception as _e:
-                        logger.warning(
-                            "Button-based approval failed, falling back to text: %s", _e
-                        )
-
-                # Fallback: plain text approval prompt
-                cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
-                msg = (
-                    f"⚠️ **Dangerous command requires approval:**\n"
-                    f"```\n{cmd_preview}\n```\n"
-                    f"Reason: {desc}\n\n"
-                    f"Reply `/approve` to execute, `/approve session` to approve this pattern "
-                    f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
+                _dispatch_exec_approval(
+                    _status_adapter,
+                    approval_data,
+                    chat_id=_status_chat_id,
+                    session_key=_approval_session_key,
+                    metadata=_status_thread_metadata,
+                    loop=_loop_for_step,
                 )
-                try:
-                    _approval_send_fut = safe_schedule_threadsafe(
-                        _status_adapter.send(
-                            _status_chat_id,
-                            msg,
-                            metadata=_status_thread_metadata,
-                        ),
-                        _loop_for_step,
-                        logger=logger,
-                        log_message="Approval text-send scheduling error",
-                    )
-                    if _approval_send_fut is not None:
-                        _approval_send_fut.result(timeout=15)
-                except Exception as _e:
-                    logger.error("Failed to send approval request: %s", _e)
 
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})

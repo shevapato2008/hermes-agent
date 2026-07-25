@@ -127,6 +127,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    SMARTBOX_VOICE = "smartbox_voice"
     @classmethod
     def _missing_(cls, value):
         """Accept unknown platform names only for known plugin adapters.
@@ -452,6 +453,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
         (cfg.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID"))
         and (cfg.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET"))
     ),
+    # Local UDS transport -- "configured" as soon as a socket path is known
+    # (defaulted by the adapter itself if unset), no external credentials.
+    Platform.SMARTBOX_VOICE: lambda cfg: True,
 }
 
 
@@ -1772,6 +1776,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             name=os.getenv("BLUEBUBBLES_HOME_CHANNEL_NAME", "Home"),
             thread_id=os.getenv("BLUEBUBBLES_HOME_CHANNEL_THREAD_ID") or None,
         )
+
+    # SmartBox voice assistant (local UDS platform adapter)
+    if os.getenv("SMARTBOX_VOICE_ENABLED", "").lower() in {"true", "1", "yes"}:
+        if Platform.SMARTBOX_VOICE not in config.platforms:
+            config.platforms[Platform.SMARTBOX_VOICE] = PlatformConfig()
+        config.platforms[Platform.SMARTBOX_VOICE].enabled = True
+        smartbox_socket_path = os.getenv("SMARTBOX_VOICE_SOCKET_PATH")
+        if smartbox_socket_path:
+            config.platforms[Platform.SMARTBOX_VOICE].extra["socket_path"] = smartbox_socket_path
+        smartbox_jsonl_path = os.getenv("SMARTBOX_VOICE_JSONL_PATH")
+        if smartbox_jsonl_path:
+            config.platforms[Platform.SMARTBOX_VOICE].extra["jsonl_path"] = smartbox_jsonl_path
 
     # QQ (Official Bot API v2)
     qq_app_id = os.getenv("QQ_APP_ID")
