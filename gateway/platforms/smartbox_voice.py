@@ -76,6 +76,29 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
         self._pending_challenges: Dict[str, Set[str]] = {}
         self._chat_id = "smartbox-voice"
 
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        """The owner-only (0600) UDS is this adapter's access gate.
+
+        ``bind_unix_socket`` chmods the socket to 0600 at bind and
+        ``assert_uds_permissions`` (called right after, in :meth:`connect`)
+        re-asserts it — so only a process running as the same OS user on the
+        same machine can ever connect and send a frame. That is access
+        control enforced before any message reaches the gateway: the local,
+        filesystem-permission analogue of how WhatsApp/WeCom gate DMs via
+        ``dm_policy``/``allow_from``.
+
+        Without this flag, a SmartBox box with no env allowlists set (the
+        normal local-appliance configuration) would hit the gateway's
+        ``GATEWAY_ALLOW_ALL_USERS`` default-deny — denying the device
+        owner's own voice turns unless an operator sets that flag globally,
+        which would open every configured platform, not just this one.
+        Declaring the flag is both a correctness fix (the local box works
+        out of the box) and a security improvement (no global allow-all
+        hammer required).
+        """
+        return True
+
     # ------------------------------------------------------------------
     # BasePlatformAdapter lifecycle
     # ------------------------------------------------------------------

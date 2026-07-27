@@ -307,3 +307,57 @@ def test_unauthorized_dm_behavior_open_policy_keeps_default(monkeypatch):
 
     # No allowlist + no restrictive policy → open-gateway pairing default.
     assert runner._get_unauthorized_dm_behavior(Platform.WECOM) == "pair"
+
+
+# ---------------------------------------------------------------------------
+# Layer 4: SmartBoxVoiceAdapter — owner-only UDS is the intake gate
+# ---------------------------------------------------------------------------
+#
+# Unlike WeCom/Weixin/Yuanbao/QQBot/WhatsApp, SmartBox has no config-driven
+# dm_policy/allow_from surface at all — its access gate is the Unix Domain
+# Socket's owner-only (0600) filesystem permissions, asserted at bind time
+# (see gateway/smartbox_voice_protocol.py). Only a same-OS-user process can
+# ever connect, so a message that reaches the gateway from this adapter has,
+# by definition, already been gated. It declares
+# ``enforces_own_access_policy = True`` for the same reason the config-policy
+# adapters do: without it, a SmartBox box with no env allowlists set (the
+# normal local-appliance config) would hit GATEWAY_ALLOW_ALL_USERS
+# default-deny and lock out the device owner's own voice turns.
+
+
+def test_smartbox_voice_adapter_declares_the_flag():
+    """SmartBoxVoiceAdapter overrides the flag to True, unlike the base default."""
+    from gateway.platforms.base import BasePlatformAdapter
+    from gateway.platforms.smartbox_voice import SmartBoxVoiceAdapter
+
+    assert BasePlatformAdapter.enforces_own_access_policy.fget(object()) is False
+    value = SmartBoxVoiceAdapter.enforces_own_access_policy.fget(
+        object.__new__(SmartBoxVoiceAdapter)
+    )
+    assert value is True
+
+
+def test_smartbox_voice_authorized_without_env_allowlist(monkeypatch):
+    """No env allowlists + GATEWAY_ALLOW_ALL_USERS unset → still authorized.
+
+    The UDS's owner-only permissions already gated this message before it
+    reached the gateway, so the flag must flip the default-deny to allow.
+    """
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(platforms={Platform.SMARTBOX_VOICE: PlatformConfig(enabled=True)})
+    runner, _adapter = _make_runner(Platform.SMARTBOX_VOICE, config, enforces=True)
+
+    assert runner._is_user_authorized(_source(Platform.SMARTBOX_VOICE)) is True
+
+
+def test_smartbox_voice_without_flag_would_default_deny(monkeypatch):
+    """Contrast: the SAME source, on an adapter without the flag, is denied.
+
+    Proves the flag itself — not some other property of the platform — is
+    what flips ``_is_user_authorized`` from default-deny to allow.
+    """
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(platforms={Platform.SMARTBOX_VOICE: PlatformConfig(enabled=True)})
+    runner, _adapter = _make_runner(Platform.SMARTBOX_VOICE, config, enforces=False)
+
+    assert runner._is_user_authorized(_source(Platform.SMARTBOX_VOICE)) is False
