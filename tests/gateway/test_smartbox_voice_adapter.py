@@ -126,6 +126,31 @@ class TestSend:
         assert record["text"] == "hello there"
         assert record["chat_id"] == "chat-1"
         assert record["seq"] == 0
+        assert record["turn_final"] is True
+
+    @pytest.mark.asyncio
+    async def test_consumer_owned_send_writes_block_and_turn_identity(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        result = await adapter.send(
+            "chat-1",
+            "tool preamble",
+            reply_to="legacy-reply",
+            metadata={
+                "_gateway_stream": {
+                    "reply_to": "turn-123",
+                    "draft_id": 7,
+                    "turn_final": False,
+                },
+            },
+        )
+        assert result.success is True
+
+        record = json.loads(
+            open(adapter.jsonl_path, encoding="utf-8").read().splitlines()[0]
+        )
+        assert record["reply_to"] == "turn-123"
+        assert record["draft_id"] == 7
+        assert record["turn_final"] is False
 
     @pytest.mark.asyncio
     async def test_send_sequence_increments_per_chat(self, tmp_path):
@@ -135,6 +160,47 @@ class TestSend:
         lines = open(adapter.jsonl_path, encoding="utf-8").read().splitlines()
         seqs = [json.loads(l)["seq"] for l in lines]
         assert seqs == [0, 1]
+
+
+class TestDraftSend:
+    def test_smartbox_opts_into_native_draft_streaming(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        assert adapter.supports_draft_streaming(chat_type="dm") is True
+
+    @pytest.mark.asyncio
+    async def test_send_draft_writes_cumulative_turn_addressed_record(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        metadata = {
+            "_gateway_stream": {
+                "reply_to": "turn-123",
+                "draft_id": 7,
+                "turn_final": False,
+            },
+        }
+
+        first = await adapter.send_draft(
+            chat_id="chat-1", draft_id=7, content="Hello", metadata=metadata,
+        )
+        second = await adapter.send_draft(
+            chat_id="chat-1", draft_id=7, content="Hello world", metadata=metadata,
+        )
+
+        assert first.success is True
+        assert second.success is True
+        records = [
+            json.loads(line)
+            for line in open(adapter.jsonl_path, encoding="utf-8").read().splitlines()
+        ]
+        assert [record["type"] for record in records] == [
+            "message_draft", "message_draft",
+        ]
+        assert [record["reply_to"] for record in records] == [
+            "turn-123", "turn-123",
+        ]
+        assert [record["draft_id"] for record in records] == [7, 7]
+        assert [record["text"] for record in records] == ["Hello", "Hello world"]
+        assert [record["seq"] for record in records] == [0, 1]
+        assert all(isinstance(record["ts"], float) for record in records)
 
     @pytest.mark.asyncio
     async def test_get_chat_info_returns_dm_shape(self, tmp_path):

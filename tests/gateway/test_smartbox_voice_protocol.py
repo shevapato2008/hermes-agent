@@ -88,8 +88,13 @@ class TestUdsPermissions:
 # ── Protocol version handshake ───────────────────────────────────────────────
 
 class TestProtocolVersion:
-    def test_matching_version_is_accepted(self):
-        assert_protocol_version(PROTOCOL_VERSION)  # must not raise
+    def test_version_two_is_accepted(self):
+        assert PROTOCOL_VERSION == 2
+        assert_protocol_version(2)  # must not raise
+
+    def test_version_one_is_rejected(self):
+        with pytest.raises(ProtocolVersionError):
+            assert_protocol_version(1)
 
     def test_mismatched_version_is_rejected(self):
         with pytest.raises(ProtocolVersionError):

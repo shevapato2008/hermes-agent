@@ -88,7 +88,7 @@ def assert_uds_permissions(sock_path: str) -> None:
 # Bump on any wire-incompatible change to frame shapes below. A mismatched
 # client is rejected at handshake rather than allowed to send frames the
 # gateway may misinterpret.
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 class ProtocolVersionError(Exception):

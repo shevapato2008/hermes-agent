@@ -1937,10 +1937,14 @@ class BasePlatformAdapter(ABC):
         ``draft_id`` values within the same chat to avoid animating over a
         prior bubble.
 
-        Drafts have no message_id and cannot be edited, replied to, or
-        deleted via normal message APIs.  When the response finishes, the
-        caller delivers the final answer as a regular ``send`` and the
-        draft preview clears naturally on the client.
+        Drafts have no message_id and cannot be edited or deleted via normal
+        message APIs.  The optional metadata may carry the reserved internal
+        ``_gateway_stream`` context (originating ``reply_to``, current
+        ``draft_id``, and ``turn_final``) for transports that need to address
+        a draft to its source turn without expanding this method's positional
+        contract.  When the response finishes, the caller delivers the final
+        answer as a regular ``send`` and the draft preview clears naturally on
+        the client.
 
         Default implementation raises NotImplementedError; adapters that
         also return True from :meth:`supports_draft_streaming` must override.

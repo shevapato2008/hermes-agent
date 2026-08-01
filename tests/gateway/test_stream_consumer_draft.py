@@ -161,6 +161,47 @@ class TestDraftStreamingHappyPath:
         assert sent_content == "Hello world!"
 
     @pytest.mark.asyncio
+    async def test_draft_and_terminal_send_carry_namespaced_stream_identity(self):
+        adapter = _make_draft_capable_adapter()
+        original_metadata = {"existing": "preserved"}
+        cfg = StreamConsumerConfig(
+            transport="auto", chat_type="dm",
+            edit_interval=0.01, buffer_threshold=5, cursor="",
+        )
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            cfg,
+            metadata=original_metadata,
+            initial_reply_to_id="turn-123",
+        )
+
+        consumer.on_delta("Hello world!")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await task
+
+        assert adapter.draft_calls
+        draft_call = adapter.draft_calls[-1]
+        draft_id = draft_call["draft_id"]
+        assert draft_call["metadata"] == {
+            "existing": "preserved",
+            "_gateway_stream": {
+                "reply_to": "turn-123",
+                "draft_id": draft_id,
+                "turn_final": False,
+            },
+        }
+        terminal_metadata = adapter.send.await_args.kwargs["metadata"]
+        assert terminal_metadata["_gateway_stream"] == {
+            "reply_to": "turn-123",
+            "draft_id": draft_id,
+            "turn_final": True,
+        }
+        assert original_metadata == {"existing": "preserved"}
+
+    @pytest.mark.asyncio
     async def test_group_chat_skips_draft_path(self):
         adapter = _make_draft_capable_adapter()
         cfg = StreamConsumerConfig(
@@ -271,21 +312,36 @@ class TestDraftIdLifecycle:
 
         # Pre-tool and post-tool segments must use different draft_ids.
         draft_ids = [c["draft_id"] for c in adapter.draft_calls]
-        if len(draft_ids) >= 2:
-            # Find pre-tool and post-tool calls by content
-            pre_ids = {
-                c["draft_id"] for c in adapter.draft_calls
-                if "Pre-tool" in c["content"] and "Post-tool" not in c["content"]
-            }
-            post_ids = {
-                c["draft_id"] for c in adapter.draft_calls
-                if "Post-tool" in c["content"]
-            }
-            if pre_ids and post_ids:
-                assert pre_ids.isdisjoint(post_ids), (
-                    f"pre-tool and post-tool segments must use distinct "
-                    f"draft_ids; got pre={pre_ids} post={post_ids}"
-                )
+        assert len(draft_ids) >= 2
+        # Find pre-tool and post-tool calls by content
+        pre_ids = {
+            c["draft_id"] for c in adapter.draft_calls
+            if "Pre-tool" in c["content"] and "Post-tool" not in c["content"]
+        }
+        post_ids = {
+            c["draft_id"] for c in adapter.draft_calls
+            if "Post-tool" in c["content"]
+        }
+        assert pre_ids and post_ids
+        assert pre_ids.isdisjoint(post_ids), (
+            f"pre-tool and post-tool segments must use distinct "
+            f"draft_ids; got pre={pre_ids} post={post_ids}"
+        )
+
+        sends = adapter.send.await_args_list
+        assert len(sends) == 2
+        pre_close = sends[0].kwargs["metadata"]["_gateway_stream"]
+        final_close = sends[1].kwargs["metadata"]["_gateway_stream"]
+        assert pre_close == {
+            "reply_to": None,
+            "draft_id": next(iter(pre_ids)),
+            "turn_final": False,
+        }
+        assert final_close == {
+            "reply_to": None,
+            "draft_id": next(iter(post_ids)),
+            "turn_final": True,
+        }
 
 
 class TestAlreadySentInDraftMode:

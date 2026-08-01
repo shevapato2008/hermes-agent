@@ -252,6 +252,16 @@ class GatewayStreamConsumer:
         except Exception:
             logger.debug("on_new_message callback error", exc_info=True)
 
+    def _delivery_metadata(self, *, is_turn_final: bool) -> dict:
+        """Copy delivery metadata and attach this consumer's stream identity."""
+        metadata = dict(self.metadata) if self.metadata else {}
+        metadata["_gateway_stream"] = {
+            "reply_to": self._initial_reply_to_id,
+            "draft_id": self._draft_id,
+            "turn_final": is_turn_final,
+        }
+        return metadata
+
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
@@ -494,8 +504,12 @@ class GatewayStreamConsumer:
                         )
                         chunks_delivered = False
                         reply_to = self._message_id or self._initial_reply_to_id
-                        for chunk in chunks:
-                            new_id = await self._send_new_chunk(chunk, reply_to)
+                        for index, chunk in enumerate(chunks):
+                            new_id = await self._send_new_chunk(
+                                chunk,
+                                reply_to,
+                                is_turn_final=(got_done and index == len(chunks) - 1),
+                            )
                             if new_id is not None and new_id != reply_to:
                                 chunks_delivered = True
                         self._accumulated = ""
@@ -695,7 +709,13 @@ class GatewayStreamConsumer:
         # Strip trailing whitespace/newlines but preserve leading content
         return cleaned.rstrip()
 
-    async def _send_new_chunk(self, text: str, reply_to_id: Optional[str]) -> Optional[str]:
+    async def _send_new_chunk(
+        self,
+        text: str,
+        reply_to_id: Optional[str],
+        *,
+        is_turn_final: bool = False,
+    ) -> Optional[str]:
         """Send a new message chunk, optionally threaded to a previous message.
 
         Returns the message_id so callers can thread subsequent chunks.
@@ -704,12 +724,11 @@ class GatewayStreamConsumer:
         if not text.strip():
             return reply_to_id
         try:
-            meta = dict(self.metadata) if self.metadata else {}
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
                 reply_to=reply_to_id,
-                metadata=meta,
+                metadata=self._delivery_metadata(is_turn_final=is_turn_final),
             )
             if result.success and result.message_id:
                 self._message_id = str(result.message_id)
@@ -820,14 +839,16 @@ class GatewayStreamConsumer:
         last_message_id: Optional[str] = None
         last_successful_chunk = ""
         sent_any_chunk = False
-        for chunk in chunks:
+        for index, chunk in enumerate(chunks):
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
-                    metadata=self.metadata,
+                    metadata=self._delivery_metadata(
+                        is_turn_final=(index == len(chunks) - 1),
+                    ),
                 )
                 if result.success:
                     break
@@ -957,7 +978,7 @@ class GatewayStreamConsumer:
                 chat_id=self.chat_id,
                 draft_id=self._draft_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._delivery_metadata(is_turn_final=False),
             )
         except Exception as e:
             logger.debug(
@@ -1004,7 +1025,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
-                metadata=self.metadata,
+                metadata=self._delivery_metadata(is_turn_final=False),
             )
             if result.success:
                 self._already_sent = True
@@ -1040,7 +1061,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._delivery_metadata(is_turn_final=False),
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
@@ -1097,7 +1118,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._delivery_metadata(is_turn_final=is_turn_final),
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -1323,7 +1344,7 @@ class GatewayStreamConsumer:
                     chat_id=self.chat_id,
                     content=text,
                     reply_to=self._initial_reply_to_id,
-                    metadata=self.metadata,
+                    metadata=self._delivery_metadata(is_turn_final=is_turn_final),
                 )
                 if result.success:
                     if result.message_id:

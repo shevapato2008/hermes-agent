@@ -287,6 +287,36 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
     # BasePlatformAdapter required methods
     # ------------------------------------------------------------------
 
+    def supports_draft_streaming(
+        self,
+        *,
+        chat_type: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        return True
+
+    async def send_draft(
+        self,
+        chat_id: str,
+        draft_id: int,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        stream_context = (metadata or {}).get("_gateway_stream")
+        if not isinstance(stream_context, dict):
+            stream_context = {}
+        seq = self._delta_seq.next(chat_id)
+        self._writer.write({
+            "type": "message_draft",
+            "chat_id": chat_id,
+            "text": content,
+            "reply_to": stream_context.get("reply_to"),
+            "draft_id": stream_context.get("draft_id", draft_id),
+            "seq": seq,
+            "ts": time.time(),
+        })
+        return SendResult(success=True, message_id=None)
+
     async def send(
         self,
         chat_id: str,
@@ -294,15 +324,24 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        stream_context = (metadata or {}).get("_gateway_stream")
+        if not isinstance(stream_context, dict):
+            stream_context = {}
+        if "reply_to" in stream_context:
+            reply_to = stream_context["reply_to"]
         seq = self._delta_seq.next(chat_id)
-        self._writer.write({
+        record = {
             "type": "message",
             "chat_id": chat_id,
             "text": content,
             "reply_to": reply_to,
+            "turn_final": stream_context.get("turn_final", True),
             "seq": seq,
             "ts": time.time(),
-        })
+        }
+        if "draft_id" in stream_context:
+            record["draft_id"] = stream_context["draft_id"]
+        self._writer.write(record)
         return SendResult(success=True, message_id=str(seq))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
