@@ -262,6 +262,13 @@ class GatewayStreamConsumer:
         }
         return metadata
 
+    def _advance_draft_id(self) -> None:
+        """Allocate a fresh block id after a normal message closes a block."""
+        if self._draft_id is None:
+            return
+        type(self)._draft_id_counter += 1
+        self._draft_id = type(self)._draft_id_counter
+
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
@@ -284,9 +291,8 @@ class GatewayStreamConsumer:
         # documented in their issue #32535 — each text block becomes its
         # own visible message via the finalize, then a new draft animates
         # for the next one.
-        if self._use_draft_streaming:
-            type(self)._draft_id_counter += 1
-            self._draft_id = type(self)._draft_id_counter
+        if self._draft_id is not None:
+            self._advance_draft_id()
 
     def on_delta(self, text: str) -> None:
         """Thread-safe callback — called from the agent's worker thread.
@@ -505,6 +511,8 @@ class GatewayStreamConsumer:
                         chunks_delivered = False
                         reply_to = self._message_id or self._initial_reply_to_id
                         for index, chunk in enumerate(chunks):
+                            if index:
+                                self._advance_draft_id()
                             new_id = await self._send_new_chunk(
                                 chunk,
                                 reply_to,
@@ -840,6 +848,8 @@ class GatewayStreamConsumer:
         last_successful_chunk = ""
         sent_any_chunk = False
         for index, chunk in enumerate(chunks):
+            if index:
+                self._advance_draft_id()
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):

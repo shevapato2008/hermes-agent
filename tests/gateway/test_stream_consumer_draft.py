@@ -344,6 +344,67 @@ class TestDraftIdLifecycle:
         }
 
 
+class TestDraftMultiChunkBlockIdentity:
+    @staticmethod
+    def _stream_contexts(adapter):
+        return [
+            call.kwargs["metadata"]["_gateway_stream"]
+            for call in adapter.send.await_args_list
+        ]
+
+    @staticmethod
+    def _assert_distinct_increasing_blocks_with_terminal_final(contexts):
+        assert len(contexts) >= 2
+        draft_ids = [context["draft_id"] for context in contexts]
+        assert draft_ids == sorted(draft_ids)
+        assert len(set(draft_ids)) == len(draft_ids)
+        assert [context["turn_final"] for context in contexts[:-1]] == [
+            False
+        ] * (len(contexts) - 1)
+        assert contexts[-1]["turn_final"] is True
+
+    @pytest.mark.asyncio
+    async def test_native_draft_overflow_allocates_one_block_per_message(self):
+        adapter = _make_draft_capable_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 700
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(
+                transport="auto", chat_type="dm", cursor="",
+            ),
+            initial_reply_to_id="turn-overflow",
+        )
+
+        consumer.on_delta("A" * 1400)
+        consumer.finish()
+        await consumer.run()
+
+        contexts = self._stream_contexts(adapter)
+        assert {context["reply_to"] for context in contexts} == {"turn-overflow"}
+        self._assert_distinct_increasing_blocks_with_terminal_final(contexts)
+
+    @pytest.mark.asyncio
+    async def test_native_draft_fallback_allocates_one_block_per_message(self):
+        adapter = _make_draft_capable_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 700
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(transport="auto", chat_type="dm", cursor=""),
+            initial_reply_to_id="turn-fallback",
+        )
+        consumer._use_draft_streaming = consumer._resolve_draft_streaming()
+        type(consumer)._draft_id_counter += 1
+        consumer._draft_id = type(consumer)._draft_id_counter
+
+        await consumer._send_fallback_final("B" * 1400)
+
+        contexts = self._stream_contexts(adapter)
+        assert {context["reply_to"] for context in contexts} == {"turn-fallback"}
+        self._assert_distinct_increasing_blocks_with_terminal_final(contexts)
+
+
 class TestAlreadySentInDraftMode:
     """Drafts must NOT mark _already_sent — that flag gates the gateway's
     fallback final-send path, which we still need to fire so the user gets

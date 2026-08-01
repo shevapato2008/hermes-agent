@@ -103,7 +103,15 @@ class TestInitialReplyToId:
         await consumer._send_or_edit("Test")
 
         call_kwargs = adapter.send.call_args[1]
-        assert call_kwargs["metadata"] == metadata
+        assert call_kwargs["metadata"] == {
+            "thread_id": "omt_topic789",
+            "_gateway_stream": {
+                "reply_to": "om_msg_000",
+                "draft_id": None,
+                "turn_final": True,
+            },
+        }
+        assert metadata == {"thread_id": "omt_topic789"}
 
 
 class TestOverflowFirstMessage:
