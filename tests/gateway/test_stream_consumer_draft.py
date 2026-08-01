@@ -385,6 +385,42 @@ class TestDraftMultiChunkBlockIdentity:
         self._assert_distinct_increasing_blocks_with_terminal_final(contexts)
 
     @pytest.mark.asyncio
+    async def test_overflow_segment_break_advances_before_next_draft(self):
+        adapter = _make_draft_capable_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 700
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(
+                transport="auto", chat_type="dm", cursor="",
+                edit_interval=0.01, buffer_threshold=1,
+            ),
+            initial_reply_to_id="turn-overflow-boundary",
+        )
+
+        consumer.on_delta("A" * 1400)
+        consumer.on_segment_break()
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.1)
+
+        closed_contexts = self._stream_contexts(adapter)
+        assert len(closed_contexts) >= 2
+        last_closed_id = closed_contexts[-1]["draft_id"]
+        assert all(context["turn_final"] is False for context in closed_contexts)
+
+        consumer.on_delta("next block")
+        await asyncio.sleep(0.1)
+        next_drafts = [
+            call for call in adapter.draft_calls
+            if call["content"] == "next block"
+        ]
+        assert next_drafts
+        assert next_drafts[-1]["draft_id"] > last_closed_id
+
+        consumer.finish()
+        await task
+
+    @pytest.mark.asyncio
     async def test_native_draft_fallback_allocates_one_block_per_message(self):
         adapter = _make_draft_capable_adapter()
         adapter.MAX_MESSAGE_LENGTH = 700

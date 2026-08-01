@@ -532,6 +532,10 @@ class GatewayStreamConsumer:
                             if chunks_delivered:
                                 self._final_content_delivered = True
                             return
+                        # Every normal message above closed its block.  A
+                        # non-terminal continuation (periodic overflow or a
+                        # tool boundary) must start on a fresh block id.
+                        self._advance_draft_id()
                         if got_segment_break:
                             self._message_id = None
                             self._fallback_final_send = False
