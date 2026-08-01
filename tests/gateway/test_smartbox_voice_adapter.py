@@ -208,6 +208,34 @@ class TestSendExecApprovalEvent:
 
 class TestUserMessageFrame:
     @pytest.mark.asyncio
+    async def test_attaches_ephemeral_voice_prompt_without_changing_user_text(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        original_text = "  请告诉我 tomorrow 的天气。  "
+
+        await adapter._handle_user_message_frame(
+            {"type": "user_message", "text": original_text, "idempotency_key": "voice-prompt"},
+            writer=None,
+        )
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text == original_text
+
+        prompt = event.channel_prompt
+        assert prompt is not None
+        assert "same language" in prompt
+        assert "1–3 short sentences" in prompt
+        assert "80 Chinese characters" in prompt
+        assert "natural spoken language" in prompt
+        assert "TTS" in prompt
+        for forbidden_format in (
+            "Markdown", "headings", "lists", "tables", "code blocks", "links", "emoji",
+        ):
+            assert forbidden_format in prompt
+        assert "one brief clarifying question" in prompt
+        assert "briefly explain why" in prompt
+        assert "one next step" in prompt
+
+    @pytest.mark.asyncio
     async def test_new_idempotency_key_dispatches_to_handle_message(self, tmp_path):
         adapter = _make_adapter(tmp_path)
         await adapter._handle_user_message_frame(

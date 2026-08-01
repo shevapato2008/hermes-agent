@@ -46,6 +46,17 @@ logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 8000
 
+# Ephemeral voice-only response guidance. The gateway applies channel prompts
+# at API-call time without persisting them in transcript history.
+SMARTBOX_VOICE_CHANNEL_PROMPT = (
+    "Reply in the same language as the user's latest message. "
+    "Normally answer in 1–3 short sentences; when replying in Chinese, usually use no more "
+    "than 80 Chinese characters. Use direct, natural spoken language suitable for TTS. "
+    "Do not use Markdown, headings, lists, tables, code blocks, links, or emoji. "
+    "If required information is missing, ask one brief clarifying question. "
+    "If you cannot complete the request, briefly explain why and give one next step."
+)
+
 # Overridable via PlatformConfig.extra["socket_path"] / SMARTBOX_VOICE_SOCKET_PATH.
 DEFAULT_SOCKET_PATH = "/tmp/hermes-smartbox-voice.sock"
 
@@ -240,6 +251,7 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
             message_type=MessageType.TEXT,
             source=source,
             message_id=idempotency_key or None,
+            channel_prompt=SMARTBOX_VOICE_CHANNEL_PROMPT,
         )
         session_key = build_session_key(source)
 
