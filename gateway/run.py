@@ -1708,6 +1708,8 @@ def _resolve_stream_consumer_settings(
         return getattr(streaming_config, name) if value is None else value
 
     cursor = _preferred("cursor")
+    if not getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True):
+        cursor = ""
     buffer_only = False
     if platform == Platform.MATRIX:
         cursor = ""
