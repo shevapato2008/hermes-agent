@@ -18,6 +18,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from gateway.config import Platform, StreamingConfig
+from gateway.run import _resolve_stream_consumer_settings
 from gateway.stream_consumer import (
     GatewayStreamConsumer,
     StreamConsumerConfig,
@@ -75,6 +77,85 @@ def _make_draft_capable_adapter(
         return_value=SimpleNamespace(success=True),
     )
     return adapter
+
+
+class TestAdapterStreamingSettings:
+    def test_smartbox_defaults_on_when_global_streaming_is_disabled(self, tmp_path):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.smartbox_voice import SmartBoxVoiceAdapter
+
+        adapter = SmartBoxVoiceAdapter(PlatformConfig(
+            enabled=True,
+            extra={
+                "socket_path": str(tmp_path / "smartbox.sock"),
+                "jsonl_path": str(tmp_path / "smartbox.jsonl"),
+            },
+        ))
+
+        settings = _resolve_stream_consumer_settings(
+            StreamingConfig(enabled=False),
+            platform_streaming=None,
+            adapter=adapter,
+            platform=Platform.SMARTBOX_VOICE,
+            chat_type="dm",
+        )
+
+        assert settings.enabled is True
+        assert settings.consumer_config.transport == "draft"
+        assert settings.consumer_config.cursor == ""
+        assert settings.consumer_config.buffer_threshold == 1
+        assert settings.consumer_config.edit_interval == 0.05
+
+    def test_explicit_smartbox_false_disables_adapter_default(self, tmp_path):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.smartbox_voice import SmartBoxVoiceAdapter
+
+        adapter = SmartBoxVoiceAdapter(PlatformConfig(
+            enabled=True,
+            extra={"socket_path": str(tmp_path / "smartbox.sock")},
+        ))
+
+        settings = _resolve_stream_consumer_settings(
+            StreamingConfig(enabled=False),
+            platform_streaming=False,
+            adapter=adapter,
+            platform=Platform.SMARTBOX_VOICE,
+            chat_type="dm",
+        )
+
+        assert settings.enabled is False
+
+    def test_unrelated_adapter_keeps_global_streaming_configuration(self):
+        adapter = _make_draft_capable_adapter()
+        global_config = StreamingConfig(
+            enabled=False,
+            transport="auto",
+            cursor=" cursor",
+            buffer_threshold=17,
+            edit_interval=0.7,
+        )
+
+        disabled = _resolve_stream_consumer_settings(
+            global_config,
+            platform_streaming=None,
+            adapter=adapter,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+        )
+        explicitly_enabled = _resolve_stream_consumer_settings(
+            global_config,
+            platform_streaming=True,
+            adapter=adapter,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+        )
+
+        assert disabled.enabled is False
+        assert explicitly_enabled.enabled is True
+        assert explicitly_enabled.consumer_config.transport == "auto"
+        assert explicitly_enabled.consumer_config.cursor == " cursor"
+        assert explicitly_enabled.consumer_config.buffer_threshold == 17
+        assert explicitly_enabled.consumer_config.edit_interval == 0.7
 
 
 class TestDraftTransportSelection:

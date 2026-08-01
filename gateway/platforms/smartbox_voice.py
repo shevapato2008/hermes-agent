@@ -28,7 +28,13 @@ import time
 from typing import Any, Dict, Optional, Set
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    StreamingPreferences,
+)
 from gateway.session import build_session_key
 from gateway.smartbox_voice_protocol import (
     DeltaSequencer,
@@ -294,6 +300,16 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
         return True
+
+    def streaming_preferences(self) -> StreamingPreferences:
+        """Prefer direct low-latency JSONL drafts for the local voice UI."""
+        return StreamingPreferences(
+            enabled_by_default=True,
+            transport="draft",
+            cursor="",
+            buffer_threshold=1,
+            edit_interval=0.05,
+        )
 
     async def send_draft(
         self,

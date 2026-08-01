@@ -58,6 +58,17 @@ class TestConstruction:
         adapter = _make_adapter(tmp_path, extra={"jsonl_path": jsonl})
         assert adapter.jsonl_path == jsonl
 
+    def test_streaming_preferences_enable_low_latency_native_drafts(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+
+        preferences = adapter.streaming_preferences()
+
+        assert preferences.enabled_by_default is True
+        assert preferences.transport == "draft"
+        assert preferences.cursor == ""
+        assert preferences.buffer_threshold == 1
+        assert preferences.edit_interval == 0.05
+
 
 # ── connect() / disconnect() lifecycle ───────────────────────────────────────
 

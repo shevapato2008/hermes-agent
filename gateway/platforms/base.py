@@ -1782,6 +1782,22 @@ def _strip_media_directives(text: str) -> str:
     return MEDIA_TAG_CLEANUP_RE.sub("", text)
 
 
+@dataclass(frozen=True)
+class StreamingPreferences:
+    """Narrow adapter overrides for the shared gateway stream consumer.
+
+    ``None`` means "inherit the global StreamingConfig value".  This keeps
+    the base adapter conservative and lets platforms with a transport-local
+    fast path opt into only the settings they actually need.
+    """
+
+    enabled_by_default: Optional[bool] = None
+    transport: Optional[str] = None
+    cursor: Optional[str] = None
+    buffer_threshold: Optional[int] = None
+    edit_interval: Optional[float] = None
+
+
 class BasePlatformAdapter(ABC):
     """
     Base class for platform adapters.
@@ -1921,6 +1937,14 @@ class BasePlatformAdapter(ABC):
         False or when ``send_draft`` raises.
         """
         return False
+
+    def streaming_preferences(self) -> StreamingPreferences:
+        """Return adapter-specific stream-consumer defaults.
+
+        The base adapter inherits every global setting so existing platforms
+        retain their current enablement, transport, cursor, and cadence.
+        """
+        return StreamingPreferences()
 
     async def send_draft(
         self,

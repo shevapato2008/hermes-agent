@@ -1662,6 +1662,77 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+@dataclasses.dataclass(frozen=True)
+class _ResolvedStreamConsumerSettings:
+    enabled: bool
+    consumer_config: Any
+
+
+def _resolve_stream_consumer_settings(
+    streaming_config: Any,
+    *,
+    platform_streaming: Any,
+    adapter: Optional[BasePlatformAdapter],
+    platform: "Platform",
+    chat_type: str,
+) -> _ResolvedStreamConsumerSettings:
+    """Resolve global, per-platform, and adapter streaming settings once.
+
+    An explicit ``display.platforms.<name>.streaming`` value remains the
+    highest-priority enablement gate.  Without one, adapters may opt into
+    streaming independently of the global default and override only the
+    consumer fields needed by their native transport.
+    """
+    from gateway.platforms.base import StreamingPreferences
+    from gateway.stream_consumer import StreamConsumerConfig
+
+    preferences = StreamingPreferences()
+    preference_resolver = getattr(adapter, "streaming_preferences", None)
+    if callable(preference_resolver):
+        resolved_preferences = preference_resolver()
+        if isinstance(resolved_preferences, StreamingPreferences):
+            preferences = resolved_preferences
+
+    global_enabled = bool(
+        streaming_config.enabled and streaming_config.transport != "off"
+    )
+    if platform_streaming is not None:
+        enabled = bool(platform_streaming)
+    elif preferences.enabled_by_default is not None:
+        enabled = preferences.enabled_by_default
+    else:
+        enabled = global_enabled
+
+    def _preferred(name: str) -> Any:
+        value = getattr(preferences, name)
+        return getattr(streaming_config, name) if value is None else value
+
+    cursor = _preferred("cursor")
+    buffer_only = False
+    if platform == Platform.MATRIX:
+        cursor = ""
+        buffer_only = True
+
+    fresh_final_seconds = (
+        float(getattr(streaming_config, "fresh_final_after_seconds", 0.0) or 0.0)
+        if platform == Platform.TELEGRAM
+        else 0.0
+    )
+    consumer_config = StreamConsumerConfig(
+        edit_interval=_preferred("edit_interval"),
+        buffer_threshold=_preferred("buffer_threshold"),
+        cursor=cursor,
+        buffer_only=buffer_only,
+        fresh_final_after_seconds=fresh_final_seconds,
+        transport=_preferred("transport") or "edit",
+        chat_type=chat_type or "",
+    )
+    return _ResolvedStreamConsumerSettings(
+        enabled=enabled,
+        consumer_config=consumer_config,
+    )
+
+
 def _teams_pipeline_plugin_enabled() -> bool:
     """Return True when the standalone Teams pipeline plugin is enabled."""
     config = _load_gateway_config()
@@ -12580,47 +12651,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _plat_streaming = resolve_display_setting(
             user_config, platform_key, "streaming"
         )
-        _streaming_enabled = (
-            _scfg.enabled and _scfg.transport != "off"
-            if _plat_streaming is None
-            else bool(_plat_streaming)
+        _adapter = self.adapters.get(source.platform)
+        _stream_settings = _resolve_stream_consumer_settings(
+            _scfg,
+            platform_streaming=_plat_streaming,
+            adapter=_adapter,
+            platform=source.platform,
+            chat_type=getattr(source, "chat_type", "") or "",
         )
+        _streaming_enabled = _stream_settings.enabled
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
         if _streaming_enabled:
             try:
-                from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-                _adapter = self.adapters.get(source.platform)
+                from gateway.stream_consumer import GatewayStreamConsumer
                 if _adapter:
-                    _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                    _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
-                    _buffer_only = False
-                    if source.platform == Platform.MATRIX:
-                        _effective_cursor = ""
-                        _buffer_only = True
-                    # Fresh-final applies to Telegram only — other
-                    # platforms either edit in place cheaply (Discord,
-                    # Slack) or don't have the timestamp-on-edit
-                    # problem.  (Ported from openclaw/openclaw#72038.)
-                    _fresh_final_secs = (
-                        float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
-                        if source.platform == Platform.TELEGRAM
-                        else 0.0
-                    )
-                    _consumer_cfg = StreamConsumerConfig(
-                        edit_interval=_scfg.edit_interval,
-                        buffer_threshold=_scfg.buffer_threshold,
-                        cursor=_effective_cursor,
-                        buffer_only=_buffer_only,
-                        fresh_final_after_seconds=_fresh_final_secs,
-                        transport=_scfg.transport or "edit",
-                        chat_type=getattr(source, "chat_type", "") or "",
-                    )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
                         chat_id=source.chat_id,
-                        config=_consumer_cfg,
+                        config=_stream_settings.consumer_config,
                         metadata=_thread_metadata,
                         initial_reply_to_id=event_message_id,
                     )
@@ -13596,19 +13646,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _plat_streaming = resolve_display_setting(
                 user_config, platform_key, "streaming"
             )
-            # None = no per-platform override → follow global config
-            _streaming_enabled = (
-                _scfg.enabled and _scfg.transport != "off"
-                if _plat_streaming is None
-                else bool(_plat_streaming)
+            _adapter = self.adapters.get(source.platform)
+            _stream_settings = _resolve_stream_consumer_settings(
+                _scfg,
+                platform_streaming=_plat_streaming,
+                adapter=_adapter,
+                platform=source.platform,
+                chat_type=getattr(source, "chat_type", "") or "",
             )
+            _streaming_enabled = _stream_settings.enabled
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
                 try:
-                    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-                    _adapter = self.adapters.get(source.platform)
+                    from gateway.stream_consumer import GatewayStreamConsumer
                     if _adapter:
                         # Platforms that don't support editing sent messages
                         # (e.g. QQ, WeChat) should skip streaming entirely —
@@ -13618,36 +13670,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
                         if not _adapter_supports_edit:
                             raise RuntimeError("skip streaming for non-editable platform")
-                        _effective_cursor = _scfg.cursor
-                        # Some Matrix clients render the streaming cursor
-                        # as a visible tofu/white-box artifact.  Keep
-                        # streaming text on Matrix, but suppress the cursor.
-                        _buffer_only = False
-                        if source.platform == Platform.MATRIX:
-                            _effective_cursor = ""
-                            _buffer_only = True
-                        # Fresh-final applies to Telegram only — other
-                        # platforms either edit in place cheaply or don't
-                        # have the edit-timestamp-stays-stale problem.
-                        # (Ported from openclaw/openclaw#72038.)
-                        _fresh_final_secs = (
-                            float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
-                            if source.platform == Platform.TELEGRAM
-                            else 0.0
-                        )
-                        _consumer_cfg = StreamConsumerConfig(
-                            edit_interval=_scfg.edit_interval,
-                            buffer_threshold=_scfg.buffer_threshold,
-                            cursor=_effective_cursor,
-                            buffer_only=_buffer_only,
-                            fresh_final_after_seconds=_fresh_final_secs,
-                            transport=_scfg.transport or "edit",
-                            chat_type=getattr(source, "chat_type", "") or "",
-                        )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
                             chat_id=source.chat_id,
-                            config=_consumer_cfg,
+                            config=_stream_settings.consumer_config,
                             metadata=_status_thread_metadata,
                             on_new_message=(
                                 (lambda: progress_queue.put(("__reset__",)))
