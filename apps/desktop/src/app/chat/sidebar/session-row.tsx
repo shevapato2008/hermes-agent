@@ -1,62 +1,94 @@
 import { useStore } from '@nanostores/react'
+import { memo } from 'react'
 import type * as React from 'react'
 
-import { writeSessionDrag } from '@/app/chat/composer/inline-refs'
+import { PrTag } from '@/app/chat/pr-tag'
+import { ProfileTag } from '@/app/chat/profile-tag'
+import { startSessionDrag } from '@/app/chat/session-drag'
+import { PlatformAvatar } from '@/app/messaging/platform-icon'
+import { openSession } from '@/app/open-session'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { Tip } from '@/components/ui/tooltip'
 import type { SessionInfo } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
+import { compactNumber } from '@/lib/format'
 import { triggerHaptic } from '@/lib/haptics'
+import { middleClickHandlers } from '@/lib/middle-click'
+import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
+import { coarseElapsed } from '@/lib/time'
+import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
-import { $attentionSessionIds } from '@/store/session'
+import { $sidebarRowMeta } from '@/store/layout'
+import { normalizeProfileKey } from '@/store/profile'
+import { $pullRequestsByBranch, sessionPrKey } from '@/store/pull-requests'
+import { $sessionDotStateById, hasLiveTurn, showsRunningArc } from '@/store/session-dot-state'
+import { sessionCostUsd } from '@/store/sidebar-archive'
 
+import { SessionStatusDot } from '../session-status-dot'
+
+import {
+  SidebarRowBody,
+  SidebarRowGrab,
+  SidebarRowLabel,
+  SidebarRowLead,
+  SidebarRowLeadGlyph,
+  SidebarRowShell
+} from './chrome'
 import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
+import { useProfilePrewarm } from './use-profile-prewarm'
 
 interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   session: SessionInfo
+  /** TUI-style tree stem for branched sessions (`└─ ` / `├─ `). */
+  branchStem?: string
   isPinned: boolean
   isSelected: boolean
-  isWorking: boolean
   onArchive: () => void
+  onBranch?: () => void
   onDelete: () => void
   onPin: () => void
   onResume: () => void
   reorderable?: boolean
   dragging?: boolean
   dragHandleProps?: React.HTMLAttributes<HTMLElement>
+  /** Tag the row with its owning profile (initial chip + tooltip). Used by
+   *  flat cross-profile lists — Pinned and search results in the All-profiles
+   *  view — where no group header communicates ownership (#66003). */
+  showProfile?: boolean
 }
 
-const AGE_TICKS: ReadonlyArray<[number, 'ageDay' | 'ageHour' | 'ageMin']> = [
-  [86_400_000, 'ageDay'],
-  [3_600_000, 'ageHour'],
-  [60_000, 'ageMin']
-]
+const AGE_KEY = { day: 'ageDay', hour: 'ageHour', minute: 'ageMin' } as const
+
+// The last thing in the trailing slot hands its place to the ⋯ button on hover,
+// and is never narrower than the button that has to cover it. A PR chip is the
+// exception while the pointer is on it: it's a link, and the kebab sits
+// absolute over this space, so it has to stop taking clicks too, not just fade.
+const TAIL_HIDES = 'min-w-5 transition-opacity group-hover:opacity-0 group-has-[[data-pr-link]:hover]:opacity-100'
+const KEBAB_YIELDS = 'group-has-[[data-pr-link]:hover]:pointer-events-none group-has-[[data-pr-link]:hover]:opacity-0'
 
 function formatAge(seconds: number, r: Translations['sidebar']['row']): string {
-  const delta = Math.max(0, Date.now() - seconds * 1000)
+  const { unit, value } = coarseElapsed(Date.now() - seconds * 1000)
 
-  for (const [ms, key] of AGE_TICKS) {
-    if (delta >= ms) {
-      return `${Math.floor(delta / ms)}${r[key]}`
-    }
-  }
-
-  return r.ageNow
+  // Under a minute reads as "now" — the sidebar never shows a seconds tick.
+  return unit === 'second' ? r.ageNow : `${value}${r[AGE_KEY[unit]]}`
 }
 
-export function SidebarSessionRow({
+function SidebarSessionRowImpl({
   session,
+  branchStem,
   isPinned,
   isSelected,
-  isWorking,
   onArchive,
+  onBranch,
   onDelete,
   onPin,
   onResume,
   reorderable = false,
   dragging = false,
   dragHandleProps,
+  showProfile = false,
   className,
   style,
   ref,
@@ -64,17 +96,99 @@ export function SidebarSessionRow({
 }: SidebarSessionRowProps) {
   const { t } = useI18n()
   const r = t.sidebar.row
+  const { cancelPrewarm, startPrewarm } = useProfilePrewarm(session.profile)
   const title = sessionTitle(session)
   const age = formatAge(session.last_active || session.started_at, r)
   const handleLabel = `Reorder ${title}`
-  // Subscribe per-row (the leaf) instead of drilling a set through the list —
-  // the atom is tiny and rarely non-empty. True when a clarify prompt in this
-  // session is waiting on the user.
-  const needsInput = useStore($attentionSessionIds).includes(session.id)
+  // Opt-in row metadata from the sidebar's filter menu. Read from the store
+  // rather than threaded as props: the subscription re-renders past the memo
+  // below, and a toggle should repaint every row at once anyway.
+  const rowMeta = useStore($sidebarRowMeta)
+  // Pinned metadata occupies the actions slot and swaps out for the kebab on
+  // hover, so the row reserves the same width either way and never reflows.
+  const pinnedAge = rowMeta.includes('updated')
+  // The default profile has no mark worth spending a row slot on — a chip on
+  // every row that says "the normal one" is noise. Named profiles only.
+  const hasProfileTag = normalizeProfileKey(session.profile) !== 'default'
+  const pinnedProfile = hasProfileTag && rowMeta.includes('profile')
+  // The branch's PR, if the row was asked to show one. A selector, not a plain
+  // useStore: a repo's PRs land as a single map write, and only the rows on
+  // those branches should repaint.
+  const prKey = sessionPrKey(session)
+  const pr = useStoreSelector($pullRequestsByBranch, prs => (rowMeta.includes('pr') && prKey ? prs[prKey] : undefined))
+  const totalTokens = session.input_tokens + session.output_tokens
+  const cost = sessionCostUsd(session)
+
+  // Tokens, cost and age share one figure rather than each claiming a column:
+  // several switched on read as one number, not as a widening gutter.
+  const figures = [
+    rowMeta.includes('tokens') && totalTokens > 0 ? compactNumber(totalTokens) : null,
+    // Sub-cent spend rounds to "$0.00", which reads as a bug rather than as a
+    // cheap session — below a cent the row says nothing at all.
+    rowMeta.includes('cost') && cost >= 0.01 ? `$${cost.toFixed(2)}` : null,
+    pinnedAge ? age : null
+  ].filter(Boolean) as string[]
+
+  // Everything the Show menu puts after the title shares ONE right-aligned
+  // slot, in reading order: identity chips, then the figures. The kebab covers
+  // the END of that slot on hover, so only the last thing in it steps aside —
+  // with tokens and age both on you lose the age and keep the number you
+  // switched on, and a PR keeps its place (and its click) unless it IS the last
+  // thing. Chips used to render in the body instead, which left them stranded
+  // to the left of the kebab's own column: never flush right, never swapping.
+  const trailing: { key: string; node: React.ReactNode }[] = []
+
+  if ((showProfile || pinnedProfile) && hasProfileTag) {
+    trailing.push({ key: 'profile', node: <ProfileTag profile={session.profile} /> })
+  }
+
+  if (pr) {
+    trailing.push({ key: 'pr', node: <PrTag pr={pr} /> })
+  }
+
+  if (figures.length) {
+    const head = figures.slice(0, -1).join(' · ')
+
+    trailing.push({
+      key: 'figures',
+      node: (
+        <span className="pointer-events-none whitespace-nowrap text-[0.625rem] leading-none text-(--ui-text-tertiary)">
+          {head}
+          {/* The figures own their tail: the separator goes with it. */}
+          <span className={cn('inline-block text-right', TAIL_HIDES)}>
+            {head && ' · '}
+            {figures.at(-1)}
+          </span>
+        </span>
+      )
+    })
+  }
+
+  // A chip that ends the slot hides whole; the figures handle their own tail.
+  const chipEndsSlot = trailing.length > 0 && !figures.length
+  // A handed-off session's live source is local, but it originated on a
+  // messaging platform — surface that origin as a small badge so e.g. a
+  // Telegram thread continued here still reads as Telegram.
+  const handoffSource = handoffOriginSource(session.handoff_state, session.handoff_platform)
+  const handoffLabel = handoffSource ? (sessionSourceLabel(handoffSource) ?? handoffSource) : null
+  // The same resolved state the row's dot paints, so the arc and the dot cannot
+  // contradict each other. A selector, not a plain useStore: the map is rebuilt
+  // whenever any session's status changes, but a row only repaints on its own.
+  const dotState = useStoreSelector($sessionDotStateById, states => states[session.id] ?? 'idle')
+  const liveTurn = hasLiveTurn(dotState)
+
+  // An archived session has no live status to paint, so the archive glyph takes
+  // the lead slot the dot would occupy instead of adding a column of its own.
+  const lead = session.archived ? (
+    <SidebarRowLeadGlyph className="text-(--ui-text-quaternary)">
+      <Codicon name="archive" size="0.75rem" />
+    </SidebarRowLeadGlyph>
+  ) : null
 
   return (
     <SessionContextMenu
       onArchive={onArchive}
+      onBranch={onBranch}
       onDelete={onDelete}
       onPin={onPin}
       pinned={isPinned}
@@ -82,39 +196,126 @@ export function SidebarSessionRow({
       sessionId={session.id}
       title={title}
     >
-      <div
+      <SidebarRowShell
+        actions={
+          // The trailing metadata sits in normal flow and the kebab lifts out
+          // of it, so this slot's intrinsic width IS the metadata's — the row's
+          // `auto` actions column measures it and the title truncates against
+          // whatever is switched on, with no width to hand-maintain. Nothing
+          // switched on leaves the slot to the kebab alone; hover changes what
+          // you can see in it, never how wide it is.
+          <div className="relative z-2 flex items-center justify-end gap-1" data-row-actions>
+            {trailing.map(({ key, node }, index) => (
+              <span
+                className={
+                  chipEndsSlot && index === trailing.length - 1 ? cn('inline-flex justify-end', TAIL_HIDES) : undefined
+                }
+                key={key}
+              >
+                {node}
+              </span>
+            ))}
+            <SessionActionsMenu
+              onArchive={onArchive}
+              onBranch={onBranch}
+              onDelete={onDelete}
+              onPin={onPin}
+              pinned={isPinned}
+              profile={session.profile}
+              sessionId={session.id}
+              title={title}
+            >
+              <Button
+                aria-label={r.sessionActions}
+                className={cn(
+                  'size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!',
+                  trailing.length > 0 && 'absolute right-0',
+                  pr && KEBAB_YIELDS
+                )}
+                size="icon"
+                variant="ghost"
+              >
+                <Codicon name="kebab-vertical" size="0.875rem" />
+              </Button>
+            </SessionActionsMenu>
+          </div>
+        }
         className={cn(
-          'group relative grid min-h-[1.625rem] cursor-pointer grid-cols-[minmax(0,1fr)_1.375rem] items-center rounded-md transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background) hover:transition-none',
+          'group row-hover relative',
           isSelected && 'bg-(--ui-row-active-background)',
-          isWorking && 'text-foreground',
-          dragging && 'z-10 cursor-grabbing opacity-60 shadow-sm',
+          liveTurn && 'text-foreground',
+          // Opaque surface while lifted so the dragged row erases what's under
+          // it (translucency let the rows below bleed through).
+          dragging && 'z-10 cursor-grabbing bg-(--ui-sidebar-surface-background)',
           className
         )}
-        data-working={isWorking ? 'true' : undefined}
-        draggable
-        onDragStart={event => {
-          // Reorder drags belong to dnd-kit (the grab handle) — cancel the
-          // native drag so the two DnD systems don't fight.
-          if ((event.target as HTMLElement).closest('[data-reorder-handle]')) {
-            event.preventDefault()
-
+        data-working={liveTurn ? 'true' : undefined}
+        // The row runs BOTH drags off one press, and each declines outside its
+        // own region — so no timing/arbitration rule is needed and neither can
+        // steal the other's gesture. Over the sidebar only the reorder has a
+        // target (the session drop denies: side chrome hosts no main tile);
+        // over the tree only the session drop does (no sortable row there).
+        // Whichever one the release lands on is the one that commits.
+        {...dragHandleProps}
+        onPointerDown={event => {
+          // The grabber already carries these same listeners, and the ⋯
+          // cluster keeps its own gestures.
+          if ((event.target as HTMLElement).closest('[data-reorder-handle], [data-row-actions]')) {
             return
           }
 
-          writeSessionDrag(event.dataTransfer, {
-            id: session.id,
-            profile: session.profile || 'default',
-            title
-          })
+          // A POINTER drag on the shared drag session (never native HTML5 DnD:
+          // no macOS snap-back, Esc aborts instantly). Sub-threshold releases
+          // stay ordinary clicks, so resume / pin / open-in-window are
+          // untouched.
+          startSessionDrag({ id: session.id, profile: session.profile || 'default', title }, event)
+          dragHandleProps?.onPointerDown?.(event)
         }}
+        // Hovering a row from another profile (the all-profiles view) telegraphs
+        // a cross-profile resume — start that backend's spawn now so the click
+        // doesn't pay the full cold boot. Same-profile rows no-op inside
+        // prewarmProfileBackend.
+        onPointerEnter={startPrewarm}
+        onPointerLeave={cancelPrewarm}
         ref={ref}
         style={style}
         {...rest}
       >
-        {isWorking && !needsInput && <span aria-hidden="true" className="arc-border" />}
-        <button
-          className="z-0 flex min-w-0 items-center gap-1.5 bg-transparent py-0.5 pl-2 pr-1 text-left group-hover:pr-12"
+        {showsRunningArc(dotState) && <span aria-hidden="true" className="arc-border arc-row" />}
+        <SidebarRowBody
+          // Every trailing figure lives in the actions slot, which the row
+          // measures — so the title needs a gap from it and nothing else. Hover
+          // changes what you can see in that slot, never how wide it is.
+          className={cn('z-0 pr-2', branchStem && 'pl-3.5')}
+          // Middle-click = open in a new tab (browser muscle memory).
+          {...middleClickHandlers(() => {
+            triggerHaptic('selection')
+            openSession(session.id, () => undefined, 'tab')
+          })}
           onClick={event => {
+            const mod = event.metaKey || event.ctrlKey
+
+            // ⇧⌘-click → pop into its own window (needs standalone windows).
+            if (mod && event.shiftKey) {
+              event.preventDefault()
+              event.stopPropagation()
+              triggerHaptic('selection')
+              openSession(session.id, () => undefined, 'window')
+
+              return
+            }
+
+            // ⌘/⌃-click → open in a new tab (stack into main).
+            if (mod) {
+              event.preventDefault()
+              event.stopPropagation()
+              triggerHaptic('selection')
+              openSession(session.id, () => undefined, 'tab')
+
+              return
+            }
+
+            // ⇧-click → pin.
             if (event.shiftKey) {
               event.preventDefault()
               event.stopPropagation()
@@ -124,134 +325,68 @@ export function SidebarSessionRow({
               return
             }
 
-            if (event.metaKey || event.ctrlKey) {
-              event.preventDefault()
-              event.stopPropagation()
-              triggerHaptic('selection')
-              onArchive()
-
-              return
-            }
-
             onResume()
           }}
-          type="button"
         >
           {reorderable ? (
-            <span
-              {...dragHandleProps}
-              aria-label={handleLabel}
-              className={cn(
-                // Scope the dot↔grabber swap to a local group so the grabber
-                // only reveals when hovering/focusing the handle itself, not
-                // anywhere on the row. Width MUST match the non-reorderable dot
-                // column (w-3.5) so rows don't shift horizontally when reorder is
-                // toggled (e.g. scoped → ALL-profiles view).
-                'group/handle relative -my-0.5 grid w-3.5 shrink-0 cursor-grab touch-none place-items-center self-stretch overflow-hidden active:cursor-grabbing',
-                // The quest-glow box-shadow extends past the dot; let it bleed
-                // out instead of being clipped by this handle's overflow-hidden.
-                needsInput && 'overflow-visible'
+            <SidebarRowGrab ariaLabel={handleLabel} dragging={dragging} dragHandleProps={dragHandleProps}>
+              {lead ?? (
+                <SessionStatusDot
+                  branchStem={branchStem}
+                  className="transition-opacity group-hover/handle:opacity-0 group-focus-within/handle:opacity-0"
+                  session={session}
+                  storedSessionId={session.id}
+                />
               )}
-              data-reorder-handle
-              onClick={event => event.stopPropagation()}
-            >
-              <SidebarRowDot
-                className="transition-opacity group-hover/handle:opacity-0 group-focus-within/handle:opacity-0"
-                isWorking={isWorking}
-                needsInput={needsInput}
-              />
-              <Codicon
-                className={cn(
-                  'absolute text-(--ui-text-quaternary) opacity-0 transition-opacity group-hover/handle:opacity-80 group-focus-within/handle:opacity-80 hover:text-(--ui-text-secondary)',
-                  dragging && 'text-(--ui-text-secondary) opacity-100'
-                )}
-                name="grabber"
-                size="0.75rem"
-              />
-            </span>
+            </SidebarRowGrab>
           ) : (
-            <span
-              className={cn(
-                'grid w-3.5 shrink-0 place-items-center',
-                needsInput ? 'overflow-visible' : 'overflow-hidden'
-              )}
-            >
-              <SidebarRowDot isWorking={isWorking} needsInput={needsInput} />
-            </span>
+            <SidebarRowLead className="overflow-hidden">
+              {lead ?? <SessionStatusDot branchStem={branchStem} session={session} storedSessionId={session.id} />}
+            </SidebarRowLead>
           )}
-          <span className="min-w-0 flex-1 truncate text-[0.8125rem] font-normal text-(--ui-text-secondary) group-hover:text-foreground group-data-[working=true]:text-foreground/90">
+          {handoffSource && handoffLabel ? (
+            <Tip label={r.handoffOrigin(handoffLabel)}>
+              <PlatformAvatar
+                className="size-4 rounded-[4px] text-[0.5rem] [&_svg]:size-2.5"
+                platformId={handoffSource}
+                platformName={handoffLabel}
+              />
+            </Tip>
+          ) : null}
+          <SidebarRowLabel className="flex-1 font-normal group-hover:text-foreground group-data-[working=true]:text-foreground/90">
             {title}
-          </span>
-        </button>
-        <div className="relative z-2 grid w-[1.375rem] place-items-center">
-          {!isWorking && (
-            <span className="pointer-events-none absolute right-6 top-1/2 min-w-6 -translate-y-1/2 text-right text-[0.625rem] leading-none text-(--ui-text-tertiary) opacity-0 transition-opacity group-hover:opacity-100">
-              {age}
-            </span>
-          )}
-          <SessionActionsMenu
-            onArchive={onArchive}
-            onDelete={onDelete}
-            onPin={onPin}
-            pinned={isPinned}
-            profile={session.profile}
-            sessionId={session.id}
-            title={title}
-          >
-            <Button
-              aria-label={r.actionsFor(title)}
-              className="size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!"
-              size="icon"
-              title={r.sessionActions}
-              variant="ghost"
-            >
-              <Codicon name="ellipsis" size="0.875rem" />
-            </Button>
-          </SessionActionsMenu>
-        </div>
-      </div>
+          </SidebarRowLabel>
+        </SidebarRowBody>
+      </SidebarRowShell>
     </SessionContextMenu>
   )
 }
 
-function SidebarRowDot({
-  isWorking,
-  needsInput = false,
-  className
-}: {
-  isWorking: boolean
-  needsInput?: boolean
-  className?: string
-}) {
-  const { t } = useI18n()
-  const r = t.sidebar.row
-
-  // "Needs input" wins over "working": a clarify-blocked session is technically
-  // still running, but the actionable state is that it's waiting on the user.
-  // Amber + steady (no ping) reads as "your turn", distinct from the accent
-  // pulse of an active turn.
-  if (needsInput) {
-    return (
-      <span
-        aria-label={r.needsInput}
-        className={cn('quest-glow relative size-1.5 rounded-full bg-amber-500', className)}
-        role="status"
-        title={r.waitingForAnswer}
-      />
-    )
-  }
-
+// The sidebar re-renders on every stream tick ($sessions/$workingSessionIds
+// churn), and it stays mounted beneath every overlay — so an unmemoized row
+// re-rendered the whole list (and its Codicon/label/status-dot subtree) on each
+// delta, bleeding churn into Settings, Cron, Profiles, Artifacts, etc.
+//
+// The callback props (onArchive/onResume/…) are fresh closures every render by
+// design (they close over the row's session id), so a default memo never bails.
+// They're pure id-forwarders, though — identical behavior for a given row — so
+// the comparator deliberately ignores them and compares only the DATA that
+// changes what the row paints. A row whose session/selection/pin state is
+// unchanged now bails out, even while a sibling session streams; its own status
+// arrives through a store subscription, which re-renders it past this bail.
+function rowPropsEqual(a: SidebarSessionRowProps, b: SidebarSessionRowProps): boolean {
   return (
-    <span
-      aria-label={isWorking ? r.sessionRunning : undefined}
-      className={cn(
-        'rounded-full',
-        isWorking
-          ? "relative size-1.5 bg-(--ui-accent) shadow-[0_0_0.625rem_color-mix(in_srgb,var(--ui-accent)_55%,transparent)] before:absolute before:inset-0 before:animate-ping before:rounded-full before:bg-(--ui-accent) before:opacity-70 before:content-['']"
-          : 'size-1 bg-(--ui-text-quaternary) opacity-80',
-        className
-      )}
-      role={isWorking ? 'status' : undefined}
-    />
+    a.session === b.session &&
+    a.isPinned === b.isPinned &&
+    a.isSelected === b.isSelected &&
+    a.branchStem === b.branchStem &&
+    a.reorderable === b.reorderable &&
+    a.dragging === b.dragging &&
+    a.showProfile === b.showProfile &&
+    a.dragHandleProps === b.dragHandleProps &&
+    a.className === b.className &&
+    a.style === b.style
   )
 }
+
+export const SidebarSessionRow = memo(SidebarSessionRowImpl, rowPropsEqual)

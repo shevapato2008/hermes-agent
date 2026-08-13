@@ -22,6 +22,12 @@ param(
     # cloning the full default-branch history) and then `git checkout`s the
     # exact ref.  Precedence: Commit > Tag > Branch.
     [string]$Commit = "",
+    # Apply -Commit even when it would roll an existing install BACKWARDS.
+    # Without this the repository stage skips a pin that is already an ancestor
+    # of HEAD, so a stale baked-in BUILD_PIN_COMMIT can't downgrade a current
+    # checkout. Reproducible/CI installs that genuinely want an older SHA on an
+    # existing tree pass -ForceCommit.
+    [switch]$ForceCommit,
     [string]$Tag = "",
     [string]$HermesHome = $(if ($env:HERMES_HOME) { $env:HERMES_HOME } else { "$env:LOCALAPPDATA\hermes" }),
     [string]$InstallDir = $(if ($env:HERMES_HOME) { "$env:HERMES_HOME\hermes-agent" } else { "$env:LOCALAPPDATA\hermes\hermes-agent" }),
@@ -37,6 +43,15 @@ param(
     [switch]$NonInteractive,
     [switch]$Json,
 
+    # Print the paths this install would use, as JSON, and exit without
+    # touching anything. The first question on any "installer says a path
+    # doesn't exist" report is which paths it actually resolved -- especially
+    # on profiles Windows exposes through an 8.3 alias, where what the user
+    # sees in Explorer and what the installer receives differ.
+    #
+    #   powershell -File install.ps1 -ShowResolvedPaths
+    [switch]$ShowResolvedPaths,
+
     # --- Ensure mode (dep_ensure.py entry point) ---
     [string]$Ensure = "",
     [switch]$PostInstall,
@@ -49,7 +64,7 @@ param(
     #   * Hermes-Setup.exe (the signed Tauri bootstrap installer) passes
     #     -IncludeDesktop so a user who installed via the GUI ends up
     #     with a launchable desktop binary.
-    #   * The Electron desktop's own bootstrap-runner.cjs runs install.ps1
+    #   * The Electron desktop's own bootstrap-runner.ts runs install.ps1
     #     from inside an already-launched Hermes.exe; if THAT recursively
     #     built apps/desktop it would try to overwrite the live Hermes.exe
     #     on disk and fail. The recursive path omits the flag.
@@ -89,13 +104,291 @@ try {
 }
 
 # ============================================================================
+# 8.3 short-path normalization
+# ============================================================================
+# Windows generates an 8.3 short alias for a user-profile folder whose name
+# contains a space ("First Last" -> FIRST~1.LAS), a dot ("Stone.ZEN8" ->
+# STONE~1.ZEN), or an accented character ("Ruben" spelled with an acute e ->
+# RUBN~1). It can then expose %TEMP%, %TMP%, %LOCALAPPDATA%, %APPDATA% and
+# %USERPROFILE% -- plus everything derived from them, including the default
+# HERMES_HOME and InstallDir -- in that short form:
+#   C:\Users\FIRST~1.LAS\AppData\Local\Temp
+#
+# PowerShell's FileSystem provider mishandles the aliased component when such a
+# path reaches a provider cmdlet (`Tee-Object -FilePath`, `Out-File`,
+# `New-Item`, `Test-Path`), throwing "An object at the specified path
+# C:\Users\FIRST~1.LAS does not exist" -- localized on non-English hosts.
+# Every Node/Electron stage streams its build log to %TEMP% via Tee-Object and
+# the desktop stage probes the binary it produced under the profile-derived
+# InstallDir, so the bootstrap aborts even though the artifact built fine.
+# The Python/uv stages, which never hand a %TEMP% path to a provider cmdlet,
+# sail through -- which is why the failure looks Node-specific.
+#
+# Expanding every profile-rooted path back to long form once, up front, lets
+# every downstream cmdlet and child process see something the provider can
+# resolve. Three resolvers, tried in order, because no single one covers every
+# host:
+#
+#   1. kernel32!GetLongPathNameW -- expands any 8.3 component regardless of
+#      locale, including the accented-username aliases the COM resolver misses.
+#   2. Scripting.FileSystemObject -- fallback for hosts where P/Invoke is
+#      blocked.
+#   3. Profile-root substitution -- when the volume has 8.3 generation disabled
+#      or the alias is stale, neither resolver can expand the name because it
+#      no longer maps to anything on disk. The aliased component is always the
+#      profile folder itself (everything below it was created long), so swap in
+#      a profile root we can prove is long and reattach the tail.
+#
+# All three degrade to returning the input untouched, so a host where none of
+# them apply -- including non-Windows -- behaves exactly as it did before.
+
+$script:LongProfileRoot = $null
+
+function Write-PathDiag {
+    # Diagnostics for this block go to stderr, never stdout: the stage protocol
+    # hands drivers a single line of JSON on stdout and a stray note would break
+    # anything parsing it.
+    #
+    # Suppressed entirely under -ShowResolvedPaths, which is a machine-readable
+    # query: Windows PowerShell 5.1 wraps any native-command stderr in a
+    # NativeCommandError and folds it back into the caller's own stream, so a
+    # child writing here at all is enough to corrupt a 5.1 caller's capture.
+    # The JSON already carries everything these lines say.
+    #
+    # [Console]::Error.WriteLine specifically -- verified reaching a caller on a
+    # windows-latest runner. $host.UI.WriteErrorLine was tried and silently
+    # produced nothing there under a non-interactive host.
+    param([string]$Message)
+    if ($ShowResolvedPaths) { return }
+    [Console]::Error.WriteLine("[hermes] $Message")
+}
+
+function Get-LongProfileRoot {
+    # The user's profile directory in long form, or '' when every source we
+    # can reach is itself aliased. Cached: this runs per env var.
+    if ($null -ne $script:LongProfileRoot) { return $script:LongProfileRoot }
+    $script:LongProfileRoot = ''
+
+    # %USERPROFILE% first: it is what the rest of the install derives from, and
+    # on a host handing us aliased paths the .NET known-folder lookup tends to
+    # be aliased in exactly the same way. Then the HOMEDRIVE/HOMEPATH pair, then
+    # the profile's parent (C:\Users never carries an alias) plus %USERNAME%,
+    # which stays the long account name even when every path is short.
+    $envProfile = [Environment]::GetEnvironmentVariable('USERPROFILE')
+    $shellProfile = [Environment]::GetFolderPath('UserProfile')
+    $candidates = @($envProfile, $shellProfile, "$env:HOMEDRIVE$env:HOMEPATH")
+    foreach ($anchor in @($envProfile, $shellProfile)) {
+        if ($anchor -and $env:USERNAME) {
+            $parent = Split-Path -Parent $anchor.TrimEnd('\', '/')
+            if ($parent) { $candidates += (Join-Path $parent $env:USERNAME) }
+        }
+    }
+
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        # Trailing separators make Split-Path -Parent return the directory
+        # itself, which would silently break the ancestry check downstream.
+        $candidate = $candidate.TrimEnd('\', '/')
+        if (-not $candidate) { continue }
+        if ($candidate -match '~\d') { continue }
+        try {
+            if (Test-Path -LiteralPath $candidate -PathType Container) {
+                $script:LongProfileRoot = $candidate
+                break
+            }
+        } catch {
+            # Unreadable candidate (denied, malformed): try the next one.
+        }
+    }
+
+    # Say which root we landed on. When someone reports "still broken" this is
+    # the first thing worth knowing, and it costs one line on the rare path
+    # where an alias actually showed up.
+    if ($script:LongProfileRoot) {
+        Write-PathDiag "long profile root: $script:LongProfileRoot"
+    } else {
+        Write-PathDiag "no long profile root found; 8.3 paths left as-is (tried: $($candidates -join ', '))"
+    }
+    return $script:LongProfileRoot
+}
+
+function Expand-ShortProfileRoot {
+    # Rebuild $Path onto a known-long profile root when its aliased component
+    # is the profile folder. Returns $Path unchanged when it isn't, so a custom
+    # TEMP on another volume (D:\SHORT~1\Temp) is never rewritten.
+    param([string]$Path)
+
+    $longRoot = Get-LongProfileRoot
+    if (-not $longRoot) { return $Path }
+    $longRootParent = Split-Path -Parent $longRoot
+    if (-not $longRootParent) { return $Path }
+
+    $node = $Path
+    $tail = ''
+    while ($node -and ($node -match '~\d')) {
+        $leaf = Split-Path -Leaf $node
+        $parent = Split-Path -Parent $node
+        if (-not $parent) { return $Path }
+        if ($leaf -match '~\d') {
+            # Candidate profile folder. Only substitute when it sits in the
+            # same directory as the real profile (both C:\Users).
+            if ($parent -ne $longRootParent) { return $Path }
+            if ($tail) { return (Join-Path $longRoot $tail) }
+            return $longRoot
+        }
+        $tail = if ($tail) { Join-Path $leaf $tail } else { $leaf }
+        $node = $parent
+    }
+    return $Path
+}
+
+function ConvertTo-LongPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    # Only 8.3 short names carry a tilde+digit ("~1"); skip every resolver for
+    # ordinary long paths, which is the overwhelmingly common case.
+    if ($Path -notmatch '~\d') { return $Path }
+
+    # 1. kernel32. Compiled on first use only, so a normal profile never pays
+    #    the Add-Type cost (this file is re-entered once per install stage).
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'HermesInstall.LongPath').Type) {
+            Add-Type -Namespace 'HermesInstall' -Name 'LongPath' -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern int GetLongPathNameW(string lpszShortPath, System.Text.StringBuilder lpszLongPath, int cchBuffer);
+'@
+        }
+        $buffer = New-Object System.Text.StringBuilder 4096
+        $length = [HermesInstall.LongPath]::GetLongPathNameW($Path, $buffer, $buffer.Capacity)
+        if ($length -gt $buffer.Capacity) {
+            $buffer = New-Object System.Text.StringBuilder $length
+            $length = [HermesInstall.LongPath]::GetLongPathNameW($Path, $buffer, $buffer.Capacity)
+        }
+        if ($length -gt 0) {
+            $expanded = $buffer.ToString()
+            if ($expanded -and $expanded -notmatch '~\d') {
+                $script:LastResolver = 'kernel32'
+                return $expanded
+            }
+        }
+    } catch {
+        # Not Windows, or P/Invoke denied by policy: try the next resolver.
+    }
+
+    # 2. COM. Validate the result the same way the kernel32 branch does: this
+    # resolver can report success and still hand back a path that carries the
+    # alias (observed on a windows-latest runner, where it "resolved"
+    # C:\Users\FIRST~1.LAS\... to itself). Accepting that silently is what let a
+    # short path reach the provider cmdlets in the first place, so an
+    # unexpanded result counts as failure and falls through.
+    try {
+        $fso = New-Object -ComObject Scripting.FileSystemObject
+        $resolved = $null
+        if ($fso.FolderExists($Path))   { $resolved = $fso.GetFolder($Path).Path }
+        elseif ($fso.FileExists($Path)) { $resolved = $fso.GetFile($Path).Path }
+        if ($resolved -and $resolved -notmatch '~\d') {
+            $script:LastResolver = 'com'
+            return $resolved
+        }
+    } catch {
+        # COM unavailable / locked-down host: try the next resolver.
+    }
+
+    # 3. The alias resolves to nothing. Rebuild from a long profile root.
+    $rebuilt = Expand-ShortProfileRoot $Path
+    $script:LastResolver = if ($rebuilt -ne $Path) { 'profile-root' } else { 'none' }
+    return $rebuilt
+}
+
+function Set-LongProfileEnvVars {
+    # Normalize every profile-rooted variable the install reads, not just
+    # %TEMP%: the desktop stage derives InstallDir from %LOCALAPPDATA%, and a
+    # short root there fails the post-build probe after a successful build.
+    # Returns $true when anything was rewritten.
+    $rewrote = $false
+    $script:NormalizedPathRewrites = @{}
+    foreach ($name in @('TEMP', 'TMP', 'LOCALAPPDATA', 'APPDATA', 'USERPROFILE')) {
+        $current = [Environment]::GetEnvironmentVariable($name)
+        if (-not $current) { continue }
+        $expanded = ConvertTo-LongPath $current
+        if ($expanded -and $expanded -ne $current) {
+            Set-Item -Path "Env:$name" -Value $expanded
+            $rewrote = $true
+            $script:NormalizedPathRewrites[$name] = $expanded
+            # Rewriting a profile path is rare and corrective; say so. Every
+            # report of this bug class arrived as a bare "does not exist" with
+            # no hint that a short alias was involved. stderr, so the stage
+            # protocol's stdout JSON stays parseable.
+            Write-PathDiag "expanded 8.3 short path in %$name%: $current -> $expanded"
+        }
+    }
+    return $rewrote
+}
+
+$script:NormalizedProfilePaths = Set-LongProfileEnvVars
+
+# Re-derive the install paths now that the env vars behind their defaults are
+# long. An explicitly passed -HermesHome / -InstallDir is normalized in place
+# rather than replaced, so a caller's choice is never overwritten by a default.
+# $PSBoundParameters is only meaningful at script scope, so this stays inline.
+if ($PSBoundParameters.ContainsKey('HermesHome')) {
+    $HermesHome = ConvertTo-LongPath $HermesHome
+} else {
+    $HermesHome = ConvertTo-LongPath $(
+        if ($env:HERMES_HOME) { $env:HERMES_HOME } else { "$env:LOCALAPPDATA\hermes" }
+    )
+}
+if ($PSBoundParameters.ContainsKey('InstallDir')) {
+    $InstallDir = ConvertTo-LongPath $InstallDir
+} else {
+    $InstallDir = ConvertTo-LongPath $(
+        if ($env:HERMES_HOME) { "$env:HERMES_HOME\hermes-agent" } else { "$env:LOCALAPPDATA\hermes\hermes-agent" }
+    )
+}
+if ($script:NormalizedProfilePaths) {
+    # Which paths the install actually settled on. Absent from every report of
+    # this bug class, and the whole question once a short alias is in play.
+    Write-PathDiag "resolved install paths: HermesHome=$HermesHome InstallDir=$InstallDir"
+}
+
+# Captured here, where the values are final, and emitted from the entry-point
+# dispatch at the bottom (alongside -ProtocolVersion / -Manifest) so
+# -ShowResolvedPaths exits before any stage runs.
+#
+# The report goes to STDOUT as JSON: on Windows a child's stderr does not
+# reliably reach a parent process -- three separate capture mechanisms each came
+# back empty on a windows-latest runner while stdout arrived intact -- and the
+# first question on any "installer says a path doesn't exist" report is which
+# paths it actually resolved.
+$script:ResolvedPathReport = @{
+    long_profile_root = (Get-LongProfileRoot)
+    normalized        = $script:NormalizedPathRewrites
+    resolver          = $script:LastResolver
+    temp              = $env:TEMP
+    hermes_home       = $HermesHome
+    install_dir       = $InstallDir
+}
+
+# ============================================================================
 # Configuration
 # ============================================================================
 
 $RepoUrlSsh = "git@github.com:NousResearch/hermes-agent.git"
 $RepoUrlHttps = "https://github.com/NousResearch/hermes-agent.git"
 $PythonVersion = "3.11"
+# Minor versions the installer accepts when the requested $PythonVersion isn't
+# available, in preference order.  uv discovers both uv-managed and system
+# interpreters, so this list also matches a pre-existing system Python.  Single
+# source of truth shared by Test-Python's fallback and Resolve-AvailablePythonVersion.
+$PythonFallbackVersions = @("3.12", "3.13", "3.10")
 $NodeVersion = "22"
+# The npm range the root package.json pins in `engines.npm`.  A constant rather
+# than a manifest read like the POSIX side does: Test-Node runs BEFORE the repo
+# is cloned, so there is usually no package.json on disk yet (and none at all
+# when install.ps1 is piped straight from the web).  Get-NpmRange prefers the
+# manifest whenever it does exist, so a drifted constant self-corrects on any
+# run against an existing checkout.
+$NpmRange = ">=12.0.0"
 
 # Stage-protocol version.  Bumped only for genuinely breaking changes to the
 # manifest schema, stage-name set semantics, or stdout JSON shape.  Adding a
@@ -185,6 +478,52 @@ function Write-Err {
     Write-Host "[X] $Message" -ForegroundColor Red
 }
 
+function Invoke-NativeWithRelaxedErrorAction {
+    param([scriptblock]$Script)
+
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Script
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+}
+function Discard-LockfileChurn {
+    param([string]$Repo = $InstallDir)
+
+    if (-not $Repo -or -not (Test-Path (Join-Path $Repo ".git"))) { return }
+
+    try {
+        $diff = & git -c windows.appendAtomically=false -C $Repo diff --name-only 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $diff) { return }
+
+        $dirtyPackageDirs = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+        foreach ($path in $diff) {
+            if ($path -like "*package.json") {
+                $null = $dirtyPackageDirs.Add((Split-Path $path -Parent))
+            }
+        }
+
+        $dirtyLocks = [System.Collections.Generic.List[string]]::new()
+        foreach ($path in $diff) {
+            if ($path -notlike "*package-lock.json") { continue }
+            $lockDir = Split-Path $path -Parent
+            if ($dirtyPackageDirs.Contains($lockDir)) { continue }
+            $dirtyLocks.Add($path)
+        }
+
+        if ($dirtyLocks.Count -eq 0) { return }
+        & git -c windows.appendAtomically=false -C $Repo checkout -- @($dirtyLocks) 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Info "Discarded npm lockfile churn ($($dirtyLocks.Count) file(s))"
+        }
+    } catch {
+        # Best-effort only; never let cleanup block the installer update path.
+    }
+}
 # Inspect npm output for a TLS-trust failure and, if found, print actionable
 # remediation. npm/Node surface corporate MITM proxies and missing root CAs as
 # "unable to get local issuer certificate" / "self-signed certificate in
@@ -214,6 +553,62 @@ function Show-NpmCertHint {
     return $true
 }
 
+function Write-NpmDebugLogTail {
+    # On failure npm prints only a terse summary to stdout/stderr; the real
+    # evidence (postinstall script stderr like Electron's install.js, network
+    # traces, EBUSY retries) lives in npm's own debug log under
+    # <npm-cache>\_logs\<timestamp>-debug-0.log. The bootstrap installer's
+    # streaming sink only captures what WE emit, so on any npm failure this
+    # helper locates that debug log and replays its tail into our output
+    # stream -- making the bootstrap log a self-contained diagnosis instead
+    # of "exit 1, details in a file on a VM nobody can reach".
+    param(
+        [string]$NpmOutput,
+        [int]$TailLines = 200
+    )
+    $logPath = $null
+    # Preferred: npm names the exact file in its failure summary.
+    if ($NpmOutput -and $NpmOutput -match "A complete log of this run can be found in:\s*(?<path>[^\r\n]+)") {
+        $candidate = $Matches['path'].Trim()
+        if (Test-Path -LiteralPath $candidate) { $logPath = $candidate }
+    }
+    # Fallback (covers --silent runs, truncated output): newest debug log in
+    # npm's cache _logs directory.
+    if (-not $logPath) {
+        try {
+            $npm = Resolve-NpmCmd
+            if ($npm) {
+                $prevEAPLocal = $ErrorActionPreference
+                $ErrorActionPreference = "Continue"
+                $cacheDir = (& $npm config get cache 2>$null | Select-Object -Last 1)
+                $ErrorActionPreference = $prevEAPLocal
+                if ($cacheDir) {
+                    $logsDir = Join-Path ("$cacheDir").Trim() "_logs"
+                    if (Test-Path -LiteralPath $logsDir) {
+                        $newest = Get-ChildItem -LiteralPath $logsDir -Filter "*-debug-*.log" -ErrorAction SilentlyContinue |
+                            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                        if ($newest) { $logPath = $newest.FullName }
+                    }
+                }
+            }
+        } catch { }
+    }
+    if (-not $logPath) {
+        Write-Warn "npm debug log could not be located -- no further npm detail available"
+        return
+    }
+    $tail = $null
+    try {
+        $tail = Get-Content -LiteralPath $logPath -Tail $TailLines -ErrorAction Stop
+    } catch {
+        Write-Warn "Could not read npm debug log ${logPath}: $($_.Exception.Message)"
+        return
+    }
+    Write-Warn "---- npm debug log: last $TailLines lines of $logPath ----"
+    foreach ($line in $tail) { Write-Host "    $line" -ForegroundColor DarkGray }
+    Write-Warn "---- end npm debug log ----"
+}
+
 # --- Ensure-mode helpers ---
 
 function Resolve-NpmCmd {
@@ -228,18 +623,17 @@ function Resolve-NpmCmd {
 }
 
 function Find-SystemBrowser {
-    $candidates = @(
-        "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
-        "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
-        "${env:LOCALAPPDATA}\Google\Chrome\Application\chrome.exe",
-        "${env:ProgramFiles}\Microsoft\Edge\Application\msedge.exe",
-        "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
-        "${env:ProgramFiles}\Chromium\Application\chrome.exe",
-        "${env:LOCALAPPDATA}\Chromium\Application\chrome.exe"
-    )
-    foreach ($p in $candidates) {
-        if (Test-Path $p) { return $p }
-    }
+    # Honor ONLY an explicit, user-set AGENT_BROWSER_EXECUTABLE_PATH override.
+    #
+    # We no longer scan well-known install locations for a system browser.
+    # Auto-detection silently bound the install to an arbitrary binary instead
+    # of the bundled Playwright Chromium, which made the browser tool behave
+    # differently across hosts (and, on Linux, picked up a sandboxed Snap
+    # Chromium that hangs every browser_navigate). Every install now uses the
+    # bundled Chromium unless the user explicitly points elsewhere.
+    $override = $env:AGENT_BROWSER_EXECUTABLE_PATH
+    if ([string]::IsNullOrWhiteSpace($override)) { return $null }
+    if (Test-Path $override) { return $override }
     return $null
 }
 
@@ -282,6 +676,9 @@ function Install-AgentBrowser {
         Remove-Item $npmLog -Force -ErrorAction SilentlyContinue
         Write-Err "npm install -g failed (exit $npmExit): $npmDetail"
         Show-NpmCertHint $npmDetail | Out-Null
+        # This install runs with --silent, so $npmDetail is often near-empty;
+        # npm's debug log is the only place the real error survives.
+        Write-NpmDebugLogTail -NpmOutput $npmDetail
         throw "npm install failed"
     }
     Remove-Item $npmLog -Force -ErrorAction SilentlyContinue
@@ -290,7 +687,7 @@ function Install-AgentBrowser {
         $sysBrowser = Find-SystemBrowser
         if ($sysBrowser) {
             Write-BrowserEnv -BrowserPath $sysBrowser
-            Write-Info "System browser detected -- skipping Chromium download"
+            Write-Info "Explicit browser override set -- skipping bundled Chromium download"
         } else {
             $abExe = Join-Path $prefixDir "agent-browser.cmd"
             if (Test-Path $abExe) {
@@ -318,8 +715,38 @@ function Install-AgentBrowser {
 # Dependency checks
 # ============================================================================
 
+# Resolve the PowerShell host executable used to spawn child PowerShell
+# processes (the astral uv installer below).  We must NOT hardcode the bare
+# name `powershell`: it names *Windows PowerShell* and only resolves when its
+# System32 directory is on PATH.  When install.ps1 is run under PowerShell 7+
+# (`pwsh`) -- or any session where `powershell` isn't on PATH -- a bare
+# `powershell` spawn dies with "The term 'powershell' is not recognized",
+# aborting uv installation (field report: Windows install stuck, uv install
+# failed with exactly that message).  Prefer the absolute path of the host we
+# are already running in (PATH-independent), then fall back to whichever of
+# powershell/pwsh is resolvable, and only then to the bare name.
+function Get-PowerShellHostExe {
+    try {
+        $hostExe = (Get-Process -Id $PID).Path
+        if ($hostExe -and (Test-Path $hostExe)) {
+            $leaf = Split-Path $hostExe -Leaf
+            # Only trust the current host when it is a real PowerShell CLI
+            # (not e.g. powershell_ise.exe or an embedded host that can't take
+            # `-ExecutionPolicy`/`-Command`).
+            if ($leaf -match '^(?i:powershell|pwsh)\.exe$') { return $hostExe }
+        }
+    } catch { }
+    foreach ($candidate in @("powershell", "pwsh")) {
+        $cmd = Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($cmd -and $cmd.Source) { return $cmd.Source }
+    }
+    # Last-ditch: hand back the bare name so the spawn surfaces its own error.
+    return "powershell"
+}
+
 function Install-Uv {
-    # Hermes owns its own uv at $HermesHome\bin\uv.exe.  Always install there —
+    # Hermes owns its own uv at $HermesHome\bin\uv.exe.  Always install there --
     # no PATH probing, no conda guards, no multi-location resolution chains.
     # The runtime update path (hermes_cli/managed_uv.py) looks in the same
     # place, so install.ps1 and `hermes update` stay in sync.
@@ -341,7 +768,11 @@ function Install-Uv {
     try {
         $ErrorActionPreference = "Continue"
         $env:UV_INSTALL_DIR = Join-Path $HermesHome "bin"
-        powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex" 2>&1 | Out-Null
+        # Spawn via the resolved host exe (see Get-PowerShellHostExe) rather
+        # than a bare `powershell`, which isn't guaranteed to be on PATH under
+        # PowerShell 7 / pwsh-only setups.
+        $psHostExe = Get-PowerShellHostExe
+        & $psHostExe -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex" 2>&1 | Out-Null
         $ErrorActionPreference = $prevEAP
 
         if (Test-Path $managedUv) {
@@ -374,13 +805,162 @@ function Sync-EnvPath {
     $env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
 }
 
+# npm lifecycle scripts on Windows spawn ``cmd.exe /d /s /c node <script>``.
+# PowerShell can resolve ``node`` via Get-Command while the child cmd process
+# still sees a PATH without node.exe's directory (nvm4w shims, App Paths
+# aliases, stale cross-process PATH).  Prepend the resolved node.exe parent
+# directory so postinstall hooks (electron-winstaller, native modules, etc.)
+# can find ``node``.  Regression for #48130.
+function Ensure-NodeExeOnPath {
+    $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $nodeCmd) { return $false }
+
+    $nodeExeDir = Split-Path $nodeCmd.Source -Parent
+    if (-not $nodeExeDir) { return $false }
+
+    $pathParts = $env:Path -split ";"
+    if ($pathParts -notcontains $nodeExeDir) {
+        $env:Path = "$nodeExeDir;$env:Path"
+    }
+    return $true
+}
+
+# Put the Hermes-managed Node dir at the FRONT of the persisted User PATH.
+#
+# Appending is not enough: it leaves a pre-existing system Node ahead of the
+# bundled one in every new shell, so anything launched without a curated
+# environment (a standalone hermes-setup.exe run, a user typing `npm`) silently
+# resolves the wrong Node.  Bundled must win.
+#
+# Move-to-front rather than add-if-missing, because installs made by an older
+# install.ps1 already have this dir in User PATH -- at the tail.  An
+# add-if-missing check sees it present and leaves the broken ordering in place
+# forever, so the very users the ordering bug hurt would never be repaired.
+#
+# Unrelated entries keep their relative order, including empty segments (a
+# trailing ';' is legal and common in a real User PATH; Install-Git's splitting
+# preserves them too, so this must not quietly rewrite them).  Duplicate
+# occurrences of the managed dir collapse into the single leading entry.
+# PowerShell's -ne is case-insensitive for strings, which is the right
+# comparison on Windows.  Persists only when the resulting string differs, so
+# an already-correct PATH costs one registry read and no write.
+function Set-ManagedNodeFirstOnUserPath {
+    param([string]$NodeDir)
+
+    if (-not $NodeDir) { return }
+
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $items = if ($userPath) { @($userPath -split ";") } else { @() }
+
+    $rest = @($items | Where-Object { $_ -ne $NodeDir })
+    $updated = (@($NodeDir) + $rest) -join ";"
+
+    if ($updated -ne $userPath) {
+        [Environment]::SetEnvironmentVariable("Path", $updated, "User")
+    }
+}
+
+# The npm range to install into the managed Node tree.  Prefers the checkout's
+# root package.json so the installer and the manifest cannot drift; falls back
+# to the $NpmRange constant, which is the common case here because Test-Node
+# runs before the repo is cloned.
+function Get-NpmRange {
+    $manifest = Join-Path $InstallDir "package.json"
+    if (Test-Path $manifest) {
+        try {
+            $engines = (Get-Content $manifest -Raw | ConvertFrom-Json).engines
+            if ($engines -and $engines.npm) { return [string]$engines.npm }
+        } catch { }
+    }
+    return $NpmRange
+}
+
+# Upgrade the Hermes-managed Node tree's bundled npm into $NpmRange.
+#
+# The nodejs.org zip ships whatever npm that Node major bundles -- Node 26.5.1
+# bundles npm 11.17.0, one minor below the root package.json's own
+# `engines.npm` floor of >=12.  The repo .npmrc sets `engine-strict=true`, so
+# that is fatal rather than a warning and a brand-new install dies at the first
+# `npm ci` with EBADENGINE.  Provision the right npm here instead of reacting
+# to the failure later.
+#
+# Three details are load-bearing, mirroring _nb_ensure_bundled_npm_range in
+# scripts/lib/node-bootstrap.sh and upgrade_managed_npm in
+# hermes_cli/npm_engine.py:
+#   - a temp cwd, so the checkout's own .npmrc (engine-strict,
+#     min-release-age) does not gate the very upgrade meant to satisfy it;
+#   - npm_config_min_release_age=0, which also neutralises a user ~/.npmrc;
+#   - an explicit --prefix at the managed tree, so the upgrade rewrites the
+#     tree's own npm rather than installing a second copy elsewhere.
+#
+# Best-effort: a failure leaves a working Node with an old npm, which beats no
+# Node at all, and npm_engine.py still covers the EBADENGINE that follows.
+function Update-ManagedNpm {
+    param([string]$NodeDir)
+
+    $npmCmd = Join-Path $NodeDir "npm.cmd"
+    if (-not (Test-Path $npmCmd)) { return $false }
+
+    $range = Get-NpmRange
+
+    # Skip the network round-trip when the bundled npm already satisfies the
+    # range.  Only the ">=N" shape we actually author is parsed; anything more
+    # exotic falls through to letting npm itself decide.
+    if ($range -match '^>=(\d+)') {
+        $want = [int]$Matches[1]
+        try {
+            $have = (& $npmCmd --version 2>$null)
+            if ($have -match '^(\d+)') {
+                if ([int]$Matches[1] -ge $want) { return $true }
+            }
+        } catch { }
+    }
+
+    Write-Info "Upgrading bundled npm to satisfy $range ..."
+
+    $tmpCwd = Join-Path $env:TEMP ("hermes-npm-upgrade-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $tmpCwd | Out-Null
+    $prevAge = $env:npm_config_min_release_age
+    $prevCI = $env:CI
+    $prevEAP = $ErrorActionPreference
+    Push-Location $tmpCwd
+    try {
+        $env:npm_config_min_release_age = "0"
+        $env:CI = "1"
+        # Relax EAP=Stop so npm's stderr lines don't get wrapped as
+        # ErrorRecords and short-circuit before $LASTEXITCODE is checked.
+        # Same pattern as Install-Uv.
+        $ErrorActionPreference = "Continue"
+        & $npmCmd install --global --prefix $NodeDir "npm@$range" `
+            --no-fund --no-audit --progress=false 2>&1 | Out-Null
+        $exit = $LASTEXITCODE
+    } catch {
+        $exit = 1
+    } finally {
+        $ErrorActionPreference = $prevEAP
+        Pop-Location
+        $env:npm_config_min_release_age = $prevAge
+        $env:CI = $prevCI
+        Remove-Item -Recurse -Force $tmpCwd -ErrorAction SilentlyContinue
+    }
+
+    if ($exit -ne 0) {
+        Write-Warn "Could not upgrade bundled npm to $range -- ``npm ci`` may fail with EBADENGINE."
+        Write-Info  "Fix manually: npm install -g --prefix `"$NodeDir`" npm@`"$range`""
+        return $false
+    }
+
+    Write-Success "npm $(& $npmCmd --version 2>$null) installed"
+    return $true
+}
+
 # Re-discover uv without re-installing it.  Cross-process stage drivers
 # (the desktop GUI's onboarding wizard, CI step-runners) invoke each stage
 # in a fresh powershell process, so $script:UvCmd set by Install-Uv in a
 # prior process is not visible here.  Later stages (Test-Python,
 # Install-Venv, Install-Dependencies, Install-PlatformSdks) call this
 # at the top to populate $script:UvCmd from the managed location.
-# Throws if uv is not findable — the caller's stage then surfaces a
+# Throws if uv is not findable -- the caller's stage then surfaces a
 # clean error via the stage-driver's try/catch.
 function Resolve-UvCmd {
     # Already resolved (default invocation path: Install-Uv ran earlier
@@ -396,7 +976,7 @@ function Resolve-UvCmd {
         # Stale; fall through to re-discover.
     }
 
-    # Check the managed location first — this is where Install-Uv puts it.
+    # Check the managed location first -- this is where Install-Uv puts it.
     $managedUv = Join-Path $HermesHome "bin\uv.exe"
     if (Test-Path $managedUv) {
         $script:UvCmd = $managedUv
@@ -419,6 +999,31 @@ function Resolve-UvCmd {
     }
 
     throw "uv is not installed. Run install.ps1 -Stage uv first."
+}
+
+function Resolve-AvailablePythonVersion {
+    # Return the first Python minor version uv can actually find, preferring the
+    # requested $PythonVersion and then $PythonFallbackVersions.  Returns $null
+    # when none are available.
+    #
+    # This is the cross-process-safe counterpart to Test-Python's in-memory
+    # ``$script:PythonVersion = $fallbackVer`` mutation.  Under Hermes-Setup.exe
+    # each ``-Stage NAME`` runs in a *fresh* powershell.exe, so the fallback the
+    # ``python`` stage settled on (e.g. 3.12 when 3.11 is absent) does NOT
+    # survive into the ``venv`` stage's process -- there $PythonVersion is back
+    # at its "3.11" default.  Consumers re-resolve here instead of trusting that
+    # default, which is exactly the propagation gap behind issue #50769.
+    $candidates = @($PythonVersion) + $PythonFallbackVersions
+    $seen = @{}
+    foreach ($ver in $candidates) {
+        if (-not $ver -or $seen.ContainsKey($ver)) { continue }
+        $seen[$ver] = $true
+        try {
+            $found = & $UvCmd python find $ver 2>$null
+            if ($found) { return $ver }
+        } catch { }
+    }
+    return $null
 }
 
 function Test-Python {
@@ -477,7 +1082,7 @@ function Test-Python {
 
     # Fallback: check if ANY Python 3.10+ is already available on the system
     Write-Info "Trying to find any existing Python 3.10+..."
-    foreach ($fallbackVer in @("3.12", "3.13", "3.10")) {
+    foreach ($fallbackVer in $PythonFallbackVersions) {
         try {
             $pythonPath = & $UvCmd python find $fallbackVer 2>$null
             if ($pythonPath) {
@@ -532,6 +1137,100 @@ function Test-Python {
     return $false
 }
 
+$script:GitInstallFailureReason = $null
+$script:GitBashPath = $null
+$script:GitBashProbeOutput = $null
+
+function Test-GitBashCompatibility {
+    <#
+    .SYNOPSIS
+    Verify that Git Bash can launch external MSYS programs, not just evaluate
+    shell builtins. Mandatory ASLR can allow bash.exe itself to start while
+    every child linked to msys-2.0.dll fails during fork/spawn.
+    #>
+    param([Parameter(Mandatory = $true)][string]$BashPath)
+
+    $script:GitBashProbeOutput = $null
+    if (-not (Test-Path -LiteralPath $BashPath)) {
+        $script:GitBashProbeOutput = "bash.exe was not found at $BashPath"
+        return $false
+    }
+
+    $process = New-Object System.Diagnostics.Process
+    try {
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $BashPath
+        $startInfo.Arguments = '--noprofile --norc -c "/usr/bin/true; /usr/bin/cat --version >/dev/null"'
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process.StartInfo = $startInfo
+
+        if (-not $process.Start()) {
+            $script:GitBashProbeOutput = "bash.exe did not start"
+            return $false
+        }
+        if (-not $process.WaitForExit(15000)) {
+            try { $process.Kill() } catch { }
+            $script:GitBashProbeOutput = "Git Bash compatibility probe timed out"
+            return $false
+        }
+
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        $script:GitBashProbeOutput = ("$stdout`n$stderr").Trim()
+        return ($process.ExitCode -eq 0)
+    } catch {
+        $script:GitBashProbeOutput = $_.Exception.Message
+        return $false
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Test-MandatoryAslrEnabled {
+    <# Return true only when Windows reports system-wide ForceRelocateImages=ON. #>
+    try {
+        $cmd = Get-Command Get-ProcessMitigation -ErrorAction SilentlyContinue
+        if (-not $cmd) { return $false }
+        $mitigations = & $cmd -System
+        $value = $mitigations.Aslr.ForceRelocateImages
+        return ($null -ne $value -and $value.ToString().ToUpperInvariant() -eq "ON")
+    } catch {
+        return $false
+    }
+}
+
+function Get-GitRootFromBashPath {
+    param([Parameter(Mandatory = $true)][string]$BashPath)
+
+    $binDir = Split-Path -Path $BashPath -Parent
+    if ((Split-Path -Path $binDir -Leaf) -ine "bin") {
+        return (Split-Path -Path $binDir -Parent)
+    }
+
+    $parent = Split-Path -Path $binDir -Parent
+    if ((Split-Path -Path $parent -Leaf) -ieq "usr") {
+        return (Split-Path -Path $parent -Parent)
+    }
+    return $parent
+}
+
+function New-GitBashAslrFailureReason {
+    param([Parameter(Mandatory = $true)][string]$BashPath)
+
+    $gitRoot = Get-GitRootFromBashPath -BashPath $BashPath
+    $escapedRoot = $gitRoot -replace "'", "''"
+    return @(
+        "Git Bash at $BashPath cannot launch required MSYS child processes because Windows Mandatory ASLR (ForceRelocateImages) is enabled system-wide. Reinstalling Git will not change this policy."
+        "Open PowerShell as Administrator and run:"
+        "`$gitRoot = '$escapedRoot'"
+        'Get-Item "$gitRoot\bin\bash.exe", "$gitRoot\usr\bin\*.exe" -ErrorAction SilentlyContinue | ForEach-Object { Set-ProcessMitigation -Name $_.FullName -Disable ForceRelocateImages }'
+        "Then rerun Hermes setup. If the override is blocked or later re-applied, ask your Windows administrator to allow this per-program exception."
+    ) -join [Environment]::NewLine
+}
+
 function Install-Git {
     <#
     .SYNOPSIS
@@ -564,13 +1263,31 @@ function Install-Git {
     ``HERMES_GIT_BASH_PATH`` (User scope) so Hermes can find it in a fresh
     shell without a second PATH refresh.
     #>
+    $script:GitInstallFailureReason = $null
     Write-Info "Checking Git..."
 
     if (Get-Command git -ErrorAction SilentlyContinue) {
         $version = git --version
         Write-Success "Git found ($version)"
         Set-GitBashEnvVar
-        return $true
+        if ($script:GitBashPath -and (Test-GitBashCompatibility -BashPath $script:GitBashPath)) {
+            Write-Success "Git Bash can launch MSYS programs"
+            return $true
+        }
+
+        if ($script:GitBashPath -and (Test-MandatoryAslrEnabled)) {
+            $script:GitInstallFailureReason = New-GitBashAslrFailureReason -BashPath $script:GitBashPath
+            Write-Err $script:GitInstallFailureReason
+            return $false
+        }
+
+        if ($script:GitBashPath) {
+            $probeDetail = if ($script:GitBashProbeOutput) { ": $script:GitBashProbeOutput" } else { "" }
+            Write-Warn "System Git Bash could not launch required MSYS programs$probeDetail"
+        } else {
+            Write-Warn "Git is on PATH, but its Git Bash installation could not be located."
+        }
+        Write-Info "Trying a Hermes-managed PortableGit install instead..."
     }
 
     # Download PortableGit into $HermesHome\git.  Always works as long as
@@ -681,8 +1398,25 @@ function Install-Git {
         $version = & $gitExe --version
         Write-Success "Git $version installed to $gitDir (portable, user-scoped)"
         Set-GitBashEnvVar
+        if (-not $script:GitBashPath) {
+            throw "PortableGit extraction did not produce a usable bash.exe"
+        }
+        if (-not (Test-GitBashCompatibility -BashPath $script:GitBashPath)) {
+            if (Test-MandatoryAslrEnabled) {
+                $script:GitInstallFailureReason = New-GitBashAslrFailureReason -BashPath $script:GitBashPath
+            } else {
+                $probeDetail = if ($script:GitBashProbeOutput) { " Probe output: $script:GitBashProbeOutput" } else { "" }
+                $script:GitInstallFailureReason = "Git Bash at $script:GitBashPath exists but cannot launch required MSYS programs.$probeDetail"
+            }
+            throw $script:GitInstallFailureReason
+        }
+        Write-Success "Git Bash can launch MSYS programs"
         return $true
     } catch {
+        if ($script:GitInstallFailureReason) {
+            Write-Err $script:GitInstallFailureReason
+            return $false
+        }
         Write-Err "Could not install portable Git: $_"
         Write-Info ""
         Write-Info "Fallback: install Git manually from https://git-scm.com/download/win"
@@ -699,6 +1433,7 @@ function Set-GitBashEnvVar {
     ``HERMES_GIT_BASH_PATH`` (User env scope) so Hermes can find it even before
     PATH propagation completes in a newly-spawned shell.
     #>
+    $script:GitBashPath = $null
     $candidates = @()
 
     # Our own portable Git install is ALWAYS checked first, so a broken
@@ -735,6 +1470,7 @@ function Set-GitBashEnvVar {
         if ($candidate -and (Test-Path $candidate)) {
             [Environment]::SetEnvironmentVariable("HERMES_GIT_BASH_PATH", $candidate, "User")
             $env:HERMES_GIT_BASH_PATH = $candidate
+            $script:GitBashPath = $candidate
             Write-Info "Set HERMES_GIT_BASH_PATH=$candidate"
             return
         }
@@ -744,11 +1480,11 @@ function Set-GitBashEnvVar {
     Write-Info "If needed, set HERMES_GIT_BASH_PATH manually to your bash.exe path."
 }
 
-# The desktop build runs Vite ^8, which refuses to start on Node outside
-# `^20.19 || >=22.12` -- older Node lacks node:util.styleText, so `vite build`
-# crashes with a SyntaxError that surfaces only as the opaque "Build desktop
-# app ... exit code 1" install failure. Returns $true when a `node --version`
-# string clears that floor.
+# The dependency tree's real Node floor is >=22.22.0, set by react-router 8.3.0
+# (`engines.node`). Keep this in sync with the root package.json: looser lets an
+# install reach a `npm ci` that dies with EBADENGINE, stricter replaces a working
+# user toolchain for nothing. Returns $true when a `node --version` string
+# clears that floor.
 function Test-NodeVersionOk {
     param([string]$Version)
     try {
@@ -756,9 +1492,8 @@ function Test-NodeVersionOk {
     } catch {
         return $false
     }
-    if ($v.Major -eq 20 -and $v.Minor -ge 19) { return $true }
-    if ($v.Major -ge 22 -and ($v.Major -gt 22 -or $v.Minor -ge 12)) { return $true }
-    return $false
+    if ($v.Major -eq 22) { return ($v.Minor -ge 22) }
+    return ($v.Major -gt 22)
 }
 
 function Test-Node {
@@ -767,11 +1502,12 @@ function Test-Node {
     if (Get-Command node -ErrorAction SilentlyContinue) {
         $version = node --version
         if (Test-NodeVersionOk $version) {
+            Ensure-NodeExeOnPath | Out-Null
             Write-Success "Node.js $version found"
             $script:HasNode = $true
             return $true
         }
-        Write-Warn "Node.js $version is too old for the desktop build (need ^20.19 or >=22.12)"
+        Write-Warn "Node.js $version is too old (Hermes requires Node >=26)"
     }
 
     # Prefer a Hermes-managed Node from a previous run over a too-old system one.
@@ -779,7 +1515,12 @@ function Test-Node {
     if ((Test-Path $managedNode) -and (Test-NodeVersionOk (& $managedNode --version))) {
         $version = & $managedNode --version
         $env:Path = "$HermesHome\node;$env:Path"
+        Set-ManagedNodeFirstOnUserPath "$HermesHome\node"
         Write-Success "Node.js $version found (Hermes-managed)"
+        # A tree from an older install still has that Node major's bundled
+        # npm, which is below the current engines.npm floor. No-ops when the
+        # npm is already in range, so reruns cost one --version probe.
+        Update-ManagedNpm "$HermesHome\node" | Out-Null
         $script:HasNode = $true
         return $true
     }
@@ -821,17 +1562,15 @@ function Test-Node {
 
                 # Persist to User PATH so fresh shells (and future stages
                 # in cross-process driver mode) see it.  Matches the
-                # pattern Install-Git uses for PortableGit.
-                $nodeDir = "$HermesHome\node"
-                $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-                $userPathItems = if ($userPath) { $userPath -split ";" } else { @() }
-                if ($userPathItems -notcontains $nodeDir) {
-                    $userPathItems += $nodeDir
-                    [Environment]::SetEnvironmentVariable("Path", ($userPathItems -join ";"), "User")
-                }
+                # pattern Install-Git uses for PortableGit.  See
+                # Set-ManagedNodeFirstOnUserPath for why this is a
+                # move-to-front and not an add-if-missing.
+                Set-ManagedNodeFirstOnUserPath "$HermesHome\node"
 
                 $version = & "$HermesHome\node\node.exe" --version
                 Write-Success "Node.js $version installed to $HermesHome\node\ (portable, user-scoped)"
+                # The zip's bundled npm is below the repo's engines.npm floor.
+                Update-ManagedNpm "$HermesHome\node" | Out-Null
                 $script:HasNode = $true
 
                 Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue
@@ -865,7 +1604,7 @@ function Test-Node {
             # even after a "successful" install.  The OpenJS manifest does
             # publish an arm64 installer, so this is safe.
             $wingetArgs = @(
-                'install','OpenJS.NodeJS.LTS','--silent',
+                'install','OpenJS.NodeJS','--silent',
                 '--accept-package-agreements','--accept-source-agreements'
             )
             if ((Get-WindowsArch) -eq 'arm64') {
@@ -890,6 +1629,42 @@ function Test-Node {
     Write-Info "Install manually: https://nodejs.org/en/download/"
     $script:HasNode = $false
     return $true
+}
+
+function Update-ProcessPathForPackages {
+    # Make freshly-installed shims (rg.exe, ffmpeg.exe) visible to Get-Command in
+    # THIS process without spawning a new shell, by folding the persisted
+    # User+Machine hives plus winget's alias-shim directory into $env:Path.
+    # Called after every package-manager attempt (winget/choco/scoop): previously
+    # PATH was only refreshed inside the winget branch, so a successful
+    # choco/scoop fallback -- or any install on a box without winget -- could be
+    # misreported as "not installed".
+    #
+    # MERGE rather than overwrite: start from the existing process PATH so any
+    # process-only entries added earlier in this installer run survive, then
+    # APPEND hive/winget-Links entries not already present (case-insensitive,
+    # order-preserving dedupe). A wholesale replace would silently drop those
+    # process-only entries.
+    $candidates = @()
+    $candidates += $env:Path
+    $candidates += [Environment]::GetEnvironmentVariable("Path", "User")
+    $candidates += [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $wingetLinks = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links"
+    if (Test-Path $wingetLinks) {
+        $candidates += $wingetLinks
+    }
+    $seen = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    $ordered = New-Object System.Collections.Generic.List[string]
+    foreach ($chunk in $candidates) {
+        if ([string]::IsNullOrEmpty($chunk)) { continue }
+        foreach ($entry in $chunk.Split(';')) {
+            $trimmed = $entry.Trim()
+            if ($trimmed -and $seen.Add($trimmed)) {
+                $ordered.Add($trimmed)
+            }
+        }
+    }
+    $env:Path = [string]::Join(';', $ordered)
 }
 
 function Install-SystemPackages {
@@ -961,25 +1736,33 @@ function Install-SystemPackages {
             try {
                 $output = winget install --exact --id $pkg --source winget --silent `
                     --accept-package-agreements --accept-source-agreements 2>&1
+                $code = $LASTEXITCODE
                 $output | Out-File -FilePath $log -Encoding utf8
-                "winget exit: $LASTEXITCODE" | Out-File -FilePath $log -Encoding utf8 -Append
+                "winget exit: $code" | Out-File -FilePath $log -Encoding utf8 -Append
+                # 0x8A15002B (-1978335189) = APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE.
+                # winget treats `install` on a package it already has registered as
+                # an *upgrade*, finds no newer version, and bails with this code --
+                # even when the binary is gone from disk/PATH (stale registration,
+                # files removed outside winget, or a missing alias shim). We KNOW the
+                # command was missing (that's why we're here), so a plain install
+                # dead-ends forever. Force a reinstall to repair the registration so
+                # the shim reappears.
+                if ($code -eq -1978335189) {
+                    "-> already-installed/no-upgrade; retrying with --force" | Out-File -FilePath $log -Encoding utf8 -Append
+                    $output = winget install --exact --id $pkg --source winget --silent --force `
+                        --accept-package-agreements --accept-source-agreements 2>&1
+                    $output | Out-File -FilePath $log -Encoding utf8 -Append
+                    "winget exit (force): $LASTEXITCODE" | Out-File -FilePath $log -Encoding utf8 -Append
+                }
             } catch {
                 $_ | Out-File -FilePath $log -Encoding utf8 -Append
                 "winget exit: <exception>" | Out-File -FilePath $log -Encoding utf8 -Append
             }
         }
-        # Refresh PATH from both env-var hives AND winget's alias shim directory.
-        # winget exposes packages via "command line aliases" in %LOCALAPPDATA%\
-        # Microsoft\WinGet\Links, which is added to PATH by the AppExecutionAlias
-        # machinery only in *newly-spawned* shells -- not the current process.
-        # Without this addition, Get-Command rg below would falsely return null
-        # immediately after a successful install.
-        $wingetLinks = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links"
-        $envPath = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
-        if (Test-Path $wingetLinks) {
-            $envPath = "$envPath;$wingetLinks"
-        }
-        $env:Path = $envPath
+        # Refresh PATH so packages winget exposed via "command line aliases" in
+        # %LOCALAPPDATA%\Microsoft\WinGet\Links (added to PATH only in
+        # newly-spawned shells, not this process) are visible to Get-Command below.
+        Update-ProcessPathForPackages
         if ($needRipgrep -and (Get-Command rg -ErrorAction SilentlyContinue)) {
             Write-Success "ripgrep installed"
             $script:HasRipgrep = $true
@@ -1005,6 +1788,7 @@ function Install-SystemPackages {
         foreach ($pkg in $chocoPkgs) {
             try { choco install $pkg -y 2>&1 | Out-Null } catch { }
         }
+        Update-ProcessPathForPackages
         if ($needRipgrep -and (Get-Command rg -ErrorAction SilentlyContinue)) {
             Write-Success "ripgrep installed via chocolatey"
             $script:HasRipgrep = $true
@@ -1023,6 +1807,7 @@ function Install-SystemPackages {
         foreach ($pkg in $scoopPkgs) {
             try { scoop install $pkg 2>&1 | Out-Null } catch { }
         }
+        Update-ProcessPathForPackages
         if ($needRipgrep -and (Get-Command rg -ErrorAction SilentlyContinue)) {
             Write-Success "ripgrep installed via scoop"
             $script:HasRipgrep = $true
@@ -1116,6 +1901,7 @@ function Install-Repository {
                 # users hit on update. Pin autocrlf=false so the dirt is never
                 # created in the first place.
                 git -c windows.appendAtomically=false config core.autocrlf false 2>$null
+                Discard-LockfileChurn $InstallDir
                 # Preserve any real local changes before the checkout instead of
                 # discarding them with `reset --hard HEAD`. The old hard reset
                 # silently destroyed agent-edited source on managed clones (the
@@ -1125,12 +1911,26 @@ function Install-Repository {
                 # agent-created dirs (e.g. tinker-atropos/) survive too.
                 $statusOut = git -c windows.appendAtomically=false status --porcelain 2>$null
                 if (-not [string]::IsNullOrWhiteSpace(($statusOut -join "`n"))) {
+                    # A previously interrupted update can leave the index with
+                    # unmerged entries. In that state `git stash` aborts with
+                    # "could not write index" and the following `git checkout`
+                    # aborts with "you need to resolve your current index first"
+                    # -- the GUI "git checkout main failed (exit 1)" install
+                    # failure. Clear the conflict markers with `git reset` first:
+                    # working-tree changes are kept (and stashed just below); only
+                    # the index conflict state is dropped. Mirrors the `hermes
+                    # update` path (#4735).
+                    $unmergedOut = git -c windows.appendAtomically=false ls-files --unmerged 2>$null
+                    if (-not [string]::IsNullOrWhiteSpace(($unmergedOut -join "`n"))) {
+                        Write-Info "Clearing unmerged index entries from a previous conflict..."
+                        git -c windows.appendAtomically=false reset -q 2>$null
+                    }
                     $stashName = "hermes-install-autostash-" + (Get-Date -Format "yyyyMMdd-HHmmss")
                     Write-Info "Local changes detected, stashing before update..."
                     git -c windows.appendAtomically=false stash push --include-untracked -m "$stashName"
                     if ($LASTEXITCODE -eq 0) { $autostashRef = "stash@{0}" }
                 }
-                git -c windows.appendAtomically=false fetch origin
+                git -c windows.appendAtomically=false fetch origin $Branch
                 if ($LASTEXITCODE -ne 0) { throw "git fetch failed (exit $LASTEXITCODE)" }
                 # Precedence: Commit > Tag > Branch.  Commit and Tag check
                 # out as detached HEAD intentionally -- they're meant to be
@@ -1139,8 +1939,32 @@ function Install-Repository {
                     # Make sure we have the commit locally (a tag-less commit
                     # SHA isn't always reachable from any one branch fetch).
                     git -c windows.appendAtomically=false fetch origin $Commit
-                    git -c windows.appendAtomically=false checkout --detach $Commit
-                    if ($LASTEXITCODE -ne 0) { throw "git checkout $Commit failed (exit $LASTEXITCODE)" }
+                    # A commit pin must never move an existing install
+                    # BACKWARDS. hermes-setup.exe bakes its build-time commit
+                    # into the binary (BUILD_PIN_COMMIT) and passes it as
+                    # -Commit on every install-mode run -- including the retry
+                    # the desktop's "Update didn't finish" screen kicks off. An
+                    # installer built months ago would otherwise rewind a
+                    # current checkout to its build commit, leaving ancient
+                    # code against a current venv (npm workspaces and Python
+                    # deps that no longer match: the #74xxx report). Skip the
+                    # pin when the target is already an ancestor of HEAD; a
+                    # fresh clone has no such ancestry and pins normally.
+                    $skipRollback = $false
+                    if (-not $ForceCommit) {
+                        git -c windows.appendAtomically=false merge-base --is-ancestor $Commit HEAD 2>$null
+                        $isAncestor = ($LASTEXITCODE -eq 0)
+                        $pinnedSha = (& git -c windows.appendAtomically=false rev-parse "$Commit^{commit}" 2>$null)
+                        $headSha = (& git -c windows.appendAtomically=false rev-parse HEAD 2>$null)
+                        $skipRollback = $isAncestor -and ($pinnedSha -ne $headSha)
+                    }
+                    if ($skipRollback) {
+                        Write-Warn "Ignoring -Commit $Commit`: the checkout is already newer."
+                        Write-Warn "Pinning to it would roll this install back. Pass -ForceCommit to override."
+                    } else {
+                        git -c windows.appendAtomically=false checkout --detach $Commit
+                        if ($LASTEXITCODE -ne 0) { throw "git checkout $Commit failed (exit $LASTEXITCODE)" }
+                    }
                 } elseif ($Tag) {
                     git -c windows.appendAtomically=false fetch origin "refs/tags/${Tag}:refs/tags/${Tag}"
                     git -c windows.appendAtomically=false checkout --detach "refs/tags/$Tag"
@@ -1148,8 +1972,16 @@ function Install-Repository {
                 } else {
                     git -c windows.appendAtomically=false checkout $Branch
                     if ($LASTEXITCODE -ne 0) { throw "git checkout $Branch failed (exit $LASTEXITCODE)" }
+                    # Managed installs should follow origin/$Branch exactly. If
+                    # the checkout has diverged (or has local-only commits),
+                    # ff-only pull cannot succeed -- mirror ``hermes update`` and
+                    # reset to the fetched remote so bootstrap/install can recover.
                     git -c windows.appendAtomically=false pull --ff-only origin $Branch
-                    if ($LASTEXITCODE -ne 0) { throw "git pull failed (exit $LASTEXITCODE)" }
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Warn "Fast-forward not possible; resetting managed install to origin/$Branch..."
+                        git -c windows.appendAtomically=false reset --hard "origin/$Branch"
+                        if ($LASTEXITCODE -ne 0) { throw "git reset --hard origin/$Branch failed (exit $LASTEXITCODE)" }
+                    }
                 }
 
                 if ($autostashRef) {
@@ -1179,15 +2011,35 @@ function Install-Repository {
 
                     if ($restoreNow) {
                         Write-Info "Restoring local changes..."
-                        git -c windows.appendAtomically=false stash apply $autostashRef
-                        if ($LASTEXITCODE -eq 0) {
+                        $restoreOutput = @(git -c windows.appendAtomically=false stash apply $autostashRef 2>&1)
+                        $restoreExit = $LASTEXITCODE
+                        $conflictedFiles = @(
+                            git -c windows.appendAtomically=false diff --name-only --diff-filter=U 2>$null
+                        ) | Where-Object { $_ -and $_.ToString().Trim() }
+                        if (($restoreExit -eq 0) -and ($conflictedFiles.Count -eq 0)) {
                             git -c windows.appendAtomically=false stash drop $autostashRef 2>$null
                             Write-Warn "Local changes were restored on top of the updated codebase."
                             Write-Warn "Review git diff / git status if Hermes behaves unexpectedly."
                         } else {
-                            Write-Err "Update succeeded, but restoring local changes failed. Your changes are still preserved in git stash."
-                            Write-Info "Resolve manually with: git stash apply $autostashRef"
-                            throw "git stash apply failed after update"
+                            Write-Err "Update pulled new code, but restoring local changes hit conflicts."
+                            foreach ($line in $restoreOutput) {
+                                if ($line -and $line.ToString().Trim()) {
+                                    Write-Host $line
+                                }
+                            }
+                            if ($conflictedFiles.Count -gt 0) {
+                                Write-Host ""
+                                Write-Host "Conflicted files:"
+                                foreach ($file in $conflictedFiles) {
+                                    Write-Host "  - $file"
+                                }
+                            }
+                            Write-Host ""
+                            Write-Info "Your stashed changes are preserved -- nothing is lost."
+                            Write-Info "  Stash ref: $autostashRef"
+                            git -c windows.appendAtomically=false reset --hard HEAD 2>$null | Out-Null
+                            Write-Info "Working tree reset to clean state."
+                            Write-Info "Restore your changes later with: git stash apply $autostashRef"
                         }
                     } else {
                         Write-Info "Skipped restoring local changes."
@@ -1246,7 +2098,7 @@ function Install-Repository {
         Write-Info "Trying SSH clone..."
         $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o ConnectTimeout=5"
         try {
-            git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlSsh $InstallDir
+            Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlSsh $InstallDir }
             if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
         } catch { }
         $env:GIT_SSH_COMMAND = $null
@@ -1255,7 +2107,7 @@ function Install-Repository {
             if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
             Write-Info "SSH failed, trying HTTPS..."
             try {
-                git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlHttps $InstallDir
+                Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlHttps $InstallDir }
                 if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
             } catch { }
         }
@@ -1292,11 +2144,54 @@ function Install-Repository {
                     Move-Item $extractedDir.FullName $InstallDir -Force
                     Write-Success "Downloaded and extracted"
 
-                    # Initialize git repo so updates work later
+                    # Initialize git repo so updates work later. A bare
+                    # `git init` leaves NO HEAD -- desktop's write-build-stamp
+                    # then hard-fails with "could not determine git commit"
+                    # (#50823 / #61657). Fetch the requested ref and force-check
+                    # it out (-f) so untracked ZIP files cannot block checkout.
                     Push-Location $InstallDir
                     git -c windows.appendAtomically=false init 2>$null
                     git -c windows.appendAtomically=false config windows.appendAtomically false 2>$null
+                    # Pin autocrlf=false BEFORE the checkout below. Git for Windows
+                    # defaults to core.autocrlf=true, which would renormalize the
+                    # repo's LF text files to CRLF in the working tree during
+                    # `checkout -f FETCH_HEAD` -- leaving this freshly-created
+                    # managed checkout dirty vs HEAD and aborting the next
+                    # `hermes update` (see the notes at the shared clone-path
+                    # config below and install.ps1:1461-1469). The later pin on
+                    # the shared path is idempotent and still covers git clones.
+                    git -c windows.appendAtomically=false config core.autocrlf false 2>$null
                     git remote add origin $RepoUrlHttps 2>$null
+                    $fetchRef = if ($Commit) { $Commit } elseif ($Tag) { "refs/tags/$Tag" } else { $Branch }
+                    Write-Info "Fetching $fetchRef so the ZIP checkout has a resolvable HEAD..."
+                    $prevZipEAP = $ErrorActionPreference
+                    $ErrorActionPreference = "Continue"
+                    try {
+                        git -c windows.appendAtomically=false fetch --depth 1 origin $fetchRef 2>&1 | Out-Null
+                        if ($LASTEXITCODE -eq 0) {
+                            if ($Commit -or $Tag) {
+                                git -c windows.appendAtomically=false checkout -f --detach FETCH_HEAD 2>&1 | Out-Null
+                            } else {
+                                git -c windows.appendAtomically=false checkout -f -B $Branch FETCH_HEAD 2>&1 | Out-Null
+                            }
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-Success "ZIP checkout pinned to $fetchRef"
+                            } else {
+                                # Checkout blocked, but FETCH_HEAD still has a SHA we can stamp with.
+                                $fetchSha = & git -c windows.appendAtomically=false rev-parse FETCH_HEAD 2>$null
+                                if ($LASTEXITCODE -eq 0 -and $fetchSha) {
+                                    if (-not $env:GITHUB_SHA) { $env:GITHUB_SHA = ("$fetchSha").Trim() }
+                                    Write-Warn "ZIP checkout failed; seeded GITHUB_SHA from FETCH_HEAD for desktop stamp"
+                                } else {
+                                    Write-Warn "ZIP extract succeeded but git checkout failed -- desktop build may need `$env:GITHUB_SHA"
+                                }
+                            }
+                        } else {
+                            Write-Warn "ZIP extract succeeded but git fetch of $fetchRef failed -- desktop build may need `$env:GITHUB_SHA"
+                        }
+                    } finally {
+                        $ErrorActionPreference = $prevZipEAP
+                    }
                     Pop-Location
                     Write-Success "Git repo initialized for future updates"
 
@@ -1364,18 +2259,163 @@ function Install-Venv {
         Write-Info "Skipping virtual environment (-NoVenv)"
         return
     }
-    
+
+    # Re-resolve the interpreter before creating the venv.  Under Hermes-Setup.exe
+    # each stage runs in its own powershell.exe, so the fallback the `python`
+    # stage picked (e.g. 3.12 when 3.11 is absent) did NOT propagate into this
+    # fresh process -- $PythonVersion is back at its "3.11" default.  Trusting it
+    # here made `uv venv venv --python 3.11` fail with exit 2 on machines without
+    # 3.11 even though the `python` stage reported success (issue #50769).
+    $resolved = Resolve-AvailablePythonVersion
+    if ($resolved -and $resolved -ne $PythonVersion) {
+        Write-Info "Python $PythonVersion not available; using detected Python $resolved"
+        $script:PythonVersion = $resolved
+    }
+
     Write-Info "Creating virtual environment with Python $PythonVersion..."
     
     Push-Location $InstallDir
-    
+
+    # Tasks we disabled below and must re-enable no matter how this stage
+    # exits. Populated only with tasks that were ENABLED before we touched
+    # them, so a task the user deliberately disabled is never re-armed.
+    $gatewayTasksDisabled = @()
+    try {
     if (Test-Path "venv") {
         Write-Info "Virtual environment already exists, recreating..."
-        Remove-Item -Recurse -Force "venv"
+        # On Windows, native Python extensions (e.g. _bcrypt.pyd, tornado's
+        # speedups.pyd) are loaded as DLLs by any running hermes process.
+        # Windows denies deletion of loaded DLLs, so every process running out
+        # of this venv must be stopped before removing it -- otherwise
+        # Remove-Item fails with "Access to the path '...' is denied" and the
+        # whole install/update aborts at this stage.
+        if ($env:OS -eq "Windows_NT") {
+            $myPid = $PID
+            Write-Info "Stopping any running hermes processes before recreating venv..."
+            # Disarm the respawner FIRST: the gateway autostart Scheduled Task
+            # relaunches a killed gateway within seconds, and losing that race
+            # re-locks the venv's .pyd files between our kill sweep and
+            # Remove-Item (the July 2026 _brotlicffi.pyd incident). schtasks
+            # /End stops a running task instance; /Change /DISABLE stops it
+            # from re-firing mid-install. (The Startup-folder .vbs fallback is
+            # NOT touched: it only fires at logon, so it cannot respawn a
+            # gateway mid-install.) Re-enabled in the finally below -- including
+            # on failure -- but only for tasks that were enabled to begin with.
+            # Best-effort: a missing task just errors quietly.
+            try {
+                schtasks /Query /FO CSV 2>$null | ConvertFrom-Csv | Where-Object { $_.TaskName -like '*Hermes_Gateway*' } | ForEach-Object {
+                    $tn = $_.TaskName
+                    if ($_.Status -eq 'Disabled') {
+                        Write-Info "  gateway autostart task $tn is already disabled; leaving it that way"
+                        return
+                    }
+                    schtasks /End /TN $tn 2>$null | Out-Null
+                    schtasks /Change /TN $tn /DISABLE 2>$null | Out-Null
+                    $gatewayTasksDisabled += $tn
+                    Write-Info "  disabled gateway autostart task $tn for the duration of the install"
+                }
+            } catch {
+                Write-Warn "Could not enumerate gateway scheduled tasks: $($_.Exception.Message)"
+            }
+            # The launcher CLI (hermes.exe) plus its child tree.
+            & taskkill /F /T /IM hermes.exe /FI "PID ne $myPid" 2>$null | Out-Null
+            # taskkill /IM hermes.exe is NOT enough: the gateway/agent that a
+            # scheduled task or watchdog autostarts runs as
+            # `pythonw.exe -m hermes_cli.main gateway run` straight out of
+            # venv\Scripts\, so its image name is python/pythonw, not hermes.exe.
+            # That process holds the venv's .pyd files open and re-triggers the
+            # access-denied failure. Select only roots whose executable lives
+            # under this venv, then stop each root's whole process tree. Some
+            # Hermes children re-exec through .hermes-runtime, so killing only
+            # the selected venv process can leave its child holding the install
+            # open. The path-prefix check still keeps unrelated Python processes
+            # outside this venv untouched.
+            #
+            # The gateway autostart task registers with /RL LIMITED as the current
+            # user (see hermes_cli/gateway_windows.py), so the installer always
+            # runs at equal-or-higher integrity and can read its executable path.
+            # Get-CimInstance is used over Get-Process because it returns a null
+            # ExecutablePath for a process it cannot inspect (a different session)
+            # instead of throwing, so an unreadable process is skipped rather than
+            # aborting the whole sweep.
+            #
+            # The sweep is a bounded LOOP, not single-shot: supervised processes
+            # (the Desktop app's backend, a watchdog-managed gateway) respawn in
+            # the window between one kill pass and the delete. Each pass re-
+            # enumerates; three consecutive clean passes (or the attempt cap)
+            # ends the loop.
+            $venvPrefix = [System.IO.Path]::GetFullPath((Join-Path $InstallDir "venv")).TrimEnd('\') + '\'
+            $cleanPasses = 0
+            for ($sweep = 0; $sweep -lt 10 -and $cleanPasses -lt 3; $sweep++) {
+                $found = 0
+                try {
+                    Get-CimInstance Win32_Process -ErrorAction Stop |
+                        Where-Object { $_.ProcessId -ne $myPid -and $_.ExecutablePath -and $_.ExecutablePath.StartsWith($venvPrefix, [System.StringComparison]::OrdinalIgnoreCase) } |
+                        ForEach-Object {
+                            $found++
+                            $treePid = [string]$_.ProcessId
+                            Write-Info "  stopping process tree at PID $treePid ($($_.Name)) running from venv"
+                            & taskkill /F /T /PID $treePid 2>$null | Out-Null
+                        }
+                } catch {
+                    Write-Warn "Could not enumerate venv processes: $($_.Exception.Message)"
+                    break
+                }
+                if ($found -eq 0) { $cleanPasses++ } else { $cleanPasses = 0 }
+                Start-Sleep -Milliseconds 400
+            }
+        }
+        # Rename-then-delete: on Windows a directory RENAME succeeds even while
+        # files inside it are mapped as DLLs (only in-place delete/replace of
+        # the mapped file is denied, and only same-volume renames are atomic
+        # moves). Moving the old venv aside means `uv venv` can create a fresh
+        # one immediately even if some straggler still holds a .pyd from the
+        # old tree; the renamed dir is deleted best-effort (now, and by the
+        # cleanup pass below on the NEXT install if a handle outlives this one).
+        $staleName = "venv.stale.{0}" -f (Get-Date -Format "yyyyMMddHHmmss")
+        $renamed = $false
+        try {
+            Rename-Item -Path "venv" -NewName $staleName -ErrorAction Stop
+            $renamed = $true
+        } catch {
+            Write-Warn "Could not rename venv aside ($($_.Exception.Message)); falling back to in-place delete"
+        }
+        if ($renamed) {
+            Remove-Item -Recurse -Force $staleName -ErrorAction SilentlyContinue
+            if (Test-Path $staleName) {
+                Write-Warn "Old venv parked at $staleName (a process still holds files in it); it will be cleaned up on the next install"
+            }
+        } else {
+            Remove-Item -Recurse -Force "venv" -ErrorAction SilentlyContinue
+            # A killed process can take a moment to release its file handles, so a
+            # first Remove-Item may still hit a locked .pyd. Retry once after a short
+            # pause before giving up and letting the stage fail loudly.
+            if (Test-Path "venv") {
+                Start-Sleep -Seconds 2
+                Remove-Item -Recurse -Force "venv"
+            }
+        }
+    }
+
+    # Clean up parked venvs from previous installs whose handles have since
+    # been released. Best-effort -- a still-held tree just stays for next time.
+    Get-ChildItem -Directory -Filter "venv.stale.*" -ErrorAction SilentlyContinue | ForEach-Object {
+        Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue
     }
     
-    # uv creates the venv and pins the Python version in one step
-    & $UvCmd venv venv --python $PythonVersion
+    # uv creates the venv and pins the Python version in one step.  uv emits
+    # normal progress such as "Using CPython ..." on stderr; under Windows
+    # PowerShell 5.1 with EAP=Stop that stderr is a NativeCommandError unless
+    # we temporarily relax EAP and trust $LASTEXITCODE for real failures.
+    Invoke-NativeWithRelaxedErrorAction { & $UvCmd venv venv --python $PythonVersion }
+    # Relaxing EAP above means a *genuine* uv-venv failure (exit != 0) no longer
+    # aborts on its own. Capture $LASTEXITCODE immediately and fail fast, so the
+    # `venv` stage can't falsely report success (and Invoke-Stage can't emit
+    # ok=true) when the venv was never created.
+    $venvExitCode = $LASTEXITCODE
+    if ($venvExitCode -ne 0) {
+        throw "Failed to create virtual environment (uv venv exited with $venvExitCode)"
+    }
 
     # Neutralize any inherited UV_PYTHON (e.g. $env:UV_PYTHON = "3.14" left in
     # the user's shell). uv honours UV_PYTHON over an existing venv for the
@@ -1388,9 +2428,23 @@ function Install-Venv {
     if (Test-Path $venvPythonExe) {
         $env:UV_PYTHON = $venvPythonExe
     }
+    } finally {
+        Pop-Location
+        # Re-arm the gateway autostart tasks disabled during the venv teardown
+        # -- in a finally so a failed teardown/creation can never strand the
+        # user's gateway autostart in the disabled state. Same function scope,
+        # so the list survives even under the stage-per-process bootstrap.
+        # Deliberately NOT started here -- dependencies aren't installed yet;
+        # the task fires normally on next logon and `hermes update` / the
+        # gateway resume path handles the immediate restart.
+        if ($gatewayTasksDisabled -and $gatewayTasksDisabled.Count -gt 0) {
+            foreach ($tn in $gatewayTasksDisabled) {
+                schtasks /Change /TN $tn /ENABLE 2>$null | Out-Null
+            }
+            Write-Info "Re-enabled gateway autostart task(s): $($gatewayTasksDisabled -join ', ')"
+        }
+    }
 
-    Pop-Location
-    
     Write-Success "Virtual environment ready (Python $PythonVersion)"
 }
 
@@ -1445,7 +2499,7 @@ function Install-Dependencies {
         # in the wrong directory and imports fail with ModuleNotFoundError.
         # (Mirrors the same flag in scripts/install.sh::install_deps.)
         $env:UV_PROJECT_ENVIRONMENT = "$InstallDir\venv"
-        & $UvCmd sync --extra all --locked
+        Invoke-NativeWithRelaxedErrorAction { & $UvCmd sync --extra all --locked }
         if ($LASTEXITCODE -eq 0) {
             Write-Success "Main package installed (hash-verified via uv.lock)"
             $script:InstalledTier = "hash-verified (uv.lock)"
@@ -1520,7 +2574,7 @@ except Exception:
     if (-not $skipPipFallback) {
         foreach ($tier in $installTiers) {
         Write-Info "Trying tier: $($tier.Name) ..."
-        & $UvCmd pip install -e $tier.Spec
+        Invoke-NativeWithRelaxedErrorAction { & $UvCmd pip install -e $tier.Spec }
         if ($LASTEXITCODE -eq 0) {
             Write-Success "Main package installed ($($tier.Name))"
             $script:InstalledTier = $tier.Name
@@ -1569,6 +2623,48 @@ except Exception:
         Write-Success "Baseline imports verified in venv"
     }
 
+    if (-not $NoVenv) {
+        # uv on Windows can register hermes.exe in dist-info/RECORD but fail to
+        # materialise the .exe (file lock during self-update, distlib edge case).
+        # Catch it here so a fresh install/update does not finish with a broken
+        # `hermes` command while hermes-agent.exe / hermes-acp.exe exist
+        $scriptsDir = Join-Path $InstallDir "venv\Scripts"
+        $pythonExe = Join-Path $scriptsDir "python.exe"
+        if ((Test-Path $scriptsDir) -and (Test-Path $pythonExe)) {
+            $scriptNames = & $pythonExe -c @"
+import tomllib
+with open('pyproject.toml', 'rb') as fh:
+    scripts = tomllib.load(fh).get('project', {}).get('scripts', {}) or {}
+print(','.join(scripts))
+"@ 2>$null
+            if ($LASTEXITCODE -eq 0 -and $scriptNames) {
+                $expected = @($scriptNames.Trim().Split(',') | Where-Object { $_ })
+                $missing = @()
+                foreach ($name in $expected) {
+                    $exe = Join-Path $scriptsDir "$name.exe"
+                    if (-not (Test-Path $exe)) { $missing += "$name.exe" }
+                }
+                if ($missing.Count -gt 0) {
+                    Write-Warn "Console entry point(s) missing: $($missing -join ', ')"
+                    Write-Info "Reinstalling entry points..."
+                    $env:UV_PROJECT_ENVIRONMENT = "$InstallDir\venv"
+                    Invoke-NativeWithRelaxedErrorAction { & $UvCmd pip install --reinstall -e . }
+                    $stillMissing = @()
+                    foreach ($name in $expected) {
+                        $exe = Join-Path $scriptsDir "$name.exe"
+                        if (-not (Test-Path $exe)) { $stillMissing += "$name.exe" }
+                    }
+                    if ($stillMissing.Count -gt 0) {
+                        Write-Warn "Entry points still missing after repair: $($stillMissing -join ', ')"
+                        Write-Info "Workaround: `"$pythonExe`" -m hermes_cli.main <command>"
+                    } else {
+                        Write-Success "Console entry points restored"
+                    }
+                }
+            }
+        }
+    }
+
     # Verify the dashboard deps specifically -- they're the most common thing
     # users hit and lazy-import errors from `hermes dashboard` are confusing.
     # If tier 1 failed (the common case), [web] was still picked up by tiers
@@ -1576,6 +2672,7 @@ except Exception:
     $pythonExe = if (-not $NoVenv) { "$InstallDir\venv\Scripts\python.exe" } else { (& $UvCmd python find $PythonVersion) }
     if (Test-Path $pythonExe) {
         $webOk = $false
+        $webServerSyntaxOk = $false
         # Relax EAP=Stop while running the import probe; see the matching
         # comment on the baseline-imports check above.  Python writes
         # deprecation warnings to stderr and we don't want those wrapped
@@ -1587,6 +2684,10 @@ except Exception:
             & $pythonExe -c "import fastapi, uvicorn" 2>&1 | Out-Null
             if ($LASTEXITCODE -eq 0) { $webOk = $true }
         } catch { }
+        try {
+            & $pythonExe -m py_compile "$InstallDir\hermes_cli\web_server.py" 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { $webServerSyntaxOk = $true }
+        } catch { }
         $ErrorActionPreference = $prevEAP
         if (-not $webOk) {
             Write-Warn "fastapi/uvicorn not importable -- `hermes dashboard` will not work."
@@ -1597,6 +2698,9 @@ except Exception:
             } else {
                 Write-Warn "Could not install [web] extra. Run manually: uv pip install --python `"$pythonExe`" `"fastapi>=0.104,<1`" `"uvicorn[standard]>=0.24,<1`""
             }
+        }
+        if (-not $webServerSyntaxOk) {
+            throw "dashboard backend source failed syntax check: hermes_cli/web_server.py"
         }
     }
     
@@ -1611,12 +2715,36 @@ function Set-PathVariable {
     if ($NoVenv) {
         $hermesBin = "$InstallDir"
     } else {
-        $hermesBin = "$InstallDir\venv\Scripts"
+        # Expose ONLY the hermes launchers on PATH -- never the whole
+        # venv\Scripts directory. venv\Scripts contains python.exe /
+        # pythonw.exe / pip.exe, and putting it on the user PATH silently
+        # hijacks the `python` command in every terminal on the machine
+        # (#83797): unrelated projects start resolving python to Hermes'
+        # runtime interpreter. A dedicated bin dir with copies of the
+        # launcher exes keeps `hermes` globally available without
+        # shadowing anything. (Launcher exes embed the venv interpreter
+        # path, so they work from any location and survive updates.)
+        $hermesBin = "$InstallDir\bin"
+        New-Item -ItemType Directory -Force -Path $hermesBin | Out-Null
+        foreach ($launcher in @("hermes.exe", "hermes-acp.exe")) {
+            $src = "$InstallDir\venv\Scripts\$launcher"
+            if (Test-Path $src) {
+                Copy-Item -Force $src "$hermesBin\$launcher"
+            }
+        }
     }
     
-    # Add the venv Scripts dir to user PATH so hermes is globally available
-    # On Windows, the hermes.exe in venv\Scripts\ has the venv Python baked in
     $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
+
+    # Migrate installs that got venv\Scripts onto PATH from earlier
+    # installer versions -- remove it so the python shadowing stops.
+    $legacyBin = "$InstallDir\venv\Scripts"
+    if ((-not $NoVenv) -and $currentPath -like "*$legacyBin*") {
+        $cleaned = ($currentPath -split ';' | Where-Object { $_ -and $_ -ne $legacyBin }) -join ';'
+        [Environment]::SetEnvironmentVariable("Path", $cleaned, "User")
+        $currentPath = $cleaned
+        Write-Info "Removed legacy venv\Scripts from user PATH (kept hermes via $hermesBin)"
+    }
     
     if ($currentPath -notlike "*$hermesBin*") {
         [Environment]::SetEnvironmentVariable(
@@ -1647,13 +2775,13 @@ function Set-PathVariable {
 
 function Write-BootstrapMarker {
     # Writes $InstallDir\.hermes-bootstrap-complete which tells the Hermes
-    # desktop app (apps/desktop/electron/main.cjs) "install.ps1 ran
-    # successfully — DON'T trigger the legacy first-launch bootstrap
+    # desktop app (apps/desktop/electron/main.ts) "install.ps1 ran
+    # successfully -- DON'T trigger the legacy first-launch bootstrap
     # runner."
     #
-    # Schema mirrors what main.cjs's writeBootstrapMarker() / isBootstrap
+    # Schema mirrors what main.ts's writeBootstrapMarker() / isBootstrap
     # Complete() expect. Keep this in lockstep when either side changes:
-    #   apps/desktop/electron/main.cjs lines 1199-1222
+    #   apps/desktop/electron/main.ts lines 1199-1222
     #   BOOTSTRAP_MARKER_SCHEMA_VERSION = 1 (line 187)
     #
     # Pinned commit/branch come from -Commit + -Branch flags (passed by
@@ -1669,7 +2797,7 @@ function Write-BootstrapMarker {
     # Resolve the pinned commit: explicit -Commit wins, otherwise read
     # the checkout's HEAD via git. If git can't run, leave commit empty
     # and the marker will fail desktop validation (pinnedCommit.length
-    # >= 7) — better to be invalid than wrong.
+    # >= 7) -- better to be invalid than wrong.
     $pinnedCommit = $Commit
     if (-not $pinnedCommit) {
         # PS 5.1 doesn't support the ?. null-conditional operator, so
@@ -1684,7 +2812,7 @@ function Write-BootstrapMarker {
                     $pinnedCommit = $resolved.Trim()
                 }
             } catch {
-                # Ignore — pinnedCommit stays empty, marker stays invalid,
+                # Ignore -- pinnedCommit stays empty, marker stays invalid,
                 # desktop falls through to its legacy bootstrap path.
             } finally {
                 Pop-Location
@@ -1703,7 +2831,7 @@ function Write-BootstrapMarker {
         pinnedCommit  = $pinnedCommit
         pinnedBranch  = $pinnedBranch
         completedAt   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-        # desktopVersion field intentionally omitted — only the desktop
+        # desktopVersion field intentionally omitted -- only the desktop
         # app knows its own version, and the marker validator doesn't
         # require it. The desktop fills it in if/when it writes its
         # own marker (e.g. after a future in-app upgrade).
@@ -1712,7 +2840,7 @@ function Write-BootstrapMarker {
 
     # Write WITHOUT a UTF-8 BOM. PowerShell 5.1's `Set-Content -Encoding UTF8`
     # always emits a BOM, and Node's plain JSON.parse rejects the BOM as an
-    # unexpected character — so a BOM'd marker would silently fail the
+    # unexpected character -- so a BOM'd marker would silently fail the
     # desktop's readJson(), make isBootstrapComplete() return null, and the
     # desktop would re-run the legacy bootstrap runner anyway. Defeats the
     # whole point. Use the .NET API directly for BOM-less UTF-8.
@@ -1725,7 +2853,7 @@ function Write-BootstrapMarker {
 function Copy-ConfigTemplates {
     Write-Info "Setting up configuration files..."
     
-    # Create ~/.hermes directory structure
+    # Create the HERMES_HOME directory structure ($HermesHome, default %LOCALAPPDATA%\hermes)
     New-Item -ItemType Directory -Force -Path "$HermesHome\cron" | Out-Null
     New-Item -ItemType Directory -Force -Path "$HermesHome\sessions" | Out-Null
     New-Item -ItemType Directory -Force -Path "$HermesHome\logs" | Out-Null
@@ -1743,13 +2871,13 @@ function Copy-ConfigTemplates {
         $examplePath = "$InstallDir\.env.example"
         if (Test-Path $examplePath) {
             Copy-Item $examplePath $envPath
-            Write-Success "Created ~/.hermes/.env from template"
+            Write-Success "Created $envPath from template"
         } else {
             New-Item -ItemType File -Force -Path $envPath | Out-Null
-            Write-Success "Created ~/.hermes/.env"
+            Write-Success "Created $envPath"
         }
     } else {
-        Write-Info "~/.hermes/.env already exists, keeping it"
+        Write-Info "$envPath already exists, keeping it"
     }
     
     # Create config.yaml
@@ -1758,10 +2886,10 @@ function Copy-ConfigTemplates {
         $examplePath = "$InstallDir\cli-config.yaml.example"
         if (Test-Path $examplePath) {
             Copy-Item $examplePath $configPath
-            Write-Success "Created ~/.hermes/config.yaml from template"
+            Write-Success "Created $configPath from template"
         }
     } else {
-        Write-Info "~/.hermes/config.yaml already exists, keeping it"
+        Write-Info "$configPath already exists, keeping it"
     }
     
     # Create SOUL.md if it doesn't exist (global persona file).
@@ -1775,44 +2903,49 @@ function Copy-ConfigTemplates {
     # PowerShell version.
     $soulPath = "$HermesHome\SOUL.md"
     if (-not (Test-Path $soulPath)) {
+        # MUST match DEFAULT_SOUL_MD in hermes_cli/default_soul.py. The runtime
+        # upgrades the old comment-only scaffold to this text on next run, so
+        # drift is self-healing, but keep them in sync to avoid first-run churn.
         $soulContent = @"
-# Hermes Agent Persona
-
-<!--
-This file defines the agent's personality and tone.
-The agent will embody whatever you write here.
-Edit this to customize how Hermes communicates with you.
-
-Examples:
-  - "You are a warm, playful assistant who uses kaomoji occasionally."
-  - "You are a concise technical expert. No fluff, just facts."
-  - "You speak like a friendly coworker who happens to know everything."
-
-This file is loaded fresh each message -- no restart needed.
-Delete the contents (or this file) to use the default personality.
--->
+You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.
 "@
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($soulPath, $soulContent, $utf8NoBom)
-        Write-Success "Created ~/.hermes/SOUL.md (edit to customize personality)"
+        Write-Success "Created $soulPath (edit to customize personality)"
     }
     
-    Write-Success "Configuration directory ready: ~/.hermes/"
+    Write-Success "Configuration directory ready: $HermesHome"
     
-    # Seed bundled skills into ~/.hermes/skills/ (manifest-based, one-time per skill)
-    Write-Info "Syncing bundled skills to ~/.hermes/skills/ ..."
+    # Seed bundled skills into $HermesHome\skills (manifest-based, one-time per skill)
+    Write-Info "Syncing bundled skills to $HermesHome\skills ..."
     $pythonExe = "$InstallDir\venv\Scripts\python.exe"
     if (Test-Path $pythonExe) {
         try {
-            & $pythonExe "$InstallDir\tools\skills_sync.py" 2>$null
-            Write-Success "Skills synced to ~/.hermes/skills/"
+            # Force the child python.exe to emit UTF-8 on its stdout/stderr.
+            # On non-UTF-8 Windows locales (CP936/GBK zh-CN) Python defaults
+            # its stream encoding to the active codepage and crashes on glyphs
+            # like the checkmark (U+2713) that the codepage can't encode; the
+            # resulting non-UTF-8 bytes break this script's JSON result frame on
+            # stdout and abort the config-templates stage. Scope to this call
+            # only. (Comment kept ASCII per this file's PS 5.1 contract above.)
+            $prevPythonioencoding = $env:PYTHONIOENCODING
+            $prevPythonutf8 = $env:PYTHONUTF8
+            $env:PYTHONIOENCODING = "utf-8"
+            $env:PYTHONUTF8 = "1"
+            try {
+                & $pythonExe "$InstallDir\tools\skills_sync.py" 2>$null
+            } finally {
+                $env:PYTHONIOENCODING = $prevPythonioencoding
+                $env:PYTHONUTF8 = $prevPythonutf8
+            }
+            Write-Success "Skills synced to $HermesHome\skills"
         } catch {
             # Fallback: simple directory copy
             $bundledSkills = "$InstallDir\skills"
             $userSkills = "$HermesHome\skills"
             if ((Test-Path $bundledSkills) -and -not (Get-ChildItem $userSkills -Exclude '.bundled_manifest' -ErrorAction SilentlyContinue)) {
                 Copy-Item -Path "$bundledSkills\*" -Destination $userSkills -Recurse -Force -ErrorAction SilentlyContinue
-                Write-Success "Skills copied to ~/.hermes/skills/"
+                Write-Success "Skills copied to $HermesHome\skills"
             }
         }
     }
@@ -1823,13 +2956,18 @@ function Install-NodeDeps {
         # Cross-process driver mode (Hermes-Setup.exe runs each -Stage NAME
         # in a fresh powershell.exe) means $script:HasNode set by Stage-Node
         # in the previous process isn't visible here. Re-probe rather than
-        # trust the stale global — Stage-Node already ran successfully or
+        # trust the stale global -- Stage-Node already ran successfully or
         # the bootstrap would've aborted, so npm is reachable.
         if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
             Write-Info "Skipping Node.js dependencies (Node not installed)"
             return
         }
     }
+
+    # npm lifecycle scripts need node.exe on the PATH visible to child
+    # cmd.exe processes.  Stage-Node may have run in a prior process, so
+    # re-apply here before any npm install (regression #48130).
+    Ensure-NodeExeOnPath | Out-Null
 
     # Resolve npm explicitly to npm.cmd, NOT npm.ps1.  Node.js on Windows
     # ships BOTH npm.cmd (a batch shim) and npm.ps1 (a PowerShell shim).
@@ -1918,6 +3056,7 @@ function Install-NodeDeps {
                     }
                     Write-Info "  Full log: $logPath"
                     Show-NpmCertHint $errText | Out-Null
+                    Write-NpmDebugLogTail -NpmOutput $errText
                 }
             }
             Write-Info "Run manually later: cd `"$installDir`"; npm install"
@@ -2041,6 +3180,50 @@ function Install-NodeDeps {
         $tuiLog = "$env:TEMP\hermes-npm-tui-$(Get-Random).log"
         [void](_Run-NpmInstall "TUI" $tuiDir $tuiLog $npmExe)
     }
+
+    Install-BrowserUseCli
+}
+
+# The Browser Use CLI is the default browser backend when it is runnable
+# (tools/browser_use_cli.py). Provision it at install time so fresh installs
+# don't silently fall back to the built-in browser tools. Best-effort: any
+# failure is non-fatal (browser_exec can still run via uvx, and `hermes tools`
+# can install it later).
+function Install-BrowserUseCli {
+    if (-not $script:UvCmd) { Resolve-UvCmd }
+    if (-not $script:UvCmd) {
+        Write-Info "Skipping Browser Use CLI install (uv unavailable)"
+        return
+    }
+    $managedBin = Join-Path $HermesHome "bin"
+    $managedBu = Join-Path $managedBin "browser-use.exe"
+    if ((Get-Command browser-use -ErrorAction SilentlyContinue) -or (Test-Path $managedBu)) {
+        Write-Success "Browser Use CLI already installed"
+        return
+    }
+
+    Write-Info "Installing Browser Use CLI (default browser backend)..."
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        # UV_TOOL_BIN_DIR keeps the binary inside Hermes' managed bin dir,
+        # where the browser tool resolves it -- no reliance on the user PATH.
+        $env:UV_TOOL_BIN_DIR = $managedBin
+        $env:UV_NO_CONFIG = "1"
+        & $script:UvCmd tool install browser-use 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success "Browser Use CLI installed"
+        } else {
+            Write-Warn "Browser Use CLI install failed (exit $LASTEXITCODE) -- browser automation falls back to built-in tools."
+            Write-Info "Install later with: uv tool install browser-use  (or via 'hermes tools')"
+        }
+    } catch {
+        Write-Warn "Browser Use CLI install failed: $_"
+    } finally {
+        $ErrorActionPreference = $prevEAP
+        Remove-Item Env:\UV_TOOL_BIN_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:\UV_NO_CONFIG -ErrorAction SilentlyContinue
+    }
 }
 
 # Clear the cached Electron download + any half-written unpacked output so the
@@ -2092,6 +3275,103 @@ function Clear-ElectronBuildCache {
     return $removed
 }
 
+# Last-resort Electron mirror after GitHub download fails (#47266).
+$script:DesktopElectronFallbackMirror = "https://npmmirror.com/mirrors/electron/"
+
+# Electron package dir -- workspace-local nest first, then root hoist.
+function Get-ElectronDir {
+    param([string]$InstallDir)
+    $desktopLocal = Join-Path $InstallDir 'apps\desktop\node_modules\electron'
+    if (Test-Path -LiteralPath $desktopLocal) { return $desktopLocal }
+    return (Join-Path $InstallDir 'node_modules\electron')
+}
+
+# True when dist/ holds a usable Electron binary (#38673 / run-electron-builder.mjs).
+function Test-ElectronDist {
+    param([string]$InstallDir)
+    $electronDir = Get-ElectronDir -InstallDir $InstallDir
+    $distExe = Join-Path $electronDir 'dist\electron.exe'
+    return (Test-Path -LiteralPath $distExe)
+}
+
+# Best-effort: run electron/install.js to populate dist/ (optional mirror).
+function Restore-ElectronDist {
+    param([string]$InstallDir, [string]$Mirror)
+    if (Test-ElectronDist -InstallDir $InstallDir) { return $true }
+
+    $electronDir = Get-ElectronDir -InstallDir $InstallDir
+    $distExe = Join-Path $electronDir 'dist\electron.exe'
+    $installer = Join-Path $electronDir 'install.js'
+    if (-not (Test-Path -LiteralPath $installer)) { return $false }
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $node) { return $false }
+
+    $distDir = Join-Path $electronDir 'dist'
+    if (Test-Path -LiteralPath $distDir) {
+        Remove-Item -LiteralPath $distDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath (Join-Path $electronDir 'path.txt') -Force -ErrorAction SilentlyContinue
+
+    $prevMirror = $env:ELECTRON_MIRROR
+    if ($Mirror) { $env:ELECTRON_MIRROR = $Mirror }
+    try {
+        # Out-Host so the downloader's progress shows on the console WITHOUT
+        # leaking into this function's return value (PowerShell returns every
+        # object left on the output stream, so a bare pipe here would make the
+        # boolean below ambiguous).
+        & $node.Source $installer 2>&1 | ForEach-Object { "$_" } | Out-Host
+    } catch {
+    } finally {
+        $env:ELECTRON_MIRROR = $prevMirror
+    }
+    return (Test-Path -LiteralPath $distExe)
+}
+
+function Test-ElectronPkgStagedMissingDist {
+    param([string]$InstallDir)
+    $electronDir = Get-ElectronDir -InstallDir $InstallDir
+    return (
+        (Test-Path -LiteralPath (Join-Path $electronDir 'package.json')) -and
+        (Test-Path -LiteralPath (Join-Path $electronDir 'install.js')) -and
+        (-not (Test-ElectronDist -InstallDir $InstallDir))
+    )
+}
+
+function Try-RestoreElectronDist {
+    param([string]$InstallDir)
+    if (Restore-ElectronDist -InstallDir $InstallDir) { return $true }
+    if ($env:ELECTRON_MIRROR) { return $false }
+    return Restore-ElectronDist -InstallDir $InstallDir -Mirror $script:DesktopElectronFallbackMirror
+}
+
+function Install-DesktopVoiceDeps {
+    # Desktop ships with working voice out of the box: eagerly install the
+    # wake-word + local-STT stacks ([wake] + [voice] extras) instead of
+    # leaving them to lazy first-use install. Policy change (Teknium, July
+    # 2026, #70509 testing): the first ear-click used to trigger a
+    # multi-minute onnxruntime pip install that froze the UI and blew RPC
+    # timeouts. Best-effort -- lazy install remains the fallback for anything
+    # this step fails to fetch.
+    if (-not $script:UvCmd) { Resolve-UvCmd }
+    if (-not $script:UvCmd) {
+        Write-Warn "uv unavailable -- voice/wake deps will lazy-install at first use instead"
+        return
+    }
+    $env:VIRTUAL_ENV = "$InstallDir\venv"
+    Write-Info "Installing voice + wake-word dependencies (onnxruntime, faster-whisper -- 1-3min)..."
+    Push-Location $InstallDir
+    try {
+        Invoke-NativeWithRelaxedErrorAction { & $UvCmd pip install -e ".[wake,voice]" }
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success "Voice + wake-word dependencies installed"
+        } else {
+            Write-Warn "Voice/wake dependency install failed (exit $LASTEXITCODE) -- they will lazy-install at first use"
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
 function Install-Desktop {
     # Build apps/desktop into a launchable Hermes.exe. Only called from
     # Stage-Desktop, which is itself only included in the manifest when
@@ -2107,12 +3387,12 @@ function Install-Desktop {
     #
     # The Tauri bootstrap installer's launch_hermes_desktop command
     # resolves apps/desktop/release/win-unpacked/Hermes.exe directly,
-    # so an "unpacked" build (electron-builder --dir) is enough — we
+    # so an "unpacked" build (electron-builder --dir) is enough -- we
     # don't need to produce an NSIS/MSI artifact here.
 
     # Always re-resolve Node here. Stages run in separate PowerShell processes,
     # so $script:HasNode from Stage-Node isn't visible; more importantly Test-Node
-    # enforces the build floor (^20.19 || >=22.12) and prepends the Hermes-managed
+    # enforces the build floor (Node >=26) and prepends the Hermes-managed
     # Node to PATH, so the build never runs on a too-old system Node -- the cause
     # of the opaque "Build desktop app ... exit code 1" failure (Vite crashes on
     # old Node).
@@ -2161,7 +3441,7 @@ function Install-Desktop {
         #
         # The streaming sink in bootstrap.rs's run_install_script
         # captures every stdout/stderr line as it's emitted, so we don't
-        # need a side TEMP log file — the installer's bootstrap log
+        # need a side TEMP log file -- the installer's bootstrap log
         # IS the artifact a support engineer reads.
         #
         # Prefer `npm ci`: it wipes node_modules and reinstalls from the
@@ -2187,10 +3467,20 @@ function Install-Desktop {
         }
         $ErrorActionPreference = $prevEAP
         if ($code -ne 0) {
-            Show-NpmCertHint ($npmOut -join "`n") | Out-Null
-            throw "desktop workspace npm install failed (exit $code) -- see lines above for cause"
+            if (Test-ElectronPkgStagedMissingDist -InstallDir $InstallDir) {
+                Write-Warn "Desktop dependency install failed with a missing Electron dist; attempting self-heal..."
+                Try-RestoreElectronDist -InstallDir $InstallDir | Out-Null
+            } else {
+                Show-NpmCertHint ($npmOut -join "`n") | Out-Null
+                # Replay npm's own debug log into our stream: the terse
+                # summary above rarely contains the postinstall stderr
+                # (e.g. Electron's install.js) that explains the failure.
+                Write-NpmDebugLogTail -NpmOutput ($npmOut -join "`n")
+                throw "desktop workspace npm install failed (exit $code) -- see lines above for cause"
+            }
+        } else {
+            Write-Success "Desktop workspace dependencies installed"
         }
-        Write-Success "Desktop workspace dependencies installed"
     } catch {
         if ($prevEAP) { $ErrorActionPreference = $prevEAP }
         Pop-Location
@@ -2210,7 +3500,7 @@ function Install-Desktop {
     # NOT signing the output. Combined with signAndEditExecutable=false in
     # apps/desktop/package.json's build.win block, electron-builder never
     # invokes signtool and therefore never fetches/extracts winCodeSign
-    # (whose macOS symlinks crash 7-Zip on non-admin Windows — a dead end we
+    # (whose macOS symlinks crash 7-Zip on non-admin Windows -- a dead end we
     # are NOT trying to work around). The Hermes icon + product name are
     # stamped onto Hermes.exe by our own rcedit step (Set-DesktopExeIdentity)
     # AFTER this build, completely decoupled from electron-builder signing.
@@ -2220,6 +3510,41 @@ function Install-Desktop {
     # for some other tool, electron-builder would still try to sign.
     Write-Info "Building desktop app (this takes 1-3 minutes)..."
     $buildLog = "$env:TEMP\hermes-desktop-build-$(Get-Random).log"
+    # Seed GITHUB_SHA for write-build-stamp.mjs. The stamp prefers CI env vars
+    # over `git rev-parse`, so this covers: (1) node can't find git.exe on PATH
+    # even though this PowerShell session can, (2) ZIP/init trees that still
+    # lack a HEAD after a failed post-extract fetch. Without it the desktop
+    # pack dies with "could not determine git commit" (#50823).
+    if (-not $env:GITHUB_SHA) {
+        if ($Commit) {
+            $env:GITHUB_SHA = $Commit
+        } else {
+            Push-Location $InstallDir
+            try {
+                $global:LASTEXITCODE = 0
+                $resolvedSha = & git -c windows.appendAtomically=false rev-parse HEAD 2>$null
+                if ($LASTEXITCODE -ne 0 -or -not $resolvedSha) {
+                    # ZIP path may have FETCH_HEAD after a fetch even when HEAD is unset.
+                    $global:LASTEXITCODE = 0
+                    $resolvedSha = & git -c windows.appendAtomically=false rev-parse FETCH_HEAD 2>$null
+                }
+                if ($LASTEXITCODE -eq 0 -and $resolvedSha) {
+                    $env:GITHUB_SHA = ("$resolvedSha").Trim()
+                }
+            } catch { } finally {
+                Pop-Location
+            }
+        }
+    }
+    if (-not $env:GITHUB_REF_NAME) {
+        $env:GITHUB_REF_NAME = if ($Branch) { $Branch } else { "main" }
+    }
+    if ($env:GITHUB_SHA) {
+        $shaPreview = if ($env:GITHUB_SHA.Length -ge 12) { $env:GITHUB_SHA.Substring(0, 12) } else { $env:GITHUB_SHA }
+        Write-Info "Desktop build stamp: $shaPreview ($($env:GITHUB_REF_NAME))"
+    } else {
+        Write-Warn "Could not resolve a git commit for the desktop stamp -- write-build-stamp will use its non-git fallback"
+    }
     Push-Location $desktopDir
     $prevEAP = $ErrorActionPreference
     $prevCSCAuto = $env:CSC_IDENTITY_AUTO_DISCOVERY
@@ -2233,19 +3558,34 @@ function Install-Desktop {
         & $npmExe run pack 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $buildLog
         $code = $LASTEXITCODE
         if ($code -ne 0) {
-            # A corrupt cached Electron zip makes `pack` fail with an opaque
-            # ENOENT on the final `electron` -> `Hermes` rename: app-builder's
-            # unpack-electron extracted a partial tree (missing the binary) from
-            # the bad zip, and re-running reuses the poisoned cache forever.
-            # Purge the cached download + any stale unpacked output and retry
-            # once; @electron/get re-downloads with its own SHASUM check. Without
-            # this a corrupt download hard-fails the whole installer.
-            $purged = @(Clear-ElectronBuildCache -DesktopDir $desktopDir)
-            if ($purged.Count -gt 0) {
-                Write-Warn "Desktop build failed - cleared cached Electron download, retrying once:"
+            $purged = @()
+            $restored = $false
+            if (-not (Test-ElectronDist -InstallDir $InstallDir)) {
+                $purged = @(Clear-ElectronBuildCache -DesktopDir $desktopDir)
+                $restored = Restore-ElectronDist -InstallDir $InstallDir
+            }
+            if ($restored) {
+                Write-Warn "Desktop build failed - refreshed the Electron download, retrying once:"
                 foreach ($p in $purged) { Write-Info "  - $p" }
                 & $npmExe run pack 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $buildLog
                 $code = $LASTEXITCODE
+            }
+        }
+        if ($code -ne 0 -and -not $env:ELECTRON_MIRROR) {
+            $mirror = $script:DesktopElectronFallbackMirror
+            Write-Warn "Desktop build still failing - the Electron download from GitHub looks blocked."
+            Write-Warn "Re-downloading Electron via a public mirror ($mirror), then rebuilding:"
+            Write-Info "  (set ELECTRON_MIRROR yourself to use a different/trusted mirror)"
+            if (-not (Test-ElectronDist -InstallDir $InstallDir)) {
+                Restore-ElectronDist -InstallDir $InstallDir -Mirror $mirror | Out-Null
+            }
+            $prevMirror = $env:ELECTRON_MIRROR
+            $env:ELECTRON_MIRROR = $mirror
+            try {
+                & $npmExe run pack 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $buildLog
+                $code = $LASTEXITCODE
+            } finally {
+                $env:ELECTRON_MIRROR = $prevMirror
             }
         }
         $ErrorActionPreference = $prevEAP
@@ -2257,16 +3597,20 @@ function Install-Desktop {
                 foreach ($line in $snippet -split "`n") { Write-Host "    $line" -ForegroundColor DarkGray }
                 Write-Info "  Full log: $buildLog"
             }
+            # `npm run pack` failures (lifecycle script exits) also land in
+            # npm's debug log; replay it so the bootstrap log carries the
+            # full evidence even when $buildLog's tail cuts off the cause.
+            Write-NpmDebugLogTail -NpmOutput $errText
             throw "apps/desktop build failed (exit $code)"
         }
         Write-Success "Desktop app built"
-        Remove-Item -Force $buildLog -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $buildLog -Force -ErrorAction SilentlyContinue
     } catch {
         if ($prevEAP) { $ErrorActionPreference = $prevEAP }
         Pop-Location
         throw
     } finally {
-        # Restore env to whatever the caller had — don't leak our
+        # Restore env to whatever the caller had -- don't leak our
         # signing-off override into anything install.ps1 invokes later
         # (Stage-PlatformSdks, etc.).
         $env:CSC_IDENTITY_AUTO_DISCOVERY = $prevCSCAuto
@@ -2296,17 +3640,34 @@ function Install-Desktop {
     }
 
     # 3b. The Hermes icon + identity are stamped onto Hermes.exe by the
-    #     electron-builder `afterPack` hook (apps/desktop/scripts/after-pack.cjs)
-    #     during `npm run pack` above — for every build, so the installer's
+    #     electron-builder `afterPack` hook (apps/desktop/scripts/after-pack.mjs)
+    #     during `npm run pack` above -- for every build, so the installer's
     #     --update rebuild stays branded too. No separate stamp step needed here.
     #     electron-builder's own rcedit step stays disabled (signAndEditExecutable
     #     =false) because enabling it drags in signtool -> winCodeSign -> the
     #     unfixable symlink crash; the afterPack hook runs rcedit directly.
 
+    # 3c. Grant ALL APPLICATION PACKAGES (S-1-15-2-2) RX on the unpacked app
+    #     directory. Chromium's GPU/renderer sandboxes CHECK-fail with
+    #     0x80000003 when this ACE is missing alongside orphan AppContainer
+    #     SIDs under %LOCALAPPDATA% (electron/electron#51761, hermes-agent#38216).
+    #     Best-effort -- never fail an otherwise-good install over ACL repair.
+    try {
+        $appDir = Split-Path -Parent $desktopExe
+        & icacls $appDir /grant "*S-1-15-2-2:(OI)(CI)(RX)" /T /C /Q | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success "Granted AppContainer read access on $appDir"
+        } else {
+            Write-Warn "icacls AppContainer grant returned exit $LASTEXITCODE for $appDir"
+        }
+    } catch {
+        Write-Warn "Could not grant AppContainer ACL: $($_.Exception.Message)"
+    }
+
     # 4. Create Start Menu + Desktop shortcuts pointing DIRECTLY at the packed
     #    Hermes.exe. We deliberately do NOT point them at `hermes desktop`: that
     #    command rebuilds (npm install + electron-builder) on every launch,
-    #    which would cost minutes each time. The packed exe is the consumer —
+    #    which would cost minutes each time. The packed exe is the consumer --
     #    launching it directly is instant, and updates flow through the
     #    installer's --update path (which rebuilds once, then relaunches).
     New-DesktopShortcuts -TargetExe $desktopExe
@@ -2362,11 +3723,11 @@ function New-DesktopShortcuts {
         # cached bitmap. Critical on the --update path: the exe was re-stamped
         # with the Hermes icon, but without this the shortcut can keep drawing
         # the old Electron icon until the user manually refreshes / reboots.
-        # Best-effort and silent — never fail the install over a cosmetic cache.
+        # Best-effort and silent -- never fail the install over a cosmetic cache.
         try {
             & ie4uinit.exe -show 2>$null
         } catch {
-            # ie4uinit may be absent/renamed on some SKUs — ignore.
+            # ie4uinit may be absent/renamed on some SKUs -- ignore.
         }
     } catch {
         Write-Warn "Skipping shortcut creation: $($_.Exception.Message)"
@@ -2761,7 +4122,12 @@ $InstallStages += @(
 # process), and throws cleanly if uv truly isn't installed yet.
 function Stage-Uv               { if (-not (Install-Uv))     { throw "uv installation failed" } }
 function Stage-Python           { Resolve-UvCmd; if (-not (Test-Python))    { throw "Python $PythonVersion not available" } }
-function Stage-Git              { if (-not (Install-Git))    { throw "Git not available and auto-install failed -- install from https://git-scm.com/download/win then re-run" } }
+function Stage-Git              {
+    if (-not (Install-Git)) {
+        if ($script:GitInstallFailureReason) { throw $script:GitInstallFailureReason }
+        throw "Git not available and auto-install failed -- install from https://git-scm.com/download/win then re-run"
+    }
+}
 # Node is optional (browser tools degrade gracefully without it).  Surface
 # failure to the JSON contract as skipped=true / reason rather than ok=true,
 # so a GUI driver consuming the manifest can distinguish "node ready" from
@@ -2778,7 +4144,7 @@ function Stage-Repository       { Install-Repository }
 function Stage-Venv             { Resolve-UvCmd; Install-Venv }
 function Stage-Dependencies     { Resolve-UvCmd; Install-Dependencies }
 function Stage-NodeDeps         { Install-NodeDeps }
-function Stage-Desktop          { Install-Desktop }
+function Stage-Desktop          { Install-DesktopVoiceDeps; Install-Desktop }
 function Stage-Path             { Set-PathVariable }
 function Stage-ConfigTemplates  { Copy-ConfigTemplates }
 function Stage-PlatformSdks     { Resolve-UvCmd; Install-PlatformSdks }
@@ -2957,6 +4323,11 @@ try {
 
     if ($ProtocolVersion) {
         Write-Output $InstallStageProtocolVersion
+        exit 0
+    }
+
+    if ($ShowResolvedPaths) {
+        $script:ResolvedPathReport | ConvertTo-Json -Depth 5 -Compress | Write-Output
         exit 0
     }
 
