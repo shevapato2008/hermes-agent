@@ -9911,14 +9911,14 @@ def _run_prompt_submit(
             # begin() first — it cuts any still-speaking previous turn, and
             # that cut IS this turn's barge-in, so it must latch before we
             # consume the latch below.
-            tts_queue = _tts_stream_begin()
+            tts_queue = _tts_stream_begin(sid)
 
             # Full-duplex agent-turn listener: armed at utterance-submit so
             # the user can interject DURING generation, not just during
             # playback. _tts_stream_begin arms it too when a pipeline
             # starts; this covers voice mode without working TTS.
             if _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
-                _arm_full_duplex_listener()
+                _arm_full_duplex_listener(sid)
 
             # Ambient "thinking" sound (voice mode only): calm bubble blips
             # while the agent works with no audio flowing, so long
@@ -13124,7 +13124,7 @@ _tts_stream_lock = threading.Lock()
 _tts_stream_state: Optional[dict] = None
 
 
-def _tts_stream_begin() -> Optional[queue.Queue]:
+def _tts_stream_begin(session_id: str | None = None) -> Optional[queue.Queue]:
     """Start a per-turn streaming TTS consumer; None when TTS can't stream."""
     if not _voice_tts_enabled():
         return None
@@ -13149,7 +13149,7 @@ def _tts_stream_begin() -> Optional[queue.Queue]:
         _tts_stream_state = {"stop": stop, "done": done}
 
     if _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
-        _arm_full_duplex_listener()
+        _arm_full_duplex_listener(session_id)
 
     return text_queue
 
@@ -13207,15 +13207,21 @@ _fd_listener_active = False
 _fd_speak_pipelines: "set[tuple[threading.Event, threading.Event]]" = set()
 
 
-def _arm_full_duplex_listener() -> None:
+def _arm_full_duplex_listener(session_id: str | None = None) -> None:
     """Arm the process-global full-duplex listener (idempotent — one mic)."""
     global _fd_listener_active
     with _fd_listener_lock:
         if _fd_listener_active:
             return
         _fd_listener_active = True
+    if session_id is None:
+        with _voice_sid_lock:
+            session_id = _voice_event_sid
     threading.Thread(
-        target=_full_duplex_listener, daemon=True, name="voice-full-duplex"
+        target=_full_duplex_listener,
+        args=(session_id,),
+        daemon=True,
+        name="voice-full-duplex",
     ).start()
 
 
@@ -13230,7 +13236,7 @@ def _fd_tts_pending() -> bool:
     return any(not done.is_set() for _stop, done in pipelines)
 
 
-def _full_duplex_listener() -> None:
+def _full_duplex_listener(session_id: str | None = None) -> None:
     """Mic live from utterance-submit to turn-complete; phase-aware trip.
 
     * generation phase (no TTS audio flowing): user speech interrupts every
@@ -13325,6 +13331,14 @@ def _full_duplex_listener() -> None:
             multiplier=_mult or None,
             grace_ms=max(0, _grace_ms),
         )
+        if (
+            not tripped.is_set()
+            and _voice_mode_enabled()
+            and not _any_session_running()
+            and not _fd_tts_pending()
+            and not is_audio_output_active()
+        ):
+            _emit("voice.output_drained", session_id or "", {})
         if not (wav_path and tripped.is_set()):
             return
         try:

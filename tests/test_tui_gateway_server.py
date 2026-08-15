@@ -16038,6 +16038,68 @@ def test_tts_stream_stop_after_natural_finish_does_not_latch(monkeypatch):
     assert ts.take_speech_interrupted() is False
 
 
+@pytest.mark.parametrize("triggered", [False, True], ids=["natural-idle", "triggered"])
+def test_full_duplex_output_drained_uses_armed_session_after_natural_idle_return(
+    monkeypatch, triggered
+):
+    """The listener releases the mic before reporting natural output drain;
+    a VAD-triggered return must not report drain even if it is idle by then."""
+    import tools.tts_streaming as ts
+
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"barge_in": True}})
+    monkeypatch.setattr(ts, "mark_speech_interrupted", lambda: None)
+    monkeypatch.setattr(server, "_voice_event_sid", "sid-global-drift")
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_tts_stream_state", None)
+    monkeypatch.setattr(server, "_fd_speak_pipelines", set())
+
+    runtime = {"running": triggered, "inside_listen": False}
+    monkeypatch.setattr(
+        server, "_any_session_running", lambda: runtime["running"]
+    )
+    monkeypatch.setattr(server, "_fd_tts_pending", lambda: False)
+
+    events: list = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: events.append(
+            (event, sid, payload, runtime["inside_listen"])
+        ),
+    )
+
+    def fake_listen(should_stop, is_playing=None, on_trigger=None, **_kw):
+        runtime["inside_listen"] = True
+        try:
+            assert should_stop() is (not triggered)
+            if triggered:
+                on_trigger("generation")
+                runtime["running"] = False
+            return None
+        finally:
+            runtime["inside_listen"] = False
+
+    _fake_tts_modules(monkeypatch, listen=fake_listen)
+
+    class ImmediateThread:
+        def __init__(self, *, target, args=(), **_kw):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
+    server._arm_full_duplex_listener("sid-prompt")
+
+    drained = [event for event in events if event[0] == "voice.output_drained"]
+    if triggered:
+        assert drained == []
+    else:
+        assert drained == [("voice.output_drained", "sid-prompt", {}, False)]
+
+
 def test_tts_stream_vad_barge_in_cuts_pipeline_and_submits_capture(monkeypatch, tmp_path):
     """User speech during playback cuts TTS at the moment of detection
     (voice.interrupted), then the captured interruption is transcribed and
