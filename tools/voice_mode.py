@@ -2193,14 +2193,20 @@ def full_duplex_listen(
                         logger.debug("full-duplex trigger callback failed: %s", e)
 
                 # Capture until the user goes quiet. Playback was cut by
-                # on_trigger, so plain silence endpointing works.
+                # on_trigger. Use the room floor calibrated before playback;
+                # a fixed 200-RMS threshold can otherwise run to the utterance
+                # cap in ordinary Mac ambient noise.
                 frames: List[Any] = list(pre_roll)
                 quiet = 0
+                endpoint_threshold = min(
+                    PLAYBACK_MIN_TRIGGER,
+                    max(float(SILENCE_RMS_THRESHOLD), quiet_floor * 1.5),
+                )
                 for _ in range(max_blocks):
                     data, _ = stream.read(block)
                     frames.append(data.copy())
                     rms = float(np.sqrt(np.mean(data.astype(np.float64) ** 2)))
-                    quiet = quiet + 1 if rms < SILENCE_RMS_THRESHOLD else 0
+                    quiet = quiet + 1 if rms < endpoint_threshold else 0
                     if quiet >= endpoint_blocks:
                         break
                 return AudioRecorder._write_wav(np.concatenate(frames, axis=0))

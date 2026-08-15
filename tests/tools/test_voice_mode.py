@@ -1326,6 +1326,29 @@ class TestFullDuplexListen:
         assert path == "/tmp/fd.wav"
         assert phases == ["playback"]
 
+    def test_endpoint_uses_calibrated_room_floor(self, mock_sd, monkeypatch):
+        """After playback is cut, normal room noise should count as quiet.
+
+        A fixed 200-RMS endpoint can keep recording until the 30s cap on a
+        Mac whose calibrated ambient floor is slightly higher.
+        """
+        levels = (
+            [300] * self.CALIB
+            + [1000] * (self.GRACE + 20)
+            + [5000] * 30
+            + [300] * 200
+            + [0] * 200
+        )
+        path, audio, _ = self._run(
+            mock_sd,
+            monkeypatch,
+            levels,
+            playing_from=self.CALIB,
+        )
+        assert path == "/tmp/fd.wav"
+        endpoint_blocks = 1250 // 30
+        assert int((audio == 300).sum()) <= endpoint_blocks * self.BLOCK
+
     def test_grace_window_suppresses_playback_onset(self, mock_sd, monkeypatch):
         """Loud blocks inside the 0.5s grace right after playback starts are
         suppressed (onset transient), but speech after grace still trips."""
