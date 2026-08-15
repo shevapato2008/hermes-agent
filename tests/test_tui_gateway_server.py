@@ -16235,6 +16235,77 @@ def test_full_duplex_stop_phrase_mid_generation_ends_voice_chat(monkeypatch, tmp
     assert os.environ.get("HERMES_VOICE") == "0"  # voice chat ended
 
 
+@pytest.mark.parametrize(
+    ("transcript", "configured_wake"),
+    [
+        ("", "hey hermes"),
+        ("HÉY—HERMÈS!", "héy hermès"),
+    ],
+    ids=["empty", "wake-only"],
+)
+def test_full_duplex_retryable_empty_fence_uses_frozen_session_after_listen_closes(
+    monkeypatch, tmp_path, transcript, configured_wake
+):
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"barge_in": True}})
+    monkeypatch.setattr(server, "_voice_event_sid", "sid-before-listen")
+
+    wav = tmp_path / "retryable-empty.wav"
+    wav.write_bytes(b"RIFF")
+    lifecycle = {"inside_listen": False, "transcribed": False}
+
+    def fake_listen(should_stop, is_playing=None, on_trigger=None, **_kw):
+        lifecycle["inside_listen"] = True
+        try:
+            on_trigger("generation")
+            return str(wav)
+        finally:
+            lifecycle["inside_listen"] = False
+
+    def fake_transcribe(path, model=None):
+        assert lifecycle["inside_listen"] is False
+        assert path == str(wav)
+        lifecycle["transcribed"] = True
+        server._voice_event_sid = "sid-global-drift"
+        return {"success": True, "transcript": transcript}
+
+    _fake_tts_modules(monkeypatch, listen=fake_listen, transcribe=fake_transcribe)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.wake_word",
+        types.SimpleNamespace(
+            load_wake_word_config=lambda: {"phrase": configured_wake},
+            wake_phrase=lambda cfg: cfg["phrase"],
+        ),
+    )
+
+    emitted = []
+
+    def fake_emit(event, sid, payload=None):
+        assert lifecycle == {"inside_listen": False, "transcribed": True}
+        emitted.append((event, sid, payload))
+
+    voice_events = []
+    monkeypatch.setattr(server, "_emit", fake_emit)
+    monkeypatch.setattr(
+        server,
+        "_voice_emit",
+        lambda event, payload=None: voice_events.append((event, payload)),
+    )
+
+    server._full_duplex_listener("sid-frozen")
+
+    assert emitted == [
+        (
+            "voice.transcript",
+            "sid-frozen",
+            {"text": "", "retryable_empty": True},
+        )
+    ]
+    assert [event for event in voice_events if event[0] == "voice.transcript"] == []
+    assert not wav.exists()
+
+
 def test_speak_text_with_barge_arms_monitor_and_cuts_playback(monkeypatch, tmp_path):
     """The fallback whole-reply speak path (streaming pipeline couldn't
     start) and the voice.tts RPC must be barge-able too: speaking over the

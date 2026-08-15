@@ -1251,11 +1251,38 @@ class TestFullDuplexListen:
     BLOCK = 480      # 30ms at 16 kHz
 
     def _run(self, mock_sd, monkeypatch, levels, playing_from=None,
-             playing_until=None, should_stop=None, on_trigger=None, **kwargs):
+             playing_until=None, should_stop=None, on_trigger=None,
+             vad_score=1.0, vad_predict_error=None, vad_factory_error=None,
+             **kwargs):
         np = pytest.importorskip("numpy")
         stream = _FakeInputStream(np, levels)
         mock_sd.InputStream.return_value = stream
         written = {}
+        factory_calls = []
+
+        class FakeVad:
+            def __init__(self):
+                self.frames = []
+
+            def predict(self, frame, frame_size=480):
+                self.frames.append((frame.copy(), frame_size))
+                if vad_predict_error is not None:
+                    raise vad_predict_error
+                return vad_score
+
+        fake_vad = FakeVad()
+
+        def fake_vad_factory():
+            factory_calls.append(True)
+            if vad_factory_error is not None:
+                raise vad_factory_error
+            return fake_vad
+
+        monkeypatch.setattr(
+            "tools.voice_mode._new_silero_vad",
+            fake_vad_factory,
+            raising=False,
+        )
         monkeypatch.setattr(
             "tools.voice_mode.AudioRecorder._write_wav",
             staticmethod(lambda audio: written.update(audio=audio) or "/tmp/fd.wav"),
@@ -1278,7 +1305,76 @@ class TestFullDuplexListen:
             on_trigger=on_trigger,
             **kwargs,
         )
+        self.vad_factory_calls = factory_calls
+        self.vad_frames = fake_vad.frames
         return path, written.get("audio"), stream
+
+    def test_full_duplex_rms_qualified_noise_is_rejected_by_silero(
+        self, mock_sd, monkeypatch
+    ):
+        phases = []
+        levels = [100] * self.CALIB + [5000] * 30
+
+        path, audio, _ = self._run(
+            mock_sd,
+            monkeypatch,
+            levels,
+            vad_score=0.1,
+            on_trigger=lambda phase: phases.append(phase),
+        )
+
+        assert path is None
+        assert audio is None
+        assert phases == []
+        assert self.vad_factory_calls == [True]
+        assert len(self.vad_frames) == 30
+        assert all(frame.shape == (self.BLOCK,) for frame, _ in self.vad_frames)
+
+    def test_full_duplex_rms_and_silero_speech_triggers_once_with_pre_roll(
+        self, mock_sd, monkeypatch
+    ):
+        phases = []
+        speech_blocks = 30
+        levels = [100] * self.CALIB + [5000] * speech_blocks + [0] * 100
+
+        path, audio, _ = self._run(
+            mock_sd,
+            monkeypatch,
+            levels,
+            vad_score=0.9,
+            on_trigger=lambda phase: phases.append(phase),
+        )
+
+        assert path == "/tmp/fd.wav"
+        assert phases == ["generation"]
+        assert self.vad_factory_calls == [True]
+        assert int((audio == 5000).sum()) == speech_blocks * self.BLOCK
+
+    @pytest.mark.parametrize("failure_point", ["factory", "inference"])
+    def test_full_duplex_silero_failure_logs_once_and_falls_back_to_rms(
+        self, mock_sd, monkeypatch, caplog, failure_point
+    ):
+        phases = []
+        levels = [100] * self.CALIB + [5000] * 30 + [0] * 100
+        kwargs = (
+            {"vad_factory_error": RuntimeError("init failed")}
+            if failure_point == "factory"
+            else {"vad_predict_error": RuntimeError("inference failed")}
+        )
+
+        with caplog.at_level("WARNING"):
+            path, _, _ = self._run(
+                mock_sd,
+                monkeypatch,
+                levels,
+                on_trigger=lambda phase: phases.append(phase),
+                **kwargs,
+            )
+
+        assert path == "/tmp/fd.wav"
+        assert phases == ["generation"]
+        assert self.vad_factory_calls == [True]
+        assert sum("Silero VAD degraded" in record.message for record in caplog.records) == 1
 
     def test_generation_phase_speech_trips_and_captures(self, mock_sd, monkeypatch):
         """Speech while the LLM generates (no playback) trips with

@@ -13236,6 +13236,11 @@ def _fd_tts_pending() -> bool:
     return any(not done.is_set() for _stop, done in pipelines)
 
 
+def _normalize_voice_phrase(text: str) -> str:
+    """Case-insensitive Unicode alphanumeric form for phrase comparisons."""
+    return "".join(ch for ch in str(text) if ch.isalnum()).casefold()
+
+
 def _full_duplex_listener(session_id: str | None = None) -> None:
     """Mic live from utterance-submit to turn-complete; phase-aware trip.
 
@@ -13343,7 +13348,9 @@ def _full_duplex_listener(session_id: str | None = None) -> None:
             return
         try:
             result = transcribe_recording(wav_path)
-            text = (result.get("transcript") or "").strip() if result.get("success") else ""
+            if not result.get("success"):
+                return
+            text = (result.get("transcript") or "").strip()
             if text:
                 # Stop-check must never break transcript delivery — if the
                 # helper is unavailable (stubbed voice_mode in tests, partial
@@ -13367,8 +13374,29 @@ def _full_duplex_listener(session_id: str | None = None) -> None:
                     except Exception:
                         pass
                     _voice_emit("voice.transcript", {"stop_phrase": True, "text": text})
-                else:
-                    _voice_emit("voice.transcript", {"text": text})
+                    return
+
+            wake_only = False
+            if text:
+                try:
+                    from tools.wake_word import load_wake_word_config, wake_phrase
+
+                    wake = wake_phrase(load_wake_word_config())
+                    wake_only = bool(_normalize_voice_phrase(wake)) and (
+                        _normalize_voice_phrase(text)
+                        == _normalize_voice_phrase(wake)
+                    )
+                except Exception as e:
+                    logger.debug("wake phrase comparison unavailable: %s", e)
+
+            if not text or wake_only:
+                _emit(
+                    "voice.transcript",
+                    session_id or "",
+                    {"text": "", "retryable_empty": True},
+                )
+            else:
+                _voice_emit("voice.transcript", {"text": text})
         finally:
             try:
                 os.unlink(wav_path)

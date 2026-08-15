@@ -2009,6 +2009,14 @@ TRIGGER_CEILING = 4000.0
 # synthetic-frame tests show 3x separates speech from ambient cleanly while
 # staying reachable (300 RMS floor * 3 = 900 trigger vs 3000+ RMS speech).
 DEFAULT_BARGE_MULTIPLIER = 3.0
+SILERO_VAD_THRESHOLD = 0.5
+
+
+def _new_silero_vad():
+    """Build the bundled Silero VAD used to confirm RMS trigger blocks."""
+    from openwakeword.vad import VAD
+
+    return VAD()
 
 
 def _voice_debug_enabled() -> bool:
@@ -2089,6 +2097,8 @@ def full_duplex_listen(
     grace_remaining = 0
     blocks_since_playback = 10_000
     block_idx = 0
+    silero_vad = None
+    silero_degraded = False
 
     try:
         with sd.InputStream(
@@ -2167,6 +2177,28 @@ def full_duplex_listen(
                     above = False
                 if grace_remaining > 0:
                     grace_remaining -= 1
+
+                # RMS remains the cheap first-stage detector. Only blocks
+                # eligible to count toward the trigger window pay for Silero
+                # inference, and one lazily-created model serves this listener.
+                # Missing/broken optional runtime support must not disable
+                # barge-in, so a failure degrades once to the prior RMS-only
+                # behavior for the rest of this listener.
+                if above and not silero_degraded:
+                    try:
+                        if silero_vad is None:
+                            silero_vad = _new_silero_vad()
+                        score = float(
+                            silero_vad.predict(data.reshape(-1), frame_size=block)
+                        )
+                        above = score >= SILERO_VAD_THRESHOLD
+                    except Exception as e:
+                        silero_degraded = True
+                        logger.warning(
+                            "Silero VAD degraded; falling back to RMS-only "
+                            "barge-in detection: %s",
+                            e,
+                        )
 
                 recent_above.append(above)
                 if rms >= trigger * 0.5:
