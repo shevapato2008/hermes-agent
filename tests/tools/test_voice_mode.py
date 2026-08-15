@@ -917,6 +917,43 @@ class TestPlaybackInterrupt:
         with _playback_lock:
             assert vm._active_playback is None
 
+    @pytest.mark.macos_only
+    def test_stop_playback_does_not_retry_with_fallback_player(
+        self, tmp_path, monkeypatch
+    ):
+        """An intentional afplay stop must not restart the audio via ffplay."""
+        import tools.voice_mode as vm
+
+        audio_path = tmp_path / "reply.mp3"
+        audio_path.write_bytes(b"audio")
+        started = []
+        interrupted = MagicMock(returncode=None)
+        interrupted.poll.return_value = None
+
+        def interrupt_during_wait(timeout=None):
+            vm.stop_playback()
+            interrupted.returncode = -15
+            return -15
+
+        interrupted.wait.side_effect = interrupt_during_wait
+        fallback = MagicMock(returncode=0)
+        fallback.wait.return_value = 0
+
+        def fake_popen(command, **_kwargs):
+            started.append(command[0])
+            return interrupted if len(started) == 1 else fallback
+
+        monkeypatch.setattr(vm, "_active_playback", None)
+        monkeypatch.setattr(vm, "_import_audio", lambda: (MagicMock(), MagicMock()))
+        monkeypatch.setattr(vm.shutil, "which", lambda command: f"/usr/bin/{command}")
+        monkeypatch.setattr(vm.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(
+            "tools.environments.local.hermes_subprocess_env", lambda **_kwargs: {}
+        )
+
+        assert vm._play_audio_file_impl(str(audio_path)) is False
+        assert started == ["afplay"]
+
 # ============================================================================
 # Continuous mode flow
 # ============================================================================

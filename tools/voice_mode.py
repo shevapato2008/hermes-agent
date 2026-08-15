@@ -1779,7 +1779,15 @@ def _play_audio_file_impl(file_path: str) -> bool:
                 proc.wait(timeout=300)
                 rc = proc.returncode
                 with _playback_lock:
-                    _active_playback = None
+                    interrupted = _active_playback is not proc
+                    if not interrupted:
+                        _active_playback = None
+                if interrupted:
+                    # stop_playback() deliberately removed this process from
+                    # the active slot before terminating it.  Its non-zero
+                    # status is a user interruption, not a player failure;
+                    # retrying the same audio with ffplay would resume TTS.
+                    return False
                 if rc == 0:
                     return True
                 # Non-zero exit: player failed (e.g. WSL ffplay/aplay with no
