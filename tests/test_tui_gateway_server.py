@@ -16100,6 +16100,160 @@ def test_full_duplex_output_drained_uses_armed_session_after_natural_idle_return
         assert drained == [("voice.output_drained", "sid-prompt", {}, False)]
 
 
+@pytest.mark.parametrize(
+    ("barge_in", "expected"),
+    [(False, ([], ["sid-prompt"])), (True, (["sid-prompt"], []))],
+)
+def test_prompt_submit_selects_output_drained_monitor_without_changing_full_duplex(
+    monkeypatch, tmp_path, barge_in, expected
+):
+    """Prompt start selects exactly one turn-lifetime monitor."""
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: True)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"barge_in": barge_in}})
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda _sid=None: None)
+    full_duplex: list[str] = []
+    output_only: list[str] = []
+    monkeypatch.setattr(
+        server, "_arm_full_duplex_listener", lambda sid=None: full_duplex.append(sid)
+    )
+    monkeypatch.setattr(
+        server,
+        "_arm_output_drain_monitor",
+        lambda sid: output_only.append(sid),
+        raising=False,
+    )
+    session = _session(agent=_RecordingAgent([]), running=True)
+    server._sessions["sid-prompt"] = session
+    try:
+        server._run_prompt_submit("rid", "sid-prompt", session, "hello")
+    finally:
+        server._sessions.pop("sid-prompt", None)
+
+    assert (full_duplex, output_only) == expected
+
+
+def test_output_drained_monitor_waits_for_turn_tts_and_audio_without_microphone(
+    monkeypatch,
+):
+    """The non-barge monitor observes output state only; it never captures."""
+    arm = getattr(server, "_arm_output_drain_monitor", None)
+    assert arm is not None, "non-barge output-drain monitor is not implemented"
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    state = {"tts": True, "audio": True}
+    current_session = {"running": True}
+    running_probed = threading.Event()
+    tts_probed = threading.Event()
+    audio_probed = threading.Event()
+    drained = threading.Event()
+    microphone_calls: list[str] = []
+    events: list[tuple[str, str, dict]] = []
+
+    class SessionMap(dict):
+        def get(self, key, default=None):
+            running_probed.set()
+            return super().get(key, default)
+
+    def tts_pending():
+        tts_probed.set()
+        return state["tts"]
+
+    def audio_active():
+        audio_probed.set()
+        return state["audio"]
+
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        SessionMap(
+            {
+                "sid-output": current_session,
+                # An unrelated text turn must not hold this voice UI in
+                # FOLLOW_UP after its own audio has drained.
+                "sid-unrelated": {"running": True},
+            }
+        ),
+    )
+    monkeypatch.setattr(server, "_fd_tts_pending", tts_pending)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda kind, sid, payload=None: (
+            events.append((kind, sid, payload or {})),
+            drained.set(),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.voice_mode",
+        types.SimpleNamespace(
+            is_audio_output_active=audio_active,
+            full_duplex_listen=lambda *_a, **_kw: microphone_calls.append("capture"),
+        ),
+    )
+
+    arm("sid-output")
+    assert running_probed.wait(2)
+    assert events == []
+    current_session["running"] = False
+    assert tts_probed.wait(2)
+    assert events == []
+    state["tts"] = False
+    assert audio_probed.wait(2)
+    assert events == []
+    state["audio"] = False
+    assert drained.wait(2)
+
+    assert events == [("voice.output_drained", "sid-output", {})]
+    assert microphone_calls == []
+
+
+def test_output_drained_monitor_new_turn_supersedes_old_and_voice_off_is_silent(
+    monkeypatch,
+):
+    arm = getattr(server, "_arm_output_drain_monitor", None)
+    assert arm is not None, "non-barge output-drain monitor is not implemented"
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    monkeypatch.setattr(server, "_fd_tts_pending", lambda: False)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.voice_mode",
+        types.SimpleNamespace(is_audio_output_active=lambda: False),
+    )
+    events: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda kind, sid, payload=None: events.append((kind, sid, payload or {})),
+    )
+
+    threads = []
+
+    class DeferredThread:
+        def __init__(self, *, target, args=(), **_kwargs):
+            self.target = target
+            self.args = args
+            threads.append(self)
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(server.threading, "Thread", DeferredThread)
+
+    arm("sid-old")
+    arm("sid-new")
+    assert len(threads) == 2
+    assert threads[0].args[-1].is_set()
+    threads[0].target(*threads[0].args)
+    threads[1].target(*threads[1].args)
+    assert events == [("voice.output_drained", "sid-new", {})]
+
+    arm("sid-off")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    threads[2].target(*threads[2].args)
+    assert events == [("voice.output_drained", "sid-new", {})]
+
+
 def test_tts_stream_vad_barge_in_cuts_pipeline_and_submits_capture(monkeypatch, tmp_path):
     """User speech during playback cuts TTS at the moment of detection
     (voice.interrupted), then the captured interruption is transcribed and

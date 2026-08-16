@@ -9917,8 +9917,12 @@ def _run_prompt_submit(
             # the user can interject DURING generation, not just during
             # playback. _tts_stream_begin arms it too when a pipeline
             # starts; this covers voice mode without working TTS.
-            if _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
-                _arm_full_duplex_listener(sid)
+            if _voice_mode_enabled():
+                if _voice_cfg_dict().get("barge_in", True):
+                    _cancel_output_drain_monitor()
+                    _arm_full_duplex_listener(sid)
+                else:
+                    _arm_output_drain_monitor(sid)
 
             # Ambient "thinking" sound (voice mode only): calm bubble blips
             # while the agent works with no audio flowing, so long
@@ -13205,6 +13209,8 @@ _fd_listener_active = False
 # the listener must cut THEIR private stop events too, and must keep
 # listening while any of them is still speaking.
 _fd_speak_pipelines: "set[tuple[threading.Event, threading.Event]]" = set()
+_output_drain_lock = threading.Lock()
+_output_drain_stop: Optional[threading.Event] = None
 
 
 def _arm_full_duplex_listener(session_id: str | None = None) -> None:
@@ -13234,6 +13240,85 @@ def _fd_tts_pending() -> bool:
     with _fd_listener_lock:
         pipelines = list(_fd_speak_pipelines)
     return any(not done.is_set() for _stop, done in pipelines)
+
+
+def _cancel_output_drain_monitor() -> None:
+    """Cancel the microphone-free monitor for an older turn, if any."""
+    global _output_drain_stop
+    with _output_drain_lock:
+        stop, _output_drain_stop = _output_drain_stop, None
+    if stop is not None:
+        stop.set()
+
+
+def _arm_output_drain_monitor(session_id: str) -> None:
+    """Report output drain without opening the microphone.
+
+    One process-global speaker means a newer turn supersedes the prior
+    monitor, just as a newer streaming-TTS pipeline supersedes the old one.
+    """
+    global _output_drain_stop
+    if not _voice_mode_enabled():
+        return
+    stop = threading.Event()
+    with _output_drain_lock:
+        previous = _output_drain_stop
+        _output_drain_stop = stop
+    if previous is not None:
+        previous.set()
+    threading.Thread(
+        target=_output_drain_monitor,
+        args=(session_id, stop),
+        daemon=True,
+        name="voice-output-drain",
+    ).start()
+
+
+def _output_drain_session_running(session_id: str) -> bool:
+    """Return whether the monitor's scoped turn is still running."""
+    try:
+        with _sessions_lock:
+            session = _sessions.get(session_id)
+            return bool(session and session.get("running"))
+    except Exception:
+        return False
+
+
+def _output_drain_monitor(
+    session_id: str,
+    stop: threading.Event,
+) -> None:
+    """Wait for the turn and every output pipeline to become idle."""
+    global _output_drain_stop
+    try:
+        from tools.voice_mode import is_audio_output_active
+
+        while not stop.is_set():
+            if not _voice_mode_enabled():
+                return
+            if (
+                _output_drain_session_running(session_id)
+                or _fd_tts_pending()
+                or is_audio_output_active()
+            ):
+                stop.wait(0.05)
+                continue
+            with _output_drain_lock:
+                if (
+                    _output_drain_stop is not stop
+                    or stop.is_set()
+                    or not _voice_mode_enabled()
+                ):
+                    return
+                _output_drain_stop = None
+                _emit("voice.output_drained", session_id, {})
+            return
+    except Exception as e:
+        logger.debug("output-drain monitor failed: %s", e)
+    finally:
+        with _output_drain_lock:
+            if _output_drain_stop is stop:
+                _output_drain_stop = None
 
 
 def _normalize_voice_phrase(text: str) -> str:
@@ -13956,6 +14041,7 @@ def _(rid, params: dict) -> dict:
                 stop_hint = ""
 
         if not enabled:
+            _cancel_output_drain_monitor()
             # Disabling the mode must tear the continuous loop down; the
             # loop holds the microphone and would otherwise keep running.
             try:
