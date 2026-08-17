@@ -1829,6 +1829,113 @@ def test_wake_status_reports_configured_input_device_and_windows_silence_hint(mo
         server._wake_owner_surface = ""
 
 
+def test_wake_diagnostics_rpc_is_strict_and_owner_scoped(monkeypatch):
+    import json
+
+    from tools import wake_word
+
+    class _Engine:
+        frame_length = 4
+
+        def process(self, _frame):
+            return False
+
+        def reset(self):
+            pass
+
+        def close(self):
+            pass
+
+    owner = types.SimpleNamespace(_closed=False)
+    other = types.SimpleNamespace(_closed=False)
+    detector = wake_word.WakeWordDetector(
+        _Engine(), lambda: None, external_audio=True
+    )
+    monkeypatch.setattr(wake_word, "_detector", detector)
+    monkeypatch.setattr(wake_word, "_detector_owner", owner)
+
+    response = server.dispatch(
+        {
+            "id": "wake-diagnostic-owner",
+            "method": "wake.diagnostics",
+            "params": {"reset": True},
+        },
+        transport=owner,
+    )
+    assert response["result"] == {
+        "armed": True,
+        "owned_by_caller": True,
+        "reason": None,
+        "capture": "client",
+        "external_audio": True,
+        "processed_frames": 0,
+        "pcm_peak": {"latest": None, "peak": None},
+        "client_queue": {"depth": 0, "drops": 0},
+    }
+    json.dumps(response["result"], allow_nan=False)
+
+    denied = server.dispatch(
+        {
+            "id": "wake-diagnostic-other",
+            "method": "wake.diagnostics",
+            "params": {"reset": True},
+        },
+        transport=other,
+    )
+    assert denied["result"] == {
+        "armed": True,
+        "owned_by_caller": False,
+        "reason": "not_owner",
+    }
+
+    # Even if an old owner reference lingers, an unarmed process returns no
+    # prior measurement fields.
+    monkeypatch.setattr(wake_word, "_detector", None)
+    unarmed = server.dispatch(
+        {"id": "wake-diagnostic-unarmed", "method": "wake.diagnostics", "params": {}},
+        transport=owner,
+    )
+    assert unarmed["result"] == {
+        "armed": False,
+        "owned_by_caller": False,
+        "reason": "unarmed",
+    }
+
+
+def test_wake_feed_response_remains_enqueue_only(monkeypatch):
+    import base64
+
+    from tools import wake_word
+
+    transport = types.SimpleNamespace(_closed=False)
+    accepted = []
+
+    def _feed_audio(*, owner, pcm_int16):
+        accepted.append((owner, pcm_int16))
+        return True
+
+    monkeypatch.setattr(wake_word, "feed_audio", _feed_audio)
+    pcm = b"\x01\x00\x02\x00"
+    response = server.dispatch(
+        {
+            "id": "wake-feed",
+            "method": "wake.feed",
+            "params": {
+                "pcm": base64.b64encode(pcm).decode("ascii"),
+                "sample_rate": 16000,
+            },
+        },
+        transport=transport,
+    )
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": "wake-feed",
+        "result": {"fed": True, "reason": None},
+    }
+    assert accepted == [(transport, pcm)]
+
+
 def test_voice_record_start_forwards_max_recording_seconds(monkeypatch):
     """voice.max_recording_seconds must reach start_continuous from the TUI.
 

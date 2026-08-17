@@ -32,6 +32,7 @@ string to the caller, exactly like a voice transcript.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 import threading
@@ -550,6 +551,11 @@ class _OpenWakeWordEngine(_Engine):
         self._threshold = _sensitivity(cfg)
         self._confirm_needed = _confirmation_frames(cfg)
         self._confirm_streak = 0
+        self._score_lock = threading.Lock()
+        self._latest_score: Optional[float] = None
+        self._latest_score_label: Optional[str] = None
+        self._peak_score: Optional[float] = None
+        self._peak_score_label: Optional[str] = None
 
         # openWakeWord silently downgrades tflite -> onnx when no tflite runtime
         # imports (model.py). On macOS ARM64 that lands on the backend whose
@@ -594,21 +600,65 @@ class _OpenWakeWordEngine(_Engine):
     def process(self, frame) -> bool:
         scores = self._model.predict(frame)
         over = any(score >= self._threshold for score in scores.values())
+        latest_score: Optional[float] = None
+        latest_label: Optional[str] = None
+        try:
+            label, raw_score = max(scores.items(), key=lambda item: item[1])
+            numeric_score = float(raw_score)
+            if math.isfinite(numeric_score):
+                latest_score = numeric_score
+                latest_label = str(label)
+        except (TypeError, ValueError):
+            pass
+
         # Require N consecutive over-threshold frames: a real phrase holds the
         # score high across frames, a stray ambient phoneme spikes just one.
-        if over:
-            self._confirm_streak += 1
-            if self._confirm_streak >= self._confirm_needed:
-                self._confirm_streak = 0
-                return True
+        with self._score_lock:
+            self._latest_score = latest_score
+            self._latest_score_label = latest_label
+            if latest_score is not None and (
+                self._peak_score is None or latest_score > self._peak_score
+            ):
+                self._peak_score = latest_score
+                self._peak_score_label = latest_label
+
+            if over:
+                self._confirm_streak += 1
+                if self._confirm_streak >= self._confirm_needed:
+                    self._confirm_streak = 0
+                    return True
+                return False
+            self._confirm_streak = 0
             return False
-        self._confirm_streak = 0
-        return False
+
+    def score_diagnostics(self, *, reset: bool = False) -> Dict[str, Any]:
+        """Return JSON-safe OpenWakeWord scores without retaining audio.
+
+        ``reset`` starts a new score measurement window. It intentionally does
+        not touch the confirmation streak or the model's rolling feature state,
+        so observing diagnostics cannot change whether a frame fires.
+        """
+        with self._score_lock:
+            if reset:
+                self._latest_score = None
+                self._latest_score_label = None
+                self._peak_score = None
+                self._peak_score_label = None
+            return {
+                "latest": self._latest_score,
+                "latest_label": self._latest_score_label,
+                "peak": self._peak_score,
+                "peak_label": self._peak_score_label,
+                "threshold": float(self._threshold),
+                "confirmation_streak": int(self._confirm_streak),
+                "confirmation_frames": int(self._confirm_needed),
+            }
 
     def reset(self) -> None:
         # Clears openWakeWord's rolling feature/prediction buffer so stale audio
         # captured before a pause can't re-fire the moment we resume.
-        self._confirm_streak = 0
+        with self._score_lock:
+            self._confirm_streak = 0
         try:
             self._model.reset()
         except Exception:
@@ -1019,6 +1069,11 @@ class WakeWordDetector:
         import queue as _queue
 
         self._audio_q: "_queue.Queue[Any]" = _queue.Queue(maxsize=64)
+        self._diagnostics_lock = threading.Lock()
+        self._latest_pcm_peak: Optional[int] = None
+        self._peak_pcm_peak: Optional[int] = None
+        self._processed_frames = 0
+        self._client_queue_drops = 0
         # True when the stream is open but every frame is (near-)silence.
         # Surfaced via wake.status / /wake status so users can tell "armed"
         # from "deaf".
@@ -1063,14 +1118,51 @@ class WakeWordDetector:
                 self._audio_q.put_nowait(chunk)
             except Exception:
                 # Drop oldest on overflow so we stay real-time
+                dropped = False
                 try:
                     self._audio_q.get_nowait()
+                    dropped = True
                 except Exception:
                     pass
+                if dropped:
+                    with self._diagnostics_lock:
+                        self._client_queue_drops += 1
                 try:
                     self._audio_q.put_nowait(chunk)
                 except Exception:
                     pass
+
+    def diagnostics(self, *, reset: bool = False) -> Dict[str, Any]:
+        """Return the bounded, non-audio measurement window for this detector."""
+        with self._diagnostics_lock:
+            if reset:
+                self._latest_pcm_peak = None
+                self._peak_pcm_peak = None
+                self._processed_frames = 0
+                self._client_queue_drops = 0
+            snapshot: Dict[str, Any] = {
+                "capture": "client" if self.external_audio else "local",
+                "external_audio": bool(self.external_audio),
+                "processed_frames": int(self._processed_frames),
+                "pcm_peak": {
+                    "latest": self._latest_pcm_peak,
+                    "peak": self._peak_pcm_peak,
+                },
+                "client_queue": {
+                    "depth": int(self._audio_q.qsize()),
+                    "drops": int(self._client_queue_drops),
+                },
+            }
+
+        score_diagnostics = getattr(self.engine, "score_diagnostics", None)
+        if callable(score_diagnostics):
+            try:
+                score = score_diagnostics(reset=reset)
+            except Exception:
+                score = None
+            if isinstance(score, dict):
+                snapshot["score"] = score
+        return snapshot
 
     def start(self) -> None:
         """Open the mic (or client feeder) and begin listening. Idempotent."""
@@ -1221,6 +1313,11 @@ class WakeWordDetector:
                     peak = int(abs(frame).max()) if len(frame) else 0
                 except Exception:
                     peak = _SILENCE_PEAK + 1
+                with self._diagnostics_lock:
+                    self._processed_frames += 1
+                    self._latest_pcm_peak = peak
+                    if self._peak_pcm_peak is None or peak > self._peak_pcm_peak:
+                        self._peak_pcm_peak = peak
                 if peak <= _SILENCE_PEAK:
                     self._silent_frames += 1
                     if self._silent_frames == silent_alert_frames:
@@ -1478,6 +1575,33 @@ def get_last_match() -> Optional[tuple[str, str]]:
     if det is None:
         return None
     return getattr(det.engine, "last_match", None)
+
+
+def get_wake_diagnostics(*, owner: object, reset: bool = False) -> Dict[str, Any]:
+    """Return diagnostics only for the process-local listener's current owner.
+
+    Denied and unarmed snapshots intentionally contain no measurement fields,
+    so a new or foreign transport cannot observe a prior owner's values.
+    """
+    with _detector_lock:
+        if _detector is None:
+            return {
+                "armed": False,
+                "owned_by_caller": False,
+                "reason": "unarmed",
+            }
+        if owner is None or _detector_owner is not owner:
+            return {
+                "armed": True,
+                "owned_by_caller": False,
+                "reason": "not_owner",
+            }
+        return {
+            "armed": True,
+            "owned_by_caller": True,
+            "reason": None,
+            **_detector.diagnostics(reset=bool(reset)),
+        }
 
 
 def feed_audio(*, owner: object, pcm_int16) -> bool:

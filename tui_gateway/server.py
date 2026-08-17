@@ -13938,6 +13938,23 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5026, str(e))
 
 
+@method("wake.diagnostics")
+def _(rid, params: dict) -> dict:
+    """Return resettable, owner-only wake measurements with no captured audio."""
+    reset = params.get("reset", False)
+    if not isinstance(reset, bool):
+        return _err(rid, 4001, "wake.diagnostics reset must be boolean")
+    transport = current_transport() or _stdio_transport
+    try:
+        from tools.wake_word import get_wake_diagnostics
+
+        snapshot = get_wake_diagnostics(owner=transport, reset=reset)
+    except Exception as e:
+        logger.debug("wake.diagnostics failed: %s", e)
+        return _err(rid, 5026, str(e))
+    return _ok(rid, snapshot)
+
+
 @method("wake.feed")
 def _(rid, params: dict) -> dict:
     """Push client-captured PCM into the armed wake detector.
