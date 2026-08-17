@@ -1902,7 +1902,7 @@ def test_wake_diagnostics_rpc_is_strict_and_owner_scoped(monkeypatch):
     }
 
 
-def test_wake_feed_response_remains_enqueue_only(monkeypatch):
+def test_wake_feed_snapshots_playback_and_response_remains_enqueue_only(monkeypatch):
     import base64
 
     from tools import wake_word
@@ -1910,11 +1910,14 @@ def test_wake_feed_response_remains_enqueue_only(monkeypatch):
     transport = types.SimpleNamespace(_closed=False)
     accepted = []
 
-    def _feed_audio(*, owner, pcm_int16):
-        accepted.append((owner, pcm_int16))
+    def _feed_audio(*, owner, pcm_int16, playback_active):
+        accepted.append((owner, pcm_int16, playback_active))
         return True
 
     monkeypatch.setattr(wake_word, "feed_audio", _feed_audio)
+    from tools import voice_mode
+
+    monkeypatch.setattr(voice_mode, "is_audio_output_active", lambda: True)
     pcm = b"\x01\x00\x02\x00"
     response = server.dispatch(
         {
@@ -1933,7 +1936,7 @@ def test_wake_feed_response_remains_enqueue_only(monkeypatch):
         "id": "wake-feed",
         "result": {"fed": True, "reason": None},
     }
-    assert accepted == [(transport, pcm)]
+    assert accepted == [(transport, pcm, True)]
 
 
 def test_voice_record_start_forwards_max_recording_seconds(monkeypatch):

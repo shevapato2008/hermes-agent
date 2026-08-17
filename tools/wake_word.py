@@ -31,14 +31,20 @@ string to the caller, exactly like a voice transcript.
 
 from __future__ import annotations
 
+import io
+import ipaddress
 import logging
 import math
 import os
 import sys
 import threading
 import time
+import wave
+from array import array
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +69,15 @@ _DEFAULT_CONFIRMATION_FRAMES = 3
 # backend-selected stream is all zeros.
 _SILENCE_PEAK = 10
 _SILENCE_ALERT_SECONDS = 10
+
+# Playback wake verification is intentionally private and fixed-budget. The
+# only product knobs are enabled/candidate_threshold/aliases; audio retention
+# and network latency stay bounded here rather than becoming user-facing
+# tuning surfaces.
+_PLAYBACK_PRE_ROLL_SECONDS = 1.2
+_PLAYBACK_POST_ROLL_SECONDS = 0.24
+_PLAYBACK_VERIFY_TIMEOUT_SECONDS = 0.4
+_PLAYBACK_DEFAULT_CANDIDATE_THRESHOLD = 0.015
 
 
 class WakeWordInUse(RuntimeError):
@@ -242,6 +257,34 @@ def _confirmation_frames(cfg: Dict[str, Any]) -> int:
     except (TypeError, ValueError):
         n = _DEFAULT_CONFIRMATION_FRAMES
     return min(max(n, 1), 10)
+
+
+def _playback_verification_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Shape-check the private playback-verification config block."""
+    raw = cfg.get("playback_verification")
+    block = raw if isinstance(raw, dict) else {}
+    try:
+        threshold = float(
+            block.get("candidate_threshold", _PLAYBACK_DEFAULT_CANDIDATE_THRESHOLD)
+        )
+    except (TypeError, ValueError):
+        threshold = _PLAYBACK_DEFAULT_CANDIDATE_THRESHOLD
+    if not math.isfinite(threshold):
+        threshold = _PLAYBACK_DEFAULT_CANDIDATE_THRESHOLD
+
+    raw_aliases = block.get("aliases")
+    aliases = []
+    if isinstance(raw_aliases, (list, tuple)):
+        aliases = [
+            str(alias).strip()
+            for alias in raw_aliases
+            if isinstance(alias, str) and alias.strip()
+        ]
+    return {
+        "enabled": block.get("enabled") is True,
+        "candidate_threshold": min(max(threshold, 0.0), 1.0),
+        "aliases": aliases,
+    }
 
 
 def wake_phrase(cfg: Optional[Dict[str, Any]] = None) -> str:
@@ -654,6 +697,11 @@ class _OpenWakeWordEngine(_Engine):
                 "confirmation_frames": int(self._confirm_needed),
             }
 
+    def latest_score(self) -> Optional[float]:
+        """Return the latest finite model score for internal gating."""
+        with self._score_lock:
+            return self._latest_score
+
     def reset(self) -> None:
         # Clears openWakeWord's rolling feature/prediction buffer so stale audio
         # captured before a pause can't re-fire the moment we resume.
@@ -1037,6 +1085,291 @@ def check_wake_word_requirements(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
 # Detector
 # ---------------------------------------------------------------------------
 
+
+def _normalize_verified_phrase(value: Any) -> str:
+    """Normalize only punctuation/spacing/case; never fuzzy- or substring-match."""
+    return "".join(ch for ch in str(value) if ch.isalnum()).casefold()
+
+
+def _frame_pcm_bytes(frame: Any) -> bytes:
+    """Copy one frame to little-endian int16 bytes for the bounded ring."""
+    if isinstance(frame, (bytes, bytearray, memoryview)):
+        return bytes(frame)
+    try:
+        return frame.astype("<i2", copy=False).tobytes()
+    except Exception:
+        samples = array("h", (int(sample) for sample in frame))
+        if sys.byteorder != "little":
+            samples.byteswap()
+        return samples.tobytes()
+
+
+def _pcm_wav_bytes(pcm: bytes) -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(SAMPLE_RATE)
+        wav_file.writeframes(pcm)
+    return output.getvalue()
+
+
+def _loopback_transcription_url(base_url: str) -> Optional[str]:
+    """Return the transcription URL only for an explicit loopback origin."""
+    try:
+        parsed = urlsplit(str(base_url).strip())
+        hostname = (parsed.hostname or "").casefold()
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            return None
+        if hostname != "localhost":
+            try:
+                if not ipaddress.ip_address(hostname).is_loopback:
+                    return None
+            except ValueError:
+                return None
+        # Accessing port validates malformed values before httpx sees them.
+        _ = parsed.port
+    except (TypeError, ValueError):
+        return None
+    return f"{str(base_url).strip().rstrip('/')}/audio/transcriptions"
+
+
+def _verify_playback_pcm(pcm: bytes, phrase: str, aliases: list[str]) -> str:
+    """Transcribe one bounded in-memory window through configured local STT.
+
+    The return value is a small diagnostic reason only. Neither PCM nor the
+    transcript escapes this call or reaches a log.
+    """
+    try:
+        from tools import transcription_tools
+
+        stt_config = transcription_tools._load_stt_config()
+        if not isinstance(stt_config, dict):
+            return "stt_unavailable"
+        if not transcription_tools.is_stt_enabled(stt_config):
+            return "stt_disabled"
+        if str(stt_config.get("provider") or "").strip().lower() != "openai":
+            return "stt_not_openai"
+
+        openai_raw = stt_config.get("openai")
+        openai_config = openai_raw if isinstance(openai_raw, dict) else {}
+        model = str(
+            openai_config.get("model")
+            or getattr(transcription_tools, "DEFAULT_STT_MODEL", "")
+        ).strip()
+        if not model:
+            return "stt_unavailable"
+        language = str(
+            openai_config.get("language") or stt_config.get("language") or ""
+        ).strip()
+        api_key, base_url = (
+            transcription_tools._resolve_openai_audio_client_config()
+        )
+        endpoint = _loopback_transcription_url(base_url)
+        if endpoint is None:
+            return "stt_not_loopback"
+    except Exception:
+        return "stt_unavailable"
+
+    request_data = {"model": model, "response_format": "json"}
+    if language:
+        request_data["language"] = language
+    try:
+        import httpx
+
+        with httpx.Client(
+            timeout=_PLAYBACK_VERIFY_TIMEOUT_SECONDS,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            response = client.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {api_key}"},
+                data=request_data,
+                files={
+                    "file": (
+                        "wake-candidate.wav",
+                        _pcm_wav_bytes(pcm),
+                        "audio/wav",
+                    )
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        try:
+            import httpx
+
+            if isinstance(exc, httpx.TimeoutException):
+                return "timeout"
+        except Exception:
+            pass
+        return "error"
+
+    transcript = payload.get("text") if isinstance(payload, dict) else None
+    normalized = _normalize_verified_phrase(transcript or "")
+    accepted = {
+        normalized_phrase
+        for normalized_phrase in (
+            _normalize_verified_phrase(candidate)
+            for candidate in [phrase, *aliases]
+        )
+        if normalized_phrase
+    }
+    return "verified" if normalized and normalized in accepted else "mismatch"
+
+
+class _PlaybackWakeVerifier:
+    """One coalescing verifier worker with a bounded in-memory PCM window."""
+
+    def __init__(
+        self,
+        *,
+        frame_length: int,
+        threshold: float,
+        phrase: str,
+        aliases: list[str],
+        is_epoch_current: Callable[[int], bool],
+        on_verified: Callable[[int], None],
+    ):
+        frame_seconds = max(1, int(frame_length)) / SAMPLE_RATE
+        pre_frames = max(1, int(math.ceil(_PLAYBACK_PRE_ROLL_SECONDS / frame_seconds)))
+        self._post_frames = max(
+            1, int(math.ceil(_PLAYBACK_POST_ROLL_SECONDS / frame_seconds))
+        )
+        self._threshold = threshold
+        self._phrase = phrase
+        self._aliases = list(aliases)
+        self._is_epoch_current = is_epoch_current
+        self._on_verified = on_verified
+        self._ring = deque(maxlen=pre_frames)
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._above_threshold = False
+        self._capture: Optional[Dict[str, Any]] = None
+        self._pending: Optional[tuple[int, int, bytes]] = None
+        self._worker: Optional[threading.Thread] = None
+        self._worker_active = False
+        self._candidates = 0
+        self._verified = 0
+        self._rejected = 0
+        self._last_result: Optional[str] = None
+
+    def observe(
+        self,
+        frame: Any,
+        *,
+        playback_active: bool,
+        score: Optional[float],
+        epoch: int,
+    ) -> None:
+        frame_bytes = _frame_pcm_bytes(frame)
+        with self._lock:
+            self._ring.append(frame_bytes)
+            above = bool(
+                playback_active
+                and score is not None
+                and math.isfinite(score)
+                and score >= self._threshold
+            )
+            new_candidate = above and not self._above_threshold
+            self._above_threshold = above
+
+            if new_candidate:
+                self._generation += 1
+                token = self._generation
+                self._pending = None
+                self._capture = {
+                    "token": token,
+                    "epoch": epoch,
+                    "frames": list(self._ring),
+                    "remaining": self._post_frames,
+                }
+                self._candidates += 1
+                self._last_result = "candidate"
+                return
+
+            capture = self._capture
+            if capture is None:
+                return
+            capture["frames"].append(frame_bytes)
+            capture["remaining"] -= 1
+            if capture["remaining"] > 0:
+                return
+
+            self._pending = (
+                int(capture["token"]),
+                int(capture["epoch"]),
+                b"".join(capture["frames"]),
+            )
+            self._capture = None
+            self._last_result = "pending"
+            if self._worker is None or not self._worker.is_alive():
+                self._worker_active = True
+                self._worker = threading.Thread(
+                    target=self._run,
+                    daemon=True,
+                    name="wake-playback-verifier",
+                )
+                self._worker.start()
+
+    def invalidate(self) -> None:
+        """Fence pending work and discard retained audio on lifecycle changes."""
+        with self._lock:
+            self._generation += 1
+            self._above_threshold = False
+            self._capture = None
+            self._pending = None
+            self._ring.clear()
+
+    def diagnostics(self, *, reset: bool = False) -> Dict[str, Any]:
+        with self._lock:
+            if reset:
+                self._candidates = 0
+                self._verified = 0
+                self._rejected = 0
+                self._last_result = None
+            return {
+                "enabled": True,
+                "candidates": int(self._candidates),
+                "verified": int(self._verified),
+                "rejected": int(self._rejected),
+                "last_result": self._last_result,
+                "worker_active": bool(self._worker_active),
+            }
+
+    def _run(self) -> None:
+        while True:
+            with self._lock:
+                pending = self._pending
+                self._pending = None
+                if pending is None:
+                    self._worker_active = False
+                    self._worker = None
+                    return
+            token, epoch, pcm = pending
+            result = _verify_playback_pcm(pcm, self._phrase, self._aliases)
+            should_fire = False
+            with self._lock:
+                if token != self._generation or not self._is_epoch_current(epoch):
+                    result = "stale"
+                if result == "verified":
+                    self._verified += 1
+                    should_fire = True
+                else:
+                    self._rejected += 1
+                self._last_result = result
+            if should_fire:
+                self._on_verified(epoch)
+
+
 class WakeWordDetector:
     """Background hotword listener. Fires ``on_wake()`` when the phrase is heard.
 
@@ -1048,7 +1381,8 @@ class WakeWordDetector:
                  cooldown: float = _FIRE_COOLDOWN_SECONDS,
                  on_failure: Optional[Callable[["WakeWordDetector"], None]] = None,
                  input_device: int | str | None = None,
-                 external_audio: bool = False):
+                 external_audio: bool = False,
+                 config: Optional[Dict[str, Any]] = None):
         self.engine = engine
         self.on_wake = on_wake
         self.cooldown = cooldown
@@ -1065,7 +1399,22 @@ class WakeWordDetector:
         self._callback_inflight = threading.Event()
         self._last_fire = 0.0
         self._lock = threading.Lock()
-        # Client-capture PCM queue (int16 mono frames). Local mode ignores this.
+        self._epoch_lock = threading.Lock()
+        self._epoch = 0
+        playback = _playback_verification_settings(config or {})
+        self._playback_verification_enabled = bool(playback["enabled"])
+        self._playback_verifier: Optional[_PlaybackWakeVerifier] = None
+        if self._playback_verification_enabled:
+            self._playback_verifier = _PlaybackWakeVerifier(
+                frame_length=int(self.engine.frame_length),
+                threshold=float(playback["candidate_threshold"]),
+                phrase=wake_phrase(config or {}),
+                aliases=list(playback["aliases"]),
+                is_epoch_current=self._is_epoch_current,
+                on_verified=self._verified_wake,
+            )
+        # Client-capture queue entries carry int16 PCM plus the playback state
+        # captured by wake.feed at ingress. Local mode ignores this queue.
         import queue as _queue
 
         self._audio_q: "_queue.Queue[Any]" = _queue.Queue(maxsize=64)
@@ -1085,7 +1434,7 @@ class WakeWordDetector:
         t = self._thread
         return t is not None and t.is_alive()
 
-    def feed(self, pcm_int16) -> None:
+    def feed(self, pcm_int16, *, playback_active: bool = False) -> None:
         """Enqueue one int16 mono frame (or raw bytes) for client capture.
 
         Frame length should match ``engine.frame_length`` (typically 1280 samples
@@ -1115,7 +1464,7 @@ class WakeWordDetector:
                 pad[: chunk.shape[0]] = chunk
                 chunk = pad
             try:
-                self._audio_q.put_nowait(chunk)
+                self._audio_q.put_nowait((chunk, bool(playback_active)))
             except Exception:
                 # Drop oldest on overflow so we stay real-time
                 dropped = False
@@ -1128,7 +1477,7 @@ class WakeWordDetector:
                     with self._diagnostics_lock:
                         self._client_queue_drops += 1
                 try:
-                    self._audio_q.put_nowait(chunk)
+                    self._audio_q.put_nowait((chunk, bool(playback_active)))
                 except Exception:
                     pass
 
@@ -1162,6 +1511,10 @@ class WakeWordDetector:
                 score = None
             if isinstance(score, dict):
                 snapshot["score"] = score
+        if self._playback_verifier is not None:
+            snapshot["playback_verification"] = self._playback_verifier.diagnostics(
+                reset=reset
+            )
         return snapshot
 
     def start(self) -> None:
@@ -1169,12 +1522,13 @@ class WakeWordDetector:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
+            epoch = self._begin_epoch()
             self._stop.clear()
             ready = threading.Event()
             startup_errors: list[BaseException] = []
             self._thread = threading.Thread(
                 target=self._run,
-                args=(ready, startup_errors),
+                args=(ready, startup_errors, epoch),
                 daemon=True,
                 name="wake-word",
             )
@@ -1198,6 +1552,7 @@ class WakeWordDetector:
         self.engine.close()
 
     def _halt_thread(self) -> None:
+        self._invalidate_epoch()
         with self._lock:
             self._stop.set()
             t = self._thread
@@ -1214,8 +1569,85 @@ class WakeWordDetector:
         finally:
             self._callback_inflight.clear()
 
+    def _begin_epoch(self) -> int:
+        with self._epoch_lock:
+            self._epoch += 1
+            epoch = self._epoch
+        if self._playback_verifier is not None:
+            self._playback_verifier.invalidate()
+        return epoch
+
+    def _invalidate_epoch(self) -> None:
+        with self._epoch_lock:
+            self._epoch += 1
+        if self._playback_verifier is not None:
+            self._playback_verifier.invalidate()
+
+    def _is_epoch_current(self, epoch: int) -> bool:
+        with self._epoch_lock:
+            return self._epoch == epoch and not self._stop.is_set()
+
+    def _verified_wake(self, epoch: int) -> None:
+        self._schedule_wake(epoch)
+
+    def _schedule_wake(self, epoch: int) -> None:
+        with self._epoch_lock:
+            if self._epoch != epoch or self._stop.is_set():
+                return
+            now = time.monotonic()
+            if now - self._last_fire < self.cooldown:
+                logger.debug("wake word: detection within cooldown — ignored")
+                return
+            self._last_fire = now
+            if self._callback_inflight.is_set():
+                return
+            self._callback_inflight.set()
+        logger.info("wake word: phrase detected — firing callback")
+        threading.Thread(
+            target=self._dispatch_wake,
+            daemon=True,
+            name="wake-word-callback",
+        ).start()
+
+    def _process_frame(
+        self, frame: Any, *, playback_active: bool, epoch: int
+    ) -> None:
+        try:
+            fired = self.engine.process(frame)
+        except Exception as e:
+            logger.debug("wake word: engine error: %s", e)
+            return
+
+        if self._playback_verifier is not None:
+            latest_score: Optional[float] = None
+            score_reader = getattr(self.engine, "latest_score", None)
+            if callable(score_reader):
+                try:
+                    latest_score = score_reader()
+                except Exception:
+                    latest_score = None
+            try:
+                self._playback_verifier.observe(
+                    frame,
+                    playback_active=playback_active,
+                    score=latest_score,
+                    epoch=epoch,
+                )
+            except Exception:
+                # Verification is optional; it must never take down or alter
+                # the ordinary idle detector path.
+                logger.debug("wake word: playback verifier failed")
+
+        # When explicitly enabled, playback frames can only wake through the
+        # exact STT verifier. The engine still processes every frame once, so
+        # its threshold/streak semantics are untouched for subsequent idle PCM.
+        if self._playback_verification_enabled and playback_active:
+            return
+        if fired:
+            self._schedule_wake(epoch)
+
     def _run(self, ready: threading.Event,
-             startup_errors: list[BaseException]) -> None:
+             startup_errors: list[BaseException], epoch: int) -> None:
         frame_length = self.engine.frame_length
         capture_frame_length = frame_length
         capture_rate = SAMPLE_RATE
@@ -1292,16 +1724,34 @@ class WakeWordDetector:
                 try:
                     if self.external_audio:
                         try:
-                            frame = self._audio_q.get(timeout=0.25)
+                            queued = self._audio_q.get(timeout=0.25)
                         except Exception:
                             # No client frames yet — count as silence for status.
                             self._silent_frames += 1
                             if self._silent_frames == silent_alert_frames:
                                 self.audio_silent = True
                             continue
-                        data = frame
+                        if (
+                            isinstance(queued, tuple)
+                            and len(queued) == 2
+                            and isinstance(queued[1], bool)
+                        ):
+                            data, playback_active = queued
+                        else:
+                            # Backward-compatible with any in-process feeder
+                            # that already placed a raw frame in the queue.
+                            data = queued
+                            playback_active = False
                     else:
                         data, _overflow = stream.read(capture_frame_length)
+                        playback_active = False
+                        if self._playback_verification_enabled:
+                            try:
+                                from tools.voice_mode import is_audio_output_active
+
+                                playback_active = bool(is_audio_output_active())
+                            except Exception:
+                                pass
                 except Exception as e:
                     logger.warning("wake word: stream read error: %s", e)
                     failed = not self._stop.is_set()
@@ -1332,25 +1782,11 @@ class WakeWordDetector:
                         logger.info("wake word: mic audio detected — stream healthy")
                     self._silent_frames = 0
                     self.audio_silent = False
-                try:
-                    fired = self.engine.process(frame)
-                except Exception as e:
-                    logger.debug("wake word: engine error: %s", e)
-                    continue
-                if fired:
-                    now = time.monotonic()
-                    if now - self._last_fire >= self.cooldown:
-                        self._last_fire = now
-                        logger.info("wake word: phrase detected — firing callback")
-                        if not self._callback_inflight.is_set():
-                            self._callback_inflight.set()
-                            threading.Thread(
-                                target=self._dispatch_wake,
-                                daemon=True,
-                                name="wake-word-callback",
-                            ).start()
-                    else:
-                        logger.debug("wake word: detection within cooldown — ignored")
+                self._process_frame(
+                    frame,
+                    playback_active=playback_active,
+                    epoch=epoch,
+                )
         finally:
             if stream is not None:
                 try:
@@ -1359,8 +1795,10 @@ class WakeWordDetector:
                 except Exception:
                     pass
             logger.info("wake word: stream closed")
-            if failed and self.on_failure is not None:
-                self.on_failure(self)
+            if failed:
+                self._invalidate_epoch()
+                if self.on_failure is not None:
+                    self.on_failure(self)
 
 
 # ---------------------------------------------------------------------------
@@ -1473,6 +1911,7 @@ def start_listening(
                 on_failure=_detector_failed,
                 input_device=_input_device(cfg),
                 external_audio=external_audio,
+                config=cfg,
             )
             _detector = detector
             _detector_owner = owner
@@ -1604,7 +2043,9 @@ def get_wake_diagnostics(*, owner: object, reset: bool = False) -> Dict[str, Any
         }
 
 
-def feed_audio(*, owner: object, pcm_int16) -> bool:
+def feed_audio(
+    *, owner: object, pcm_int16, playback_active: bool = False
+) -> bool:
     """Push client-captured PCM into the armed detector (client capture mode).
 
     Returns True when the frame was accepted for ``owner``'s armed detector.
@@ -1615,7 +2056,7 @@ def feed_audio(*, owner: object, pcm_int16) -> bool:
         if not _detector.external_audio:
             return False
         det = _detector
-    det.feed(pcm_int16)
+    det.feed(pcm_int16, playback_active=bool(playback_active))
     return True
 
 
