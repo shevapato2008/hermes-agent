@@ -13213,6 +13213,21 @@ _output_drain_lock = threading.Lock()
 _output_drain_stop: Optional[threading.Event] = None
 
 
+def _stop_all_tts(user_barge: bool = True) -> None:
+    """Cut streaming TTS, fallback speak pipelines, and the active player."""
+    _tts_stream_stop(user_barge=user_barge)
+    with _fd_listener_lock:
+        pipelines = list(_fd_speak_pipelines)
+    for stop, _done in pipelines:
+        stop.set()
+    try:
+        from tools.voice_mode import stop_playback
+
+        stop_playback()
+    except Exception:
+        pass
+
+
 def _arm_full_duplex_listener(session_id: str | None = None) -> None:
     """Arm the process-global full-duplex listener (idempotent — one mic)."""
     global _fd_listener_active
@@ -13346,7 +13361,6 @@ def _full_duplex_listener(session_id: str | None = None) -> None:
         from tools.voice_mode import (
             full_duplex_listen,
             is_audio_output_active,
-            stop_playback,
             transcribe_recording,
         )
 
@@ -13372,14 +13386,7 @@ def _full_duplex_listener(session_id: str | None = None) -> None:
         tripped = threading.Event()
 
         def _cut_all_tts() -> None:
-            # Streaming pipeline (private stop event + player).
-            _tts_stream_stop(user_barge=True)
-            # Fallback whole-reply speak paths (their own stop events).
-            with _fd_listener_lock:
-                pipelines = list(_fd_speak_pipelines)
-            for _stop, _done in pipelines:
-                _stop.set()
-            stop_playback()
+            _stop_all_tts(user_barge=True)
 
         def _on_trigger(phase: str) -> None:
             tripped.set()

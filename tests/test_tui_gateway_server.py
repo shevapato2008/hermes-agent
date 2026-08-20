@@ -10004,6 +10004,42 @@ def test_interrupt_clears_multiple_own_pending():
             server._answers.pop(key, None)
 
 
+def test_interrupt_stops_fallback_tts_when_streaming_state_is_absent(monkeypatch):
+    """Stop cuts fallback speech even when no streaming pipeline owns the player."""
+    from tools import voice_mode
+
+    fallback_stop = threading.Event()
+    fallback_done = threading.Event()
+    playback_stops = []
+    monkeypatch.setattr(server, "_tts_stream_state", None)
+    monkeypatch.setattr(
+        server,
+        "_fd_speak_pipelines",
+        {(fallback_stop, fallback_done)},
+    )
+    monkeypatch.setattr(
+        voice_mode,
+        "stop_playback",
+        lambda: playback_stops.append(True),
+    )
+    server._sessions["sid"] = _session()
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "interrupt-fallback-tts",
+                "method": "session.interrupt",
+                "params": {"session_id": "sid"},
+            }
+        )
+
+        assert response["result"]["status"] == "interrupted"
+        assert fallback_stop.is_set() is True
+        assert playback_stops == [True]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_run_prompt_submit_registers_turn_thread_for_interrupt(monkeypatch):
     """_run_prompt_submit must expose the actual turn thread to session.interrupt.
 
