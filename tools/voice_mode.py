@@ -1625,8 +1625,9 @@ def play_audio_file(file_path: str) -> bool:
 
     Strategy:
     1. WAV files via ``sounddevice.play()`` when available.
-    2. System commands: ``afplay`` (macOS), ``ffplay`` (cross-platform),
-       ``aplay`` (Linux ALSA).
+    2. System commands: ``afplay`` (macOS), ``gst-launch-1.0`` (Linux),
+       ``ffplay`` (cross-platform), and ``aplay`` for supported Linux PCM
+       containers.
 
     Playback can be interrupted by calling ``stop_playback()``.
 
@@ -1755,8 +1756,34 @@ def _play_audio_file_impl(file_path: str) -> bool:
             except Exception:
                 pass  # WSL path resolution failed; fall through to ffplay/aplay
 
-    players.append(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file_path])
+    players.append(
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file_path]
+    )
     if system == "Linux":
+        players.append(
+            [
+                "gst-launch-1.0",
+                "-q",
+                "filesrc",
+                f"location={file_path}",
+                "!",
+                "decodebin",
+                "!",
+                "audioconvert",
+                "!",
+                "audioresample",
+                "!",
+                "pulsesink",
+            ]
+        )
+    if system == "Linux" and os.path.splitext(file_path)[1].lower() in {
+        ".wav",
+        ".voc",
+        ".au",
+    }:
+        # aplay does not decode compressed formats.  Given an MP3 it treats
+        # the bytes as unsigned 8 kHz raw PCM, emits digital noise, and still
+        # exits zero -- so compressed files must fail closed instead.
         players.append(["aplay", "-q", file_path])
 
     for cmd in players:
