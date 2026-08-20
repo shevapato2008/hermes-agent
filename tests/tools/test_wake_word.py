@@ -6,14 +6,12 @@ dispatch, the requirements probe, the detector fire/cooldown loop, and the
 process-wide singleton lifecycle.
 """
 
-import io
 import multiprocessing
 import os
 import sys
 import threading
 import time
 import types
-import wave
 from pathlib import Path
 
 import pytest
@@ -361,54 +359,6 @@ def test_openwakeword_diagnostics_reset_scores_without_changing_fire(monkeypatch
         "confirmation_frames": 3,
     }
     assert eng.process([0]) is True
-
-
-def _playback_verification_config():
-    return {
-        "phrase": "hey hermes",
-        "sensitivity": 0.35,
-        "confirmation_frames": 1,
-        "playback_verification": {
-            "enabled": True,
-            "candidate_threshold": 0.015,
-            "aliases": ["he hermes", "hay hermes", "he hermis"],
-        },
-    }
-
-
-def test_local_playback_snapshot_preserves_idle_openwakeword_threshold(monkeypatch):
-    """Playback state is captured per local frame; idle detection stays exact."""
-    eng = _openwakeword_engine_with_scores(
-        monkeypatch,
-        {"sensitivity": 0.35, "confirmation_frames": 1},
-        [0.020, 0.360],
-    )
-    fake_sd = types.SimpleNamespace(InputStream=lambda **kw: _LoudStream(**kw))
-    monkeypatch.setattr(ww, "_import_audio", lambda: (fake_sd, None))
-
-    from tools import voice_mode
-
-    playback_states = iter((True, False))
-    monkeypatch.setattr(
-        voice_mode,
-        "is_audio_output_active",
-        lambda: next(playback_states, False),
-    )
-    fired = threading.Event()
-    det = ww.WakeWordDetector(
-        eng,
-        fired.set,
-        config=_playback_verification_config(),
-    )
-
-    det.start()
-    try:
-        assert fired.wait(2.0)
-        diagnostics = det.diagnostics()
-        assert diagnostics["playback_verification"]["candidates"] == 1
-        assert diagnostics["score"]["threshold"] == 0.35
-    finally:
-        det.stop()
 
 
 # ── sherpa-onnx open-vocabulary engine ───────────────────────────────────
@@ -872,236 +822,6 @@ def test_feed_audio_rejects_wrong_owner(monkeypatch, tmp_path):
     assert ww.stop_listening(owner=owner) is True
 
 
-def test_playback_low_score_exact_loopback_verification_fires_once(
-    monkeypatch, tmp_path
-):
-    np = pytest.importorskip("numpy")
-    import httpx
-    from tools import transcription_tools
-
-    eng = _openwakeword_engine_with_scores(
-        monkeypatch,
-        {"sensitivity": 0.35, "confirmation_frames": 1},
-        [0.020] + [0.0] * 20,
-    )
-    monkeypatch.setattr(ww, "_build_engine", lambda cfg: eng)
-    monkeypatch.setattr(ww, "_lock_path", lambda: tmp_path / "wake.lock")
-    monkeypatch.setattr(
-        transcription_tools,
-        "_load_stt_config",
-        lambda: {
-            "enabled": True,
-            "provider": "openai",
-            "language": "zh",
-            "openai": {"model": "smartbox-sherpa-zh-en"},
-        },
-    )
-    monkeypatch.setattr(
-        transcription_tools,
-        "_resolve_openai_audio_client_config",
-        lambda: ("local-token", "http://127.0.0.1:8091/v1"),
-    )
-
-    requested = threading.Event()
-    release_response = threading.Event()
-    request: dict = {}
-
-    class _Response:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {"text": " He, Hermis! "}
-
-    class _Client:
-        def __init__(self, **kwargs):
-            request["client"] = kwargs
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            pass
-
-        def post(self, url, **kwargs):
-            request["url"] = url
-            request["post"] = kwargs
-            requested.set()
-            assert release_response.wait(2.0)
-            return _Response()
-
-    monkeypatch.setattr(httpx, "Client", _Client)
-    owner = object()
-    fire_count = 0
-    fired = threading.Event()
-
-    def _on_wake():
-        nonlocal fire_count
-        fire_count += 1
-        fired.set()
-
-    ww.start_listening(
-        _on_wake,
-        owner=owner,
-        config=_playback_verification_config(),
-        external_audio=True,
-    )
-    try:
-        pcm = (np.ones(eng.frame_length, dtype=np.int16) * 1200).tobytes()
-        for _ in range(10):
-            assert ww.feed_audio(
-                owner=owner,
-                pcm_int16=pcm,
-                playback_active=True,
-            )
-        assert requested.wait(2.0)
-        assert fired.is_set() is False  # candidate never directly fires
-
-        assert request["url"] == "http://127.0.0.1:8091/v1/audio/transcriptions"
-        assert request["client"] == {
-            "timeout": 2.0,
-            "follow_redirects": False,
-            "trust_env": False,
-        }
-        assert request["post"]["headers"] == {
-            "Authorization": "Bearer local-token"
-        }
-        assert request["post"]["data"] == {
-            "model": "smartbox-sherpa-zh-en",
-            "response_format": "json",
-            "language": "zh",
-        }
-        filename, wav_bytes, content_type = request["post"]["files"]["file"]
-        assert filename == "wake-candidate.wav"
-        assert content_type == "audio/wav"
-        with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
-            assert wav_file.getnchannels() == 1
-            assert wav_file.getsampwidth() == 2
-            assert wav_file.getframerate() == 16000
-            assert wav_file.getnframes() <= 20 * eng.frame_length
-
-        release_response.set()
-        assert fired.wait(2.0)
-        time.sleep(0.05)
-        assert fire_count == 1
-    finally:
-        release_response.set()
-        ww.stop_listening(owner=owner)
-
-
-@pytest.mark.parametrize(
-    ("outcome", "expected_reason"),
-    [
-        ("mismatch", "mismatch"),
-        ("timeout", "timeout"),
-        ("error", "error"),
-        ("pause", "stale"),
-        ("stop", "stale"),
-    ],
-)
-def test_playback_verification_rejection_preserves_playback(
-    monkeypatch, tmp_path, outcome, expected_reason
-):
-    np = pytest.importorskip("numpy")
-    import httpx
-    from tools import transcription_tools, voice_mode
-
-    eng = _openwakeword_engine_with_scores(
-        monkeypatch,
-        {"sensitivity": 0.35, "confirmation_frames": 1},
-        [0.020] + [0.0] * 20,
-    )
-    monkeypatch.setattr(ww, "_build_engine", lambda cfg: eng)
-    monkeypatch.setattr(ww, "_lock_path", lambda: tmp_path / f"wake-{outcome}.lock")
-    monkeypatch.setattr(
-        transcription_tools,
-        "_load_stt_config",
-        lambda: {
-            "enabled": True,
-            "provider": "openai",
-            "openai": {"model": "smartbox-sherpa-zh-en"},
-        },
-    )
-    monkeypatch.setattr(
-        transcription_tools,
-        "_resolve_openai_audio_client_config",
-        lambda: ("local-token", "http://127.0.0.1:8091/v1"),
-    )
-
-    requested = threading.Event()
-    release_response = threading.Event()
-
-    class _Response:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            text = "well hey hermes friend" if outcome == "mismatch" else "hey hermes"
-            return {"text": text}
-
-    class _Client:
-        def __init__(self, **_kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            pass
-
-        def post(self, _url, **_kwargs):
-            requested.set()
-            if outcome == "timeout":
-                raise httpx.ReadTimeout("slow local STT")
-            if outcome == "error":
-                raise RuntimeError("local STT unavailable")
-            if outcome in ("pause", "stop"):
-                assert release_response.wait(2.0)
-            return _Response()
-
-    monkeypatch.setattr(httpx, "Client", _Client)
-    owner = object()
-    fired = threading.Event()
-    voice_mode.mark_audio_output_active(True)
-    det = ww.start_listening(
-        fired.set,
-        owner=owner,
-        config=_playback_verification_config(),
-        external_audio=True,
-    )
-    try:
-        pcm = (np.ones(eng.frame_length, dtype=np.int16) * 1200).tobytes()
-        for _ in range(10):
-            assert ww.feed_audio(
-                owner=owner,
-                pcm_int16=pcm,
-                playback_active=True,
-            )
-        assert requested.wait(2.0)
-        if outcome == "pause":
-            assert ww.pause_listening(owner=owner) is True
-            release_response.set()
-        elif outcome == "stop":
-            assert ww.stop_listening(owner=owner) is True
-            release_response.set()
-
-        deadline = time.monotonic() + 2.0
-        diagnostics = det.diagnostics()["playback_verification"]
-        while diagnostics["last_result"] != expected_reason and time.monotonic() < deadline:
-            time.sleep(0.01)
-            diagnostics = det.diagnostics()["playback_verification"]
-
-        assert diagnostics["last_result"] == expected_reason
-        assert diagnostics["verified"] == 0
-        assert diagnostics["rejected"] == 1
-        assert fired.is_set() is False
-        assert voice_mode.is_audio_output_active() is True
-    finally:
-        release_response.set()
-        ww.stop_listening(owner=owner)
-        voice_mode.mark_audio_output_active(False)
-
-
 def test_client_capture_diagnostics_aggregate_and_reset_for_owner(monkeypatch):
     import json
 
@@ -1163,3 +883,58 @@ def test_client_capture_diagnostics_aggregate_and_reset_for_owner(monkeypatch):
         "owned_by_caller": False,
         "reason": "unarmed",
     }
+
+
+def test_local_playback_openwakeword_hit_fires_without_stt_request(
+    monkeypatch, tmp_path
+):
+    """A normal-threshold hit interrupts playback without a second STT gate."""
+    import httpx
+
+    engine = _openwakeword_engine_with_scores(
+        monkeypatch,
+        {"sensitivity": 0.35, "confirmation_frames": 1},
+        [0.36] + [0.0] * 40,
+    )
+    fake_sd = types.SimpleNamespace(InputStream=lambda **kw: _LoudStream(**kw))
+    monkeypatch.setattr(ww, "_import_audio", lambda: (fake_sd, None))
+    monkeypatch.setattr(ww, "_build_engine", lambda _cfg: engine)
+    monkeypatch.setattr(ww, "_lock_path", lambda: tmp_path / "wake.lock")
+
+    from tools import voice_mode
+
+    http_client_calls = []
+
+    class _UnexpectedHttpClient:
+        def __init__(self, **kwargs):
+            http_client_calls.append(kwargs)
+
+    monkeypatch.setattr(httpx, "Client", _UnexpectedHttpClient)
+
+    owner = object()
+    fired = threading.Event()
+    voice_mode.mark_audio_output_active(True)
+    try:
+        ww.start_listening(
+            fired.set,
+            owner=owner,
+            config={
+                "provider": "openwakeword",
+                "sensitivity": 0.35,
+                "confirmation_frames": 1,
+                # A stale config block must not resurrect the removed verifier.
+                "playback_verification": {
+                    "enabled": True,
+                    "candidate_threshold": 0.015,
+                },
+            },
+        )
+        deadline = time.monotonic() + 2.0
+        while not fired.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert fired.is_set() is True
+        assert http_client_calls == []
+    finally:
+        ww.stop_listening(owner=owner)
+        voice_mode.mark_audio_output_active(False)

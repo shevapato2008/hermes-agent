@@ -13969,12 +13969,6 @@ def _(rid, params: dict) -> dict:
     without a microphone can still run openWakeWord on Mac/desktop audio.
     """
     transport = current_transport() or _stdio_transport
-    try:
-        from tools.voice_mode import is_audio_output_active
-
-        playback_active = bool(is_audio_output_active())
-    except Exception:
-        playback_active = False
     raw_b64 = params.get("pcm") or params.get("pcm_b64") or ""
     if not isinstance(raw_b64, str) or not raw_b64.strip():
         return _err(rid, 4001, "wake.feed requires base64 pcm")
@@ -13993,11 +13987,7 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4001, "wake.feed only accepts 16 kHz PCM")
     try:
         from tools.wake_word import feed_audio
-        ok = feed_audio(
-            owner=transport,
-            pcm_int16=pcm,
-            playback_active=playback_active,
-        )
+        ok = feed_audio(owner=transport, pcm_int16=pcm)
     except Exception as e:
         logger.debug("wake.feed failed: %s", e)
         return _err(rid, 5026, str(e))
