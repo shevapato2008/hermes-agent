@@ -959,7 +959,7 @@ def test_playback_low_score_exact_loopback_verification_fires_once(
 
         assert request["url"] == "http://127.0.0.1:8091/v1/audio/transcriptions"
         assert request["client"] == {
-            "timeout": 0.4,
+            "timeout": 2.0,
             "follow_redirects": False,
             "trust_env": False,
         }
