@@ -131,7 +131,7 @@ def turn_env(server, monkeypatch, tmp_path):
     )
     monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
     monkeypatch.setattr(server, "_register_session_cwd", lambda session: None)
-    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda session_id=None: None)
     monkeypatch.setattr(
         server, "_sync_session_key_after_compress", lambda *a, **k: None
     )
