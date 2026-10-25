@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import Platform, StreamingConfig
+from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import resolve_proxy_url
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -283,6 +283,99 @@ class TestRunAgentViaProxy:
         assert len(messages) == 1
         assert messages[0]["role"] == "user"
         assert messages[0]["content"] == "hello"
+
+
+    @pytest.mark.asyncio
+    async def test_non_editable_proxy_runtime_keeps_cursor_empty(self, monkeypatch):
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+        from gateway.stream_consumer import GatewayStreamConsumer
+
+        Adapter = type(
+            "NonEditableProxyAdapter",
+            (BasePlatformAdapter,),
+            {"MAX_MESSAGE_LENGTH": 4096, "SUPPORTS_MESSAGE_EDITING": False},
+        )
+        Adapter.__abstractmethods__ = frozenset()
+        adapter = Adapter.__new__(Adapter)
+        adapter._typing_paused = set()
+        adapter._fatal_error_message = None
+        adapter.send_typing = AsyncMock(return_value=None)
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="m1"))
+        adapter.edit_message = AsyncMock(return_value=SendResult(success=True, message_id="m1"))
+
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        runner.config.streaming = StreamingConfig(enabled=True, cursor=" cursor")
+        runner.adapters = {Platform.DISCORD: adapter}
+        source = _make_source(Platform.DISCORD)
+        captured_configs = []
+        original_init = GatewayStreamConsumer.__init__
+
+        def _capture_init(consumer, *args, **kwargs):
+            captured_configs.append(kwargs["config"])
+            original_init(consumer, *args, **kwargs)
+
+        monkeypatch.setattr(GatewayStreamConsumer, "__init__", _capture_init)
+        response = _FakeSSEResponse(
+            sse_chunks=[b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'],
+        )
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(_FakeSession(response)):
+                with patch("aiohttp.ClientTimeout"):
+                    await runner._run_agent_via_proxy(
+                        message="hi", context_prompt="", history=[],
+                        source=source, session_id="non-editable-proxy",
+                    )
+
+        assert len(captured_configs) == 1
+        assert captured_configs[0].cursor == ""
+
+
+
+    @pytest.mark.asyncio
+    async def test_smartbox_runtime_constructs_consumer_with_adapter_settings(
+        self, monkeypatch, tmp_path
+    ):
+        from gateway.platforms.smartbox_voice import SmartBoxVoiceAdapter
+        from gateway.stream_consumer import GatewayStreamConsumer
+
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        adapter = SmartBoxVoiceAdapter(PlatformConfig(
+            enabled=True,
+            extra={
+                "socket_path": str(tmp_path / "smartbox.sock"),
+                "jsonl_path": str(tmp_path / "smartbox.jsonl"),
+            },
+        ))
+        runner = _make_runner()
+        runner.adapters = {Platform.SMARTBOX_VOICE: adapter}
+        source = _make_source(Platform.SMARTBOX_VOICE)
+        captured_configs = []
+        original_init = GatewayStreamConsumer.__init__
+
+        def _capture_init(consumer, *args, **kwargs):
+            captured_configs.append(kwargs["config"])
+            original_init(consumer, *args, **kwargs)
+
+        monkeypatch.setattr(GatewayStreamConsumer, "__init__", _capture_init)
+        response = _FakeSSEResponse(
+            sse_chunks=[b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'],
+        )
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(_FakeSession(response)):
+                with patch("aiohttp.ClientTimeout"):
+                    await runner._run_agent_via_proxy(
+                        message="hi", context_prompt="", history=[],
+                        source=source, session_id="smartbox-proxy",
+                    )
+
+        assert len(captured_configs) == 1
+        config = captured_configs[0]
+        assert (config.transport, config.cursor) == ("draft", "")
+        assert (config.buffer_threshold, config.edit_interval) == (1, 0.05)
+
 
 
 class TestEnvVarRegistration:

@@ -111,9 +111,31 @@ class TestApprovalCommandWiring:
         )
 
     def test_chat_platform_path_redacts_before_send(self):
-        import gateway.run as run
+        import asyncio
+        import threading
+        from gateway.run import _dispatch_exec_approval
+        from gateway.platforms.base import SendResult
 
-        self._assert_redacts_then_uses(run, "_approval_notify_sync", "send_exec_approval")
+        class Adapter:
+            async def send_exec_approval(self, **kwargs):
+                self.command = kwargs["command"]
+                return SendResult(success=True)
+
+        adapter = Adapter()
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            _dispatch_exec_approval(
+                adapter, {"command": "export OPENAI_API_KEY=" + _FAKE_OPENAI},
+                chat_id="chat", session_key="session", metadata=None, loop=loop,
+            )
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+            loop.close()
+        assert _FAKE_OPENAI not in adapter.command
+        assert "OPENAI_API_KEY" in adapter.command
 
     def test_sse_api_path_redacts_before_enqueue(self):
         from gateway.platforms import api_server

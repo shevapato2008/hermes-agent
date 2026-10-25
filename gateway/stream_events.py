@@ -35,7 +35,7 @@ invariants):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 
 # ── Message (assistant text) events ──────────────────────────────────────────
@@ -145,6 +145,65 @@ class GatewayNotice:
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
+# ── Challenge-addressed dangerous-command approval event ─────────────────────
+
+@dataclass(frozen=True)
+class ApprovalRequired:
+    """A challenge-addressed dangerous-command approval request.
+
+    Delivered only to adapters that implement the ``send_exec_approval_event``
+    capability (see ``gateway/run.py``'s capability-dispatch extension of the
+    single per-session ``_approval_notify_sync`` callback). Unlike the legacy
+    FIFO approval flow (plain text / button prompt + ``/approve``), this
+    carries an explicit ``challenge_id`` that the client must echo back
+    verbatim when resolving the approval (``tools.approval.
+    resolve_gateway_approval(..., challenge_id=...)``), so a reconnecting or
+    multi-approval client always resolves the *specific* pending request
+    rather than "whichever is oldest" (FIFO).
+
+    ``pattern_keys`` are the *names* of the dangerous-command patterns that
+    matched — never the secret command text or a matched substring — so this
+    object is safe to log or transmit without redaction.
+
+    Scope flags mirror the 0.20 approval policy so clients can offer only
+    the choices available for this operation.
+    """
+
+    challenge_id: str
+    command: str
+    description: str
+    pattern_keys: List[str] = field(default_factory=list)
+    timeout_seconds: int = 300
+    allow_permanent: bool = True
+    allow_session: bool = True
+    smart_denied: bool = False
+
+    @classmethod
+    def from_notification(cls, data: Dict[str, Any]) -> "ApprovalRequired":
+        """Build from the notify_cb payload ``_await_gateway_decision`` sends.
+
+        That payload is a COPY of the legacy approval-data dict augmented
+        with ``challenge_id`` and the resolved ``timeout_seconds`` (see
+        ``tools/approval.py``). Falls back to wrapping a single
+        ``pattern_key`` when the plural ``pattern_keys`` list is absent, so
+        this also tolerates hand-built dicts in tests.
+        """
+        pattern_keys = data.get("pattern_keys")
+        if not pattern_keys:
+            single = data.get("pattern_key")
+            pattern_keys = [single] if single else []
+        return cls(
+            challenge_id=str(data.get("challenge_id") or ""),
+            command=str(data.get("command") or ""),
+            description=str(data.get("description") or ""),
+            pattern_keys=list(pattern_keys),
+            timeout_seconds=int(data.get("timeout_seconds", 300)),
+            allow_permanent=data.get("allow_permanent", True),
+            allow_session=data.get("allow_session", True),
+            smart_denied=data.get("smart_denied", False),
+        )
+
+
 # Union of every event the consumer's dispatcher accepts.  Kept explicit (rather
 # than a marker base class) so a missing ``case`` in an exhaustive match is a
 # visible type error rather than a silent fall-through.
@@ -156,6 +215,7 @@ StreamEvent = Union[
     ToolCallFinished,
     LongToolHint,
     GatewayNotice,
+    ApprovalRequired,
 ]
 
 
@@ -167,5 +227,6 @@ __all__ = [
     "ToolCallFinished",
     "LongToolHint",
     "GatewayNotice",
+    "ApprovalRequired",
     "StreamEvent",
 ]

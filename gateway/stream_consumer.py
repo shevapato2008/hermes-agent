@@ -326,6 +326,7 @@ class GatewayStreamConsumer:
         *,
         final: bool = False,
         expect_edits: bool = False,
+        is_turn_final: Optional[bool] = None,
     ) -> dict | None:
         """Return per-send metadata for stream-created messages.
 
@@ -339,6 +340,11 @@ class GatewayStreamConsumer:
         final-message delivery.
         """
         meta = dict(self.metadata) if self.metadata else {}
+        meta["_gateway_stream"] = {
+            "reply_to": self._initial_reply_to_id,
+            "draft_id": self._draft_id,
+            "turn_final": final if is_turn_final is None else is_turn_final,
+        }
         if self._initial_reply_to_id:
             meta["reply_to_message_id"] = self._initial_reply_to_id
         if expect_edits:
@@ -570,6 +576,12 @@ class GatewayStreamConsumer:
         except Exception:
             pass
 
+    def _advance_draft_id(self) -> None:
+        """Give each closed native-draft block its own monotonic identity."""
+        if self._draft_id is not None:
+            type(self)._draft_id_counter += 1
+            self._draft_id = type(self)._draft_id_counter
+
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
@@ -604,9 +616,7 @@ class GatewayStreamConsumer:
         # documented in their issue #32535 — each text block becomes its
         # own visible message via the finalize, then a new draft animates
         # for the next one.
-        if self._use_draft_streaming:
-            type(self)._draft_id_counter += 1
-            self._draft_id = type(self)._draft_id_counter
+        self._advance_draft_id()
 
     def on_delta(self, text: str) -> None:
         """Thread-safe callback — called from the agent's worker thread.
@@ -952,6 +962,7 @@ class GatewayStreamConsumer:
                                 break
                             chunks_delivered = True
                             reply_to = new_id
+                            self._advance_draft_id()
 
                         if all_heads_delivered:
                             self._accumulated = chunks[-1]
@@ -999,6 +1010,15 @@ class GatewayStreamConsumer:
                                 self._turn_split_delivery = True
                                 self._record_turn_final_payload(self._accumulated)
                             return
+                        if got_segment_break and self._draft_id is not None:
+                            if self._accumulated:
+                                await self._send_or_edit(
+                                    self._accumulated, finalize=True, is_turn_final=False,
+                                )
+                            self._reset_segment_state()
+                            if got_flush:
+                                self._signal_flush(flush_event)
+                            continue
                         if got_segment_break:
                             self._message_id = None
                             self._fallback_final_send = False
@@ -1268,6 +1288,7 @@ class GatewayStreamConsumer:
         reply_to_id: Optional[str],
         *,
         final: bool = False,
+        is_turn_final: bool = False,
     ) -> Optional[str]:
         """Send a new message chunk, optionally threaded to a previous message.
 
@@ -1283,6 +1304,7 @@ class GatewayStreamConsumer:
                 reply_to=reply_to_id,
                 metadata=self._metadata_for_send(
                     final=final,
+                    is_turn_final=is_turn_final,
                     expect_edits=not final,
                 ),
             )
@@ -1489,14 +1511,18 @@ class GatewayStreamConsumer:
         last_message_id: Optional[str] = None
         last_successful_chunk = ""
         sent_any_chunk = False
-        for chunk in chunks:
+        for index, chunk in enumerate(chunks):
+            if index:
+                self._advance_draft_id()
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
-                    metadata=self._metadata_for_send(final=True),
+                    metadata=self._metadata_for_send(
+                        final=True, is_turn_final=(index == len(chunks) - 1),
+                    ),
                 )
                 if result.success:
                     break
@@ -1755,7 +1781,7 @@ class GatewayStreamConsumer:
                 chat_id=self.chat_id,
                 draft_id=self._draft_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._metadata_for_send(is_turn_final=False),
             )
         except Exception as e:
             logger.debug(
@@ -1802,7 +1828,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
-                metadata=self.metadata,
+                metadata=self._metadata_for_send(is_turn_final=False),
             )
             if result.success:
                 self._already_sent = True
@@ -1839,7 +1865,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._metadata_for_send(is_turn_final=False),
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
@@ -1994,7 +2020,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self._metadata_for_send(final=True),
+                metadata=self._metadata_for_send(final=True, is_turn_final=is_turn_final),
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -2398,6 +2424,7 @@ class GatewayStreamConsumer:
                     reply_to=self._initial_reply_to_id,
                     metadata=self._metadata_for_send(
                         final=finalize,
+                        is_turn_final=finalize and is_turn_final,
                         expect_edits=not finalize,
                     ),
                 )

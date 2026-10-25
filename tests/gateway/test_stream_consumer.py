@@ -16,13 +16,14 @@ def test_stream_send_metadata_carries_original_reply_anchor():
         initial_reply_to_id="456",
     )
 
-    assert consumer._metadata_for_send(final=False) == {
-        "reply_to_message_id": "456",
-    }
-    assert consumer._metadata_for_send(final=True) == {
-        "reply_to_message_id": "456",
-        "notify": True,
-    }
+    preview = consumer._metadata_for_send(final=False)
+    final = consumer._metadata_for_send(final=True)
+    assert preview["reply_to_message_id"] == "456"
+    assert "notify" not in preview
+    assert final["reply_to_message_id"] == "456"
+    assert final["notify"] is True
+    assert preview["_gateway_stream"]["turn_final"] is False
+    assert final["_gateway_stream"]["turn_final"] is True
 
 
 # ── _clean_for_display unit tests ────────────────────────────────────────

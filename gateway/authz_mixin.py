@@ -646,6 +646,11 @@ class GatewayAuthorizationMixin:
                 source.platform,
                 profile=adapter_profile,
             ):
+                # SmartBox intake is a local owner-only (0600) Unix socket,
+                # so its restriction is enforced by the OS before dispatch.
+                # Network adapters still require their config allowlist below.
+                if source.platform == Platform.SMARTBOX_VOICE:
+                    return True
                 if source.chat_type in {"group", "forum", "channel"}:
                     effective_policy = self._adapter_group_policy(
                         source.platform,

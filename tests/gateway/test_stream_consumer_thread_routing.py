@@ -172,3 +172,21 @@ class TestFeishuFallbackThreadRouting:
             f"Expected receive_id_type='thread_id', got '{receive_id_type}'"
         )
 
+
+
+@pytest.mark.asyncio
+async def test_stream_identity_preserves_thread_reply_and_preview_metadata():
+    adapter = _make_adapter()
+    original = {"thread_id": "topic"}
+    consumer = GatewayStreamConsumer(
+        adapter, "chat", metadata=original, initial_reply_to_id="turn",
+    )
+    await consumer._send_or_edit("preview")
+    metadata = adapter.send.await_args.kwargs["metadata"]
+    assert metadata["thread_id"] == "topic"
+    assert metadata["reply_to_message_id"] == "turn"
+    assert metadata["expect_edits"] is True
+    assert metadata["_gateway_stream"] == {
+        "reply_to": "turn", "draft_id": None, "turn_final": False,
+    }
+    assert original == {"thread_id": "topic"}
