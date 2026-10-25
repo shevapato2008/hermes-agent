@@ -291,3 +291,58 @@ class TestOrderedJSONLWriter:
         # half-written lines from concurrent writers.
         for line in lines:
             json.loads(line)
+
+
+def test_jsonl_new_file_is_owner_only_under_permissive_umask(tmp_path):
+    path = tmp_path / "private.jsonl"
+    previous = os.umask(0o022)
+    try:
+        OrderedJSONLWriter(path).write({"text": "private transcript"})
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_jsonl_existing_file_is_hardened_before_append(tmp_path):
+    path = tmp_path / "existing.jsonl"
+    path.write_text('{"seq":0}\n')
+    path.chmod(0o666)
+    OrderedJSONLWriter(path).write({"seq": 1})
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert [json.loads(line)["seq"] for line in path.read_text().splitlines()] == [0, 1]
+
+
+def test_jsonl_rejects_symlink_without_touching_target(tmp_path):
+    target = tmp_path / "target.jsonl"
+    target.write_text("untouched\n")
+    target.chmod(0o644)
+    path = tmp_path / "symlink.jsonl"
+    path.symlink_to(target)
+    with pytest.raises(OSError):
+        OrderedJSONLWriter(path).write({"seq": 0})
+    assert target.read_text() == "untouched\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+def test_jsonl_rejects_fifo_without_blocking(tmp_path):
+    path = tmp_path / "fifo.jsonl"
+    os.mkfifo(path, 0o600)
+    # Keep a reader open so opening the FIFO for append itself succeeds;
+    # the writer must reject the nonregular descriptor before any write.
+    reader = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        with pytest.raises(OSError):
+            OrderedJSONLWriter(path).write({"seq": 0})
+    finally:
+        os.close(reader)
+
+
+def test_jsonl_rejects_foreign_owner_before_chmod_or_write(tmp_path, monkeypatch):
+    path = tmp_path / "foreign.jsonl"
+    path.write_text("untouched\n")
+    path.chmod(0o644)
+    monkeypatch.setattr(os, "geteuid", lambda: path.stat().st_uid + 1)
+    with pytest.raises(PermissionError):
+        OrderedJSONLWriter(path).write({"seq": 0})
+    assert path.read_text() == "untouched\n"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644

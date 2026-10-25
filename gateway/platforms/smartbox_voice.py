@@ -278,16 +278,25 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
         if interrupt_event is not None:
             interrupt_event.set()
 
-    def _handle_resolve_approval_frame(self, frame: dict, session_key: Optional[str]) -> None:
-        """Resolve a challenge-addressed approval. Always requires the exact
-        challenge — there is no FIFO fallback for SmartBox frames."""
+    def _handle_resolve_approval_frame(self, frame: dict, session_key: Optional[str]) -> bool:
+        """Resolve only a valid, exact challenge-addressed approval choice."""
         challenge_id = frame.get("challenge_id")
         choice = frame.get("choice")
-        if not challenge_id or not choice or not session_key:
-            return
+        reason = frame.get("reason")
+        if (
+            not isinstance(challenge_id, str) or not challenge_id or not session_key
+            or not isinstance(choice, str) or choice not in {"once", "session", "always", "deny"}
+            or (reason is not None and not isinstance(reason, str))
+        ):
+            return False
         from tools.approval import resolve_gateway_approval
-        resolve_gateway_approval(session_key, choice, challenge_id=challenge_id)
-        self._pending_challenges.get(session_key, set()).discard(challenge_id)
+        kwargs = {"challenge_id": challenge_id}
+        if choice == "deny" and reason is not None:
+            kwargs["reason"] = reason
+        resolved = resolve_gateway_approval(session_key, choice, **kwargs)
+        if resolved:
+            self._pending_challenges.get(session_key, set()).discard(challenge_id)
+        return bool(resolved)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter required methods

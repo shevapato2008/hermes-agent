@@ -29,6 +29,7 @@ connection; ``gateway/platforms/smartbox_voice.py`` wires this to a real
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
@@ -244,7 +245,21 @@ class OrderedJSONLWriter:
     def write(self, record: dict) -> None:
         line = json.dumps(record, separators=(",", ":"), sort_keys=True)
         with self._lock:
-            with open(self._path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-                f.flush()
-                os.fsync(f.fileno())
+            # The default path may live in /tmp. Do not follow a planted
+            # symlink, and never block opening a FIFO before checking its type.
+            flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+            fd = os.open(self._path, flags, 0o600)
+            try:
+                target = os.fstat(fd)
+                if not stat.S_ISREG(target.st_mode):
+                    raise OSError(errno.EINVAL, "SmartBox stream must be a regular file", str(self._path))
+                if target.st_uid != os.geteuid():
+                    raise PermissionError(errno.EPERM, "SmartBox stream must be owned by this user", str(self._path))
+                # Harden existing files before appending any private records.
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "a", encoding="utf-8", closefd=False) as f:
+                    f.write(line + "\n")
+                    f.flush()
+                    os.fsync(fd)
+            finally:
+                os.close(fd)

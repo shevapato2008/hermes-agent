@@ -595,3 +595,52 @@ async def test_configured_factory_adapter_binds_and_authorizes_owner(tmp_path, m
         assert runner._is_user_authorized(source)
     finally:
         await adapter.disconnect()
+
+
+@pytest.mark.parametrize("choice", ["cancel", "approve", "ONCE", True, 1, [], {}, None, ""])
+def test_invalid_approval_choice_leaves_challenge_pending(tmp_path, monkeypatch, choice):
+    from tools import approval as approval_mod
+    adapter = _make_adapter(tmp_path)
+    entry = approval_mod._ApprovalEntry({"command": "rm x"})
+    adapter._pending_challenges["session"] = {entry.challenge_id}
+    monkeypatch.setitem(approval_mod._gateway_queues, "session", [entry])
+    result = adapter._handle_resolve_approval_frame(
+        {"challenge_id": entry.challenge_id, "choice": choice}, "session",
+    )
+    assert result is False
+    assert entry.result is None
+    assert not entry.event.is_set()
+    assert entry.challenge_id in adapter._pending_challenges["session"]
+    assert approval_mod._gateway_queues["session"] == [entry]
+
+
+def test_approval_denial_reason_reaches_registry(tmp_path, monkeypatch):
+    from tools import approval as approval_mod
+    adapter = _make_adapter(tmp_path)
+    entry = approval_mod._ApprovalEntry({"command": "rm x"})
+    adapter._pending_challenges["session"] = {entry.challenge_id}
+    monkeypatch.setitem(approval_mod._gateway_queues, "session", [entry])
+    result = adapter._handle_resolve_approval_frame(
+        {"challenge_id": entry.challenge_id, "choice": "deny", "reason": "keep the file"},
+        "session",
+    )
+    assert result is True
+    assert entry.result == "deny"
+    assert entry.reason == "keep the file"
+    assert entry.event.is_set()
+    assert entry.challenge_id not in adapter._pending_challenges["session"]
+
+
+def test_nonstring_denial_reason_leaves_challenge_pending(tmp_path, monkeypatch):
+    from tools import approval as approval_mod
+    adapter = _make_adapter(tmp_path)
+    entry = approval_mod._ApprovalEntry({"command": "rm x"})
+    adapter._pending_challenges["session"] = {entry.challenge_id}
+    monkeypatch.setitem(approval_mod._gateway_queues, "session", [entry])
+    result = adapter._handle_resolve_approval_frame(
+        {"challenge_id": entry.challenge_id, "choice": "deny", "reason": {"unexpected": True}},
+        "session",
+    )
+    assert result is False
+    assert entry.result is None
+    assert entry.challenge_id in adapter._pending_challenges["session"]
