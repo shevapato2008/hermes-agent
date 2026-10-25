@@ -243,6 +243,9 @@ class OrderedJSONLWriter:
         return self._path
 
     def write(self, record: dict) -> None:
+        effective_uid = getattr(os, "geteuid", None)
+        if os.name != "posix" or not callable(effective_uid):
+            raise OSError(errno.ENOTSUP, "SmartBox private streams require POSIX ownership checks")
         line = json.dumps(record, separators=(",", ":"), sort_keys=True)
         with self._lock:
             # The default path may live in /tmp. Do not follow a planted
@@ -253,7 +256,7 @@ class OrderedJSONLWriter:
                 target = os.fstat(fd)
                 if not stat.S_ISREG(target.st_mode):
                     raise OSError(errno.EINVAL, "SmartBox stream must be a regular file", str(self._path))
-                if target.st_uid != os.geteuid():
+                if target.st_uid != effective_uid():
                     raise PermissionError(errno.EPERM, "SmartBox stream must be owned by this user", str(self._path))
                 # Harden existing files before appending any private records.
                 os.fchmod(fd, 0o600)

@@ -346,3 +346,12 @@ def test_jsonl_rejects_foreign_owner_before_chmod_or_write(tmp_path, monkeypatch
         OrderedJSONLWriter(path).write({"seq": 0})
     assert path.read_text() == "untouched\n"
     assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_jsonl_missing_posix_owner_primitive_fails_before_creating_file(tmp_path, monkeypatch):
+    path = tmp_path / "unsupported.jsonl"
+    writer = OrderedJSONLWriter(path)
+    monkeypatch.delattr(os, "geteuid", raising=False)
+    with pytest.raises(OSError, match="POSIX"):
+        writer.write({"text": "private transcript"})
+    assert not path.exists()
