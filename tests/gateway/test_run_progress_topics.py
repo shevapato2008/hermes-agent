@@ -925,6 +925,7 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    adapter=None,
 ):
     if config_data:
         import yaml
@@ -939,7 +940,7 @@ async def _run_with_agent(
     fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
-    adapter = adapter_cls(platform=platform)
+    adapter = adapter or adapter_cls(platform=platform)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
@@ -1003,6 +1004,51 @@ async def test_retryable_overflow_edit_keeps_editable_bubble_identity(monkeypatc
     assert any(call["message_id"] == "progress-1" for call in adapter.edits[1:])
     assert adapter.oversized_sends == []
     assert adapter.oversized_edits == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_smartbox_constructs_consumer_with_adapter_settings(
+    monkeypatch, tmp_path
+):
+    from gateway.platforms.smartbox_voice import SmartBoxVoiceAdapter
+    from gateway.stream_consumer import GatewayStreamConsumer
+
+    smartbox_adapter = SmartBoxVoiceAdapter(PlatformConfig(
+        enabled=True,
+        extra={
+            "socket_path": str(tmp_path / "smartbox.sock"),
+            "jsonl_path": str(tmp_path / "smartbox.jsonl"),
+        },
+    ))
+    captured_configs = []
+    original_init = GatewayStreamConsumer.__init__
+
+    def _capture_init(consumer, *args, **kwargs):
+        captured_configs.append(kwargs["config"])
+        original_init(consumer, *args, **kwargs)
+
+    monkeypatch.setattr(GatewayStreamConsumer, "__init__", _capture_init)
+    _, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamingRefineAgent,
+        session_id="sess-smartbox-streaming-default",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": False},
+        },
+        platform=Platform.SMARTBOX_VOICE,
+        chat_id="smartbox-voice",
+        chat_type="dm",
+        thread_id=None,
+        adapter=smartbox_adapter,
+    )
+
+    assert result.get("already_sent") is True
+    assert len(captured_configs) == 1
+    config = captured_configs[0]
+    assert (config.transport, config.cursor) == ("draft", "")
+    assert (config.buffer_threshold, config.edit_interval) == (1, 0.05)
 
 
 @pytest.mark.asyncio

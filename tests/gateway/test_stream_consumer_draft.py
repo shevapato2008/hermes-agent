@@ -18,6 +18,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from gateway.config import Platform, StreamingConfig
+from gateway.run import _resolve_stream_consumer_settings
+
 from gateway.stream_consumer import (
     GatewayStreamConsumer,
     StreamConsumerConfig,
@@ -68,8 +71,12 @@ def _make_draft_capable_adapter(
     # send / edit_message: count and return canned successes so the
     # consumer's first-send + finalize paths work when drafts fall back
     # or when delivering the final message.
+    import itertools
+    message_ids = itertools.count(1)
     adapter.send = AsyncMock(
-        return_value=SimpleNamespace(success=True, message_id="msg_real"),
+        side_effect=lambda **kwargs: SimpleNamespace(
+            success=True, message_id=f"msg_real_{next(message_ids)}",
+        ),
     )
     adapter.edit_message = AsyncMock(
         return_value=SimpleNamespace(success=True),
@@ -165,11 +172,55 @@ class TestDraftStreamingHappyPath:
 
         message_id = await consumer._send_new_chunk("Sealed head", None, final=True)
 
-        assert message_id == "msg_real"
+        assert message_id == "msg_real_1"
         send_mock = adapter.__dict__["send"]
         metadata = send_mock.call_args.kwargs.get("metadata") or {}
         assert metadata.get("notify") is True
         assert "expect_edits" not in metadata
+
+
+    @pytest.mark.asyncio
+    async def test_draft_and_terminal_send_carry_namespaced_stream_identity(self):
+        adapter = _make_draft_capable_adapter()
+        original_metadata = {"existing": "preserved"}
+        cfg = StreamConsumerConfig(
+            transport="auto", chat_type="dm",
+            edit_interval=0.01, buffer_threshold=5, cursor="",
+        )
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            cfg,
+            metadata=original_metadata,
+            initial_reply_to_id="turn-123",
+        )
+
+        consumer.on_delta("Hello world!")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await task
+
+        assert adapter.draft_calls
+        draft_call = adapter.draft_calls[-1]
+        draft_id = draft_call["draft_id"]
+        assert draft_call["metadata"] == {
+            "existing": "preserved",
+            "reply_to_message_id": "turn-123",
+            "_gateway_stream": {
+                "reply_to": "turn-123",
+                "draft_id": draft_id,
+                "turn_final": False,
+            },
+        }
+        terminal_metadata = adapter.send.await_args.kwargs["metadata"]
+        assert terminal_metadata["_gateway_stream"] == {
+            "reply_to": "turn-123",
+            "draft_id": draft_id,
+            "turn_final": True,
+        }
+        assert original_metadata == {"existing": "preserved"}
+
 
 
 class TestDraftFallbackOnFailure:
@@ -236,6 +287,63 @@ class TestDraftIdLifecycle:
         )
         # Every draft_id must be non-zero (Telegram's contract).
         assert all(did != 0 for did in all_ids)
+
+    @pytest.mark.asyncio
+    async def test_tool_boundary_bumps_draft_id(self):
+        """After a segment break (tool boundary), the next text segment
+        animates via a new draft_id so it appears below the tool-progress
+        bubble rather than overwriting the prior segment's preview."""
+        adapter = _make_draft_capable_adapter()
+        cfg = StreamConsumerConfig(
+            transport="auto", chat_type="dm",
+            edit_interval=0.01, buffer_threshold=5, cursor="",
+        )
+        consumer = GatewayStreamConsumer(adapter, "12345", cfg)
+
+        consumer.on_delta("Pre-tool ")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        # Tool boundary
+        consumer.on_segment_break()
+        await asyncio.sleep(0.05)
+        consumer.on_delta("Post-tool")
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await task
+
+        # Pre-tool and post-tool segments must use different draft_ids.
+        draft_ids = [c["draft_id"] for c in adapter.draft_calls]
+        assert len(draft_ids) >= 2
+        # Find pre-tool and post-tool calls by content
+        pre_ids = {
+            c["draft_id"] for c in adapter.draft_calls
+            if "Pre-tool" in c["content"] and "Post-tool" not in c["content"]
+        }
+        post_ids = {
+            c["draft_id"] for c in adapter.draft_calls
+            if "Post-tool" in c["content"]
+        }
+        assert pre_ids and post_ids
+        assert pre_ids.isdisjoint(post_ids), (
+            f"pre-tool and post-tool segments must use distinct "
+            f"draft_ids; got pre={pre_ids} post={post_ids}"
+        )
+
+        sends = adapter.send.await_args_list
+        assert len(sends) == 2
+        pre_close = sends[0].kwargs["metadata"]["_gateway_stream"]
+        final_close = sends[1].kwargs["metadata"]["_gateway_stream"]
+        assert pre_close == {
+            "reply_to": None,
+            "draft_id": next(iter(pre_ids)),
+            "turn_final": False,
+        }
+        assert final_close == {
+            "reply_to": None,
+            "draft_id": next(iter(post_ids)),
+            "turn_final": True,
+        }
+
 
 
 class TestAlreadySentInDraftMode:
@@ -423,3 +531,198 @@ class TestRichAwareOverflow:
         adapter.delete_message.assert_awaited_once_with("12345", "preview1")
         assert consumer.final_response_sent is True
 
+
+
+class TestAdapterStreamingSettings:
+    def test_smartbox_defaults_on_when_global_streaming_is_disabled(self, tmp_path):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.smartbox_voice import SmartBoxVoiceAdapter
+
+        adapter = SmartBoxVoiceAdapter(PlatformConfig(
+            enabled=True,
+            extra={
+                "socket_path": str(tmp_path / "smartbox.sock"),
+                "jsonl_path": str(tmp_path / "smartbox.jsonl"),
+            },
+        ))
+
+        settings = _resolve_stream_consumer_settings(
+            StreamingConfig(enabled=False),
+            platform_streaming=None,
+            adapter=adapter,
+            platform=Platform.SMARTBOX_VOICE,
+            chat_type="dm",
+        )
+
+        assert settings.enabled is True
+        assert settings.consumer_config.transport == "draft"
+        assert settings.consumer_config.cursor == ""
+        assert settings.consumer_config.buffer_threshold == 1
+        assert settings.consumer_config.edit_interval == 0.05
+
+    def test_explicit_smartbox_false_disables_adapter_default(self, tmp_path):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.smartbox_voice import SmartBoxVoiceAdapter
+
+        adapter = SmartBoxVoiceAdapter(PlatformConfig(
+            enabled=True,
+            extra={"socket_path": str(tmp_path / "smartbox.sock")},
+        ))
+
+        settings = _resolve_stream_consumer_settings(
+            StreamingConfig(enabled=False),
+            platform_streaming=False,
+            adapter=adapter,
+            platform=Platform.SMARTBOX_VOICE,
+            chat_type="dm",
+        )
+
+        assert settings.enabled is False
+
+    def test_unrelated_adapter_keeps_global_streaming_configuration(self):
+        adapter = _make_draft_capable_adapter()
+        global_config = StreamingConfig(
+            enabled=False,
+            transport="auto",
+            cursor=" cursor",
+            buffer_threshold=17,
+            edit_interval=0.7,
+        )
+
+        disabled = _resolve_stream_consumer_settings(
+            global_config,
+            platform_streaming=None,
+            adapter=adapter,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+        )
+        explicitly_enabled = _resolve_stream_consumer_settings(
+            global_config,
+            platform_streaming=True,
+            adapter=adapter,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+        )
+
+        assert disabled.enabled is False
+        assert explicitly_enabled.enabled is True
+        assert explicitly_enabled.consumer_config.transport == "auto"
+        assert explicitly_enabled.consumer_config.cursor == " cursor"
+        assert explicitly_enabled.consumer_config.buffer_threshold == 17
+        assert explicitly_enabled.consumer_config.edit_interval == 0.7
+
+
+
+class TestDraftMultiChunkBlockIdentity:
+    @staticmethod
+    def _stream_contexts(adapter):
+        return [
+            call.kwargs["metadata"]["_gateway_stream"]
+            for call in adapter.send.await_args_list
+        ]
+
+    @staticmethod
+    def _assert_distinct_increasing_blocks_with_terminal_final(contexts):
+        assert len(contexts) >= 2
+        draft_ids = [context["draft_id"] for context in contexts]
+        assert draft_ids == sorted(draft_ids)
+        assert len(set(draft_ids)) == len(draft_ids)
+        assert [context["turn_final"] for context in contexts[:-1]] == [
+            False
+        ] * (len(contexts) - 1)
+        assert contexts[-1]["turn_final"] is True
+
+    @pytest.mark.asyncio
+    async def test_native_draft_overflow_allocates_one_block_per_message(self):
+        adapter = _make_draft_capable_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 700
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(
+                transport="auto", chat_type="dm", cursor="",
+            ),
+            initial_reply_to_id="turn-overflow",
+        )
+
+        consumer.on_delta("A" * 1400)
+        consumer.finish()
+        await consumer.run()
+
+        contexts = self._stream_contexts(adapter)
+        assert {context["reply_to"] for context in contexts} == {"turn-overflow"}
+        self._assert_distinct_increasing_blocks_with_terminal_final(contexts)
+
+    @pytest.mark.asyncio
+    async def test_overflow_segment_break_advances_before_next_draft(self):
+        adapter = _make_draft_capable_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 700
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(
+                transport="auto", chat_type="dm", cursor="",
+                edit_interval=0.01, buffer_threshold=1,
+            ),
+            initial_reply_to_id="turn-overflow-boundary",
+        )
+
+        consumer.on_delta("A" * 1400)
+        consumer.on_segment_break()
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.1)
+
+        closed_contexts = self._stream_contexts(adapter)
+        assert len(closed_contexts) >= 2
+        last_closed_id = closed_contexts[-1]["draft_id"]
+        assert all(context["turn_final"] is False for context in closed_contexts)
+
+        consumer.on_delta("next block")
+        await asyncio.sleep(0.1)
+        next_drafts = [
+            call for call in adapter.draft_calls
+            if call["content"] == "next block"
+        ]
+        assert next_drafts
+        assert next_drafts[-1]["draft_id"] > last_closed_id
+
+        consumer.finish()
+        await task
+
+    @pytest.mark.asyncio
+    async def test_native_draft_fallback_allocates_one_block_per_message(self):
+        adapter = _make_draft_capable_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 700
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(transport="auto", chat_type="dm", cursor=""),
+            initial_reply_to_id="turn-fallback",
+        )
+        consumer._use_draft_streaming = consumer._resolve_draft_streaming()
+        type(consumer)._draft_id_counter += 1
+        consumer._draft_id = type(consumer)._draft_id_counter
+
+        await consumer._send_fallback_final("B" * 1400)
+
+        contexts = self._stream_contexts(adapter)
+        assert {context["reply_to"] for context in contexts} == {"turn-fallback"}
+        self._assert_distinct_increasing_blocks_with_terminal_final(contexts)
+
+
+
+@pytest.mark.asyncio
+async def test_native_draft_overflow_flush_signals_delivery_barrier():
+    import threading
+    from gateway.stream_consumer import _FLUSH
+    adapter = _make_draft_capable_adapter()
+    adapter.MAX_MESSAGE_LENGTH = 700
+    consumer = GatewayStreamConsumer(
+        adapter, "chat", StreamConsumerConfig(transport="draft", chat_type="dm", cursor=""),
+    )
+    delivered = threading.Event()
+    consumer.on_delta("A" * 1400)
+    consumer._queue.put((_FLUSH, delivered))
+    consumer.finish()
+    await consumer.run()
+    assert delivered.is_set()

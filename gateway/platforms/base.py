@@ -2881,6 +2881,22 @@ def _strip_media_directives(text: str) -> str:
     return _strip_media_tag_directives(text)
 
 
+@dataclass(frozen=True)
+class StreamingPreferences:
+    """Narrow adapter overrides for the shared gateway stream consumer.
+
+    ``None`` means "inherit the global StreamingConfig value".  This keeps
+    the base adapter conservative and lets platforms with a transport-local
+    fast path opt into only the settings they actually need.
+    """
+
+    enabled_by_default: Optional[bool] = None
+    transport: Optional[str] = None
+    cursor: Optional[str] = None
+    buffer_threshold: Optional[int] = None
+    edit_interval: Optional[float] = None
+
+
 class BasePlatformAdapter(ABC):
     """
     Base class for platform adapters.
@@ -3265,6 +3281,14 @@ class BasePlatformAdapter(ABC):
         """
         return None
 
+    def streaming_preferences(self) -> StreamingPreferences:
+        """Return adapter-specific stream-consumer defaults.
+
+        The base adapter inherits every global setting so existing platforms
+        retain their current enablement, transport, cursor, and cadence.
+        """
+        return StreamingPreferences()
+
     async def send_draft(
         self,
         chat_id: str,
@@ -3280,10 +3304,14 @@ class BasePlatformAdapter(ABC):
         ``draft_id`` values within the same chat to avoid animating over a
         prior bubble.
 
-        Drafts have no message_id and cannot be edited, replied to, or
-        deleted via normal message APIs.  When the response finishes, the
-        caller delivers the final answer as a regular ``send`` and the
-        draft preview clears naturally on the client.
+        Drafts have no message_id and cannot be edited or deleted via normal
+        message APIs.  The optional metadata may carry the reserved internal
+        ``_gateway_stream`` context (originating ``reply_to``, current
+        ``draft_id``, and ``turn_final``) for transports that need to address
+        a draft to its source turn without expanding this method's positional
+        contract.  When the response finishes, the caller delivers the final
+        answer as a regular ``send`` and the draft preview clears naturally on
+        the client.
 
         Default implementation raises NotImplementedError; adapters that
         also return True from :meth:`supports_draft_streaming` must override.

@@ -2501,6 +2501,187 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _dispatch_exec_approval(
+    adapter,
+    approval_data: dict,
+    *,
+    chat_id: str,
+    session_key: str,
+    metadata: Optional[dict],
+    loop,
+) -> None:
+    """Deliver an approval through the adapter's typed or legacy capability."""
+    cmd = approval_data.get("command", "")
+    desc = approval_data.get("description", "dangerous command")
+
+    # Redact credentials from the command before displaying it in
+    # the approval prompt — Tirith's findings are already redacted,
+    # but the raw command string still leaks secrets to the chat
+    # platform (#48456). Applied here so BOTH the button-based
+    # (send_exec_approval) and plain-text fallback paths below use
+    # the redacted value.
+    cmd = _redact_approval_command(cmd)
+
+    if getattr(type(adapter), "send_exec_approval_event", None) is not None:
+        from gateway.stream_events import ApprovalRequired
+
+        payload = dict(approval_data, command=cmd)
+        fut = safe_schedule_threadsafe(
+            adapter.send_exec_approval_event(
+                chat_id=chat_id,
+                approval=ApprovalRequired.from_notification(payload),
+                session_key=session_key,
+                metadata=metadata,
+            ),
+            loop,
+            logger=logger,
+            log_message="send_exec_approval_event scheduling error",
+        )
+        if fut is None:
+            raise RuntimeError("send_exec_approval_event: loop unavailable")
+        result = fut.result(timeout=15)
+        if result is not None and not result.success:
+            raise RuntimeError("send_exec_approval_event delivery failed")
+        return
+
+    # Prefer button-based approval when the adapter supports it.
+    # Check the *class* for the method, not the instance — avoids
+    # false positives from MagicMock auto-attribute creation in tests.
+    if getattr(type(adapter), "send_exec_approval", None) is not None:
+        try:
+            _approval_fut = safe_schedule_threadsafe(
+                adapter.send_exec_approval(
+                    chat_id=chat_id,
+                    command=cmd,
+                    session_key=session_key,
+                    description=desc,
+                    metadata=metadata,
+                    allow_permanent=approval_data.get("allow_permanent", True),
+                    allow_session=approval_data.get("allow_session", True),
+                    smart_denied=approval_data.get("smart_denied", False),
+                ),
+                loop,
+                logger=logger,
+                log_message="send_exec_approval scheduling error",
+            )
+            if _approval_fut is None:
+                raise RuntimeError("send_exec_approval: loop unavailable")
+            _approval_result = _approval_fut.result(timeout=15)
+            if _approval_result.success:
+                return
+            logger.warning(
+                "Button-based approval failed (send returned error), falling back to text: %s",
+                _approval_result.error,
+            )
+        except Exception as _e:
+            logger.warning(
+                "Button-based approval failed, falling back to text: %s", _e
+            )
+
+    # Fallback: plain text approval prompt.  Use the adapter's
+    # typed prefix so Slack/Matrix users are told the form they
+    # can actually type (`!approve`) — typed "/" is blocked in
+    # Slack threads and reserved by Matrix clients.
+    _p = getattr(adapter, "typed_command_prefix", "/")
+    msg = _format_exec_approval_fallback(
+        cmd,
+        desc,
+        _p,
+        allow_permanent=approval_data.get("allow_permanent", True),
+        allow_session=approval_data.get("allow_session", True),
+        smart_denied=approval_data.get("smart_denied", False),
+    )
+    try:
+        _approval_send_fut = safe_schedule_threadsafe(
+            adapter.send(
+                chat_id,
+                msg,
+                metadata=metadata,
+            ),
+            loop,
+            logger=logger,
+            log_message="Approval text-send scheduling error",
+        )
+        if _approval_send_fut is not None:
+            _approval_send_fut.result(timeout=15)
+    except Exception as _e:
+        logger.error("Failed to send approval request: %s", _e)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ResolvedStreamConsumerSettings:
+    enabled: bool
+    consumer_config: Any
+
+
+def _resolve_stream_consumer_settings(
+    streaming_config: Any,
+    *,
+    platform_streaming: Any,
+    adapter: Optional[BasePlatformAdapter],
+    platform: "Platform",
+    chat_type: str,
+) -> _ResolvedStreamConsumerSettings:
+    """Resolve global, per-platform, and adapter streaming settings once.
+
+    An explicit ``display.platforms.<name>.streaming`` value remains the
+    highest-priority enablement gate.  Without one, adapters may opt into
+    streaming independently of the global default and override only the
+    consumer fields needed by their native transport.
+    """
+    from gateway.platforms.base import StreamingPreferences
+    from gateway.stream_consumer import StreamConsumerConfig
+
+    preferences = StreamingPreferences()
+    preference_resolver = getattr(adapter, "streaming_preferences", None)
+    if callable(preference_resolver):
+        resolved_preferences = preference_resolver()
+        if isinstance(resolved_preferences, StreamingPreferences):
+            preferences = resolved_preferences
+
+    global_enabled = bool(
+        streaming_config.enabled and streaming_config.transport != "off"
+    )
+    if platform_streaming is not None:
+        enabled = bool(platform_streaming)
+    elif preferences.enabled_by_default is not None:
+        enabled = preferences.enabled_by_default
+    else:
+        enabled = global_enabled
+
+    def _preferred(name: str) -> Any:
+        value = getattr(preferences, name)
+        return getattr(streaming_config, name) if value is None else value
+
+    cursor = _preferred("cursor")
+    if not getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True):
+        cursor = ""
+    buffer_only = False
+    if platform == Platform.MATRIX:
+        cursor = ""
+        buffer_only = True
+
+    fresh_final_seconds = (
+        float(getattr(streaming_config, "fresh_final_after_seconds", 0.0) or 0.0)
+        if platform == Platform.TELEGRAM
+        else 0.0
+    )
+    consumer_config = StreamConsumerConfig(
+        edit_interval=_preferred("edit_interval"),
+        buffer_threshold=_preferred("buffer_threshold"),
+        cursor=cursor,
+        buffer_only=buffer_only,
+        fresh_final_after_seconds=fresh_final_seconds,
+        transport=_preferred("transport") or "edit",
+        chat_type=chat_type or "",
+    )
+    return _ResolvedStreamConsumerSettings(
+        enabled=enabled,
+        consumer_config=consumer_config,
+    )
+
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -4672,12 +4853,15 @@ class TurnRunner:
         _plat_streaming = ctx.resolve_display_setting(
             ctx.user_config, platform_key, "streaming"
         )
-        # None = no per-platform override → follow global config
-        _streaming_enabled = (
-            _scfg.enabled and _scfg.transport != "off"
-            if _plat_streaming is None
-            else bool(_plat_streaming)
-        )
+        # Explicit per-platform settings override adapter and global defaults.
+        _adapter = self._runner._adapter_for_source(ctx.source)
+        _streaming_enabled = _resolve_stream_consumer_settings(
+            _scfg,
+            platform_streaming=_plat_streaming,
+            adapter=_adapter,
+            platform=ctx.source.platform,
+            chat_type=getattr(ctx.source, "chat_type", "") or "",
+        ).enabled
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
@@ -5352,79 +5536,14 @@ class TurnRunner:
             # Typing resumes in _handle_approve_command/_handle_deny_command.
             ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
 
-            cmd = approval_data.get("command", "")
-            desc = approval_data.get("description", "dangerous command")
-
-            # Redact credentials from the command before displaying it in
-            # the approval prompt — Tirith's findings are already redacted,
-            # but the raw command string still leaks secrets to the chat
-            # platform (#48456). Applied here so BOTH the button-based
-            # (send_exec_approval) and plain-text fallback paths below use
-            # the redacted value.
-            cmd = _redact_approval_command(cmd)
-
-            # Prefer button-based approval when the adapter supports it.
-            # Check the *class* for the method, not the instance — avoids
-            # false positives from MagicMock auto-attribute creation in tests.
-            if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
-                try:
-                    _approval_fut = safe_schedule_threadsafe(
-                        ctx._status_adapter.send_exec_approval(
-                            chat_id=ctx._status_chat_id,
-                            command=cmd,
-                            session_key=_approval_session_key,
-                            description=desc,
-                            metadata=ctx._status_thread_metadata,
-                            allow_permanent=approval_data.get("allow_permanent", True),
-                            allow_session=approval_data.get("allow_session", True),
-                            smart_denied=approval_data.get("smart_denied", False),
-                        ),
-                        ctx._loop_for_step,
-                        logger=logger,
-                        log_message="send_exec_approval scheduling error",
-                    )
-                    if _approval_fut is None:
-                        raise RuntimeError("send_exec_approval: loop unavailable")
-                    _approval_result = _approval_fut.result(timeout=15)
-                    if _approval_result.success:
-                        return
-                    logger.warning(
-                        "Button-based approval failed (send returned error), falling back to text: %s",
-                        _approval_result.error,
-                    )
-                except Exception as _e:
-                    logger.warning(
-                        "Button-based approval failed, falling back to text: %s", _e
-                    )
-
-            # Fallback: plain text approval prompt.  Use the adapter's
-            # typed prefix so Slack/Matrix users are told the form they
-            # can actually type (`!approve`) — typed "/" is blocked in
-            # Slack threads and reserved by Matrix clients.
-            _p = getattr(ctx._status_adapter, "typed_command_prefix", "/")
-            msg = _format_exec_approval_fallback(
-                cmd,
-                desc,
-                _p,
-                allow_permanent=approval_data.get("allow_permanent", True),
-                allow_session=approval_data.get("allow_session", True),
-                smart_denied=approval_data.get("smart_denied", False),
+            _dispatch_exec_approval(
+                ctx._status_adapter,
+                approval_data,
+                chat_id=ctx._status_chat_id,
+                session_key=_approval_session_key,
+                metadata=ctx._status_thread_metadata,
+                loop=ctx._loop_for_step,
             )
-            try:
-                _approval_send_fut = safe_schedule_threadsafe(
-                    ctx._status_adapter.send(
-                        ctx._status_chat_id,
-                        msg,
-                        metadata=ctx._status_thread_metadata,
-                    ),
-                    ctx._loop_for_step,
-                    logger=logger,
-                    log_message="Approval text-send scheduling error",
-                )
-                if _approval_send_fut is not None:
-                    _approval_send_fut.result(timeout=15)
-            except Exception as _e:
-                logger.error("Failed to send approval request: %s", _e)
 
         # Keep real user text separate from API-only recovery guidance.  If
         # an auto-continue note is prepended below, persist the original
@@ -14419,6 +14538,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Yuanbao: websockets not installed. Run: pip install websockets")
                 return None
             return YuanbaoAdapter(config)
+
+        elif platform == Platform.SMARTBOX_VOICE:
+            from gateway.platforms.smartbox_voice import SmartBoxVoiceAdapter
+            return SmartBoxVoiceAdapter(config)
 
         return None
 
@@ -25224,8 +25347,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Returns ``(consumer_cfg, pause_typing_before_finalize)``.
         """
-        from gateway.stream_consumer import StreamConsumerConfig
-
         _pause_typing_before_finalize = None
         if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
             def _pause_typing_before_finalize(
@@ -25243,33 +25364,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapter_supports_edit = getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
         if not _adapter_supports_edit and on_missing_cursor == "raise":
             raise RuntimeError("skip streaming for non-editable platform")
-        _effective_cursor = scfg.cursor if _adapter_supports_edit else ""
-        # Some Matrix clients render the streaming cursor
-        # as a visible tofu/white-box artifact.  Keep
-        # streaming text on Matrix, but suppress the cursor.
-        _buffer_only = False
-        if source.platform == Platform.MATRIX:
-            _effective_cursor = ""
-            _buffer_only = True
-        # Fresh-final applies to Telegram only — other
-        # platforms either edit in place cheaply (Discord,
-        # Slack) or don't have the timestamp-on-edit /
-        # edit-timestamp-stays-stale problem.
-        # (Ported from openclaw/openclaw#72038.)
-        _fresh_final_secs = (
-            float(getattr(scfg, "fresh_final_after_seconds", 0.0) or 0.0)
-            if source.platform == Platform.TELEGRAM
-            else 0.0
-        )
-        _consumer_cfg = StreamConsumerConfig(
-            edit_interval=scfg.edit_interval,
-            buffer_threshold=scfg.buffer_threshold,
-            cursor=_effective_cursor,
-            buffer_only=_buffer_only,
-            fresh_final_after_seconds=_fresh_final_secs,
-            transport=scfg.transport or "edit",
+        _consumer_cfg = _resolve_stream_consumer_settings(
+            scfg,
+            platform_streaming=None,
+            adapter=adapter,
+            platform=source.platform,
             chat_type=getattr(source, "chat_type", "") or "",
-        )
+        ).consumer_config
         return _consumer_cfg, _pause_typing_before_finalize
 
     async def _run_agent_via_proxy(
@@ -25382,11 +25483,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _plat_streaming = resolve_display_setting(
             user_config, platform_key, "streaming"
         )
-        _streaming_enabled = (
-            _scfg.enabled and _scfg.transport != "off"
-            if _plat_streaming is None
-            else bool(_plat_streaming)
-        )
+        _adapter = self._adapter_for_source(source)
+        _streaming_enabled = _resolve_stream_consumer_settings(
+            _scfg,
+            platform_streaming=_plat_streaming,
+            adapter=_adapter,
+            platform=source.platform,
+            chat_type=getattr(source, "chat_type", "") or "",
+        ).enabled
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
