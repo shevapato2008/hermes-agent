@@ -17,6 +17,10 @@ _STALE_TARGET_MSG = "target user message is no longer in session history"
 _GROUP_PROBE_FAILED_MSG = "Could not verify this group. Try again after the gateway recovers."
 
 
+class _TypedVoiceStopError(RuntimeError):
+    """A recognized stop was consumed, but its physical release was not acknowledged."""
+
+
 def _history_user_indices(history: list) -> list:
     """Indices of canonical live-user turns, including composite carriers."""
     from agent.context_compressor import user_originated_turn_view
@@ -255,17 +259,24 @@ def _consume_typed_stop_phrase(text, sid=None, *, emit: bool = True) -> bool:
     except Exception:  # an unreadable voice config never swallows the message: it reaches the agent
         logger.debug("typed stop-phrase check failed; submitting the text", exc_info=True)
         return False
+    session_id = str(sid or "")
+    caller = _caller_transport()
+    _owner, _epoch, owner_transport, _capture_id = _voice_scope_snapshot()
+    _authority_sid, authority_transport = _voice_authority_snapshot()
+    epoch = _claim_voice_authority(
+        session_id,
+        caller,
+        allow_unclaimed=authority_transport is None,
+        release_all=owner_transport is None and _capture_live(),
+    )
+    if epoch is None:
+        return False
     owner, epoch, transport, capture_id = _voice_scope_snapshot()
-    if owner and owner != str(sid or ""):
-        return False
-    if not owner:
-        transport = _caller_transport()
-        epoch = _acquire_voice_lease(str(sid or ""), transport)
-        if epoch is None:
-            return False
-        owner, epoch, transport, capture_id = _voice_scope_snapshot()
-    if not _end_session_voice_chat(sid, stop_loop=True, stop_tts=True):
-        return False
+    if not _end_session_voice_chat(
+        session_id, stop_loop=True, stop_tts=True, transport=caller,
+        lease_epoch=epoch,
+    ):
+        raise _TypedVoiceStopError("voice input could not be released")
     if emit:
         _voice_emit(
             "voice.transcript", {"stop_phrase": True, "typed": True},
@@ -278,7 +289,11 @@ def _consume_typed_stop_phrase(text, sid=None, *, emit: bool = True) -> bool:
 def _typed_stop_phrase_response(rid, text, sid=None):
     """RPC reply ending the voice chat when a bare stop phrase is TYPED while the session's voice
     mode is on (typed twin of the spoken stop phrase), or None for a normal message."""
-    return _ok(rid, {"voice_stopped": True}) if _consume_typed_stop_phrase(text, sid) else None
+    try:
+        consumed = _consume_typed_stop_phrase(text, sid)
+    except _TypedVoiceStopError as exc:
+        return _err(rid, 5025, str(exc))
+    return _ok(rid, {"voice_stopped": True}) if consumed else None
 
 
 _HOSTED_TASK_FIELDS = {"room_id", "task_id", "thread_id", "turn_id", "execution_generation", "member_id"}
@@ -827,6 +842,7 @@ from gateway.session_surface import SURFACES as _CLIENT_SURFACES
 
 
 @method("prompt.submit")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
     sid = params.get("session_id", "")

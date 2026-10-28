@@ -66,6 +66,32 @@ async def test_a_retried_stop_replays_voice_stopped_and_never_starts_a_turn(voic
 
 
 @pytest.mark.asyncio
+async def test_typed_stop_release_failure_is_not_admitted(voice_owner, monkeypatch):
+    from tui_gateway import server
+
+    voice_owner.runner._voice_mode['s'] = 'voice_only'
+    monkeypatch.setattr(server, '_claim_voice_authority', lambda *_args, **_kwargs: 7)
+    monkeypatch.setattr(
+        server,
+        '_voice_scope_snapshot',
+        lambda: ('s', 7, server._stdio_transport, None),
+    )
+    monkeypatch.setattr(server, '_end_session_voice_chat', lambda *_args, **_kwargs: False)
+
+    with voice_owner.db:
+        reply = await _call(
+            _connection(voice_owner.authority),
+            'prompt.submit',
+            text='stop',
+            submission_id='r1',
+        )
+
+    assert reply['error']['code'] == 5025
+    assert reply['error']['data']['reason'] == 'voice_release_failed'
+    assert _ledger(voice_owner.db) == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('mode, text', [('off', 'stop'), ('voice_only', 'stop doing that')])
 async def test_other_text_or_voice_off_is_admitted_as_a_turn(voice_owner, mode, text):
     voice_owner.runner._voice_mode['s'] = mode

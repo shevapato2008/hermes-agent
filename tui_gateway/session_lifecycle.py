@@ -661,8 +661,16 @@ def _teardown_popped_session(session: dict | None, *, end_reason: str = "tui_clo
     if end_reason != "tui_shutdown":
         _settle_isolated_turn_before_close(session)
     sid = str(session.get("_sid") or "")
-    if sid and _voice_scope_snapshot()[0] == sid:
-        _stop_session_voice_capture(sid)
+    owner_sid, epoch, owner_transport, _capture_id = _voice_scope_snapshot()
+    authority_sid, authority_transport = _voice_authority_snapshot()
+    if sid == owner_sid and owner_transport is not None:
+        _release_voice_for_transport(
+            owner_transport, expected_session_id=sid, expected_epoch=epoch
+        )
+    elif sid == authority_sid and authority_transport is not None:
+        _release_voice_for_transport(
+            authority_transport, expected_session_id=sid, expected_epoch=epoch
+        )
     try:
         _teardown_session(session, end_reason=end_reason)
     finally:

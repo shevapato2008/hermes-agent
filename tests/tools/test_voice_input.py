@@ -9,6 +9,8 @@ import threading
 
 import pytest
 
+from tests.waiting import wait_until
+
 
 class _ChunkedStdout:
     def __init__(self, chunks):
@@ -186,6 +188,80 @@ def test_pulse_pump_error_callback_can_close_through_helper_thread(monkeypatch):
         assert process.terminated == 1 and process.waited == 1
     finally:
         provider.release_active(timeout=1)
+
+
+def test_pulse_pump_normalizes_callback_failure_and_reaps_if_error_handler_raises(
+    monkeypatch, tmp_path,
+):
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    from tools.voice_input import PulseCliVoiceInputProvider, VoiceInputError
+
+    pcm = struct.pack("<480h", *([1] * 480))
+    failed_process = _FakeProcess([pcm])
+    replacement_process = _FakeProcess([b""])
+    processes = iter((failed_process, replacement_process))
+    monkeypatch.setattr(
+        "tools.voice_input.subprocess.Popen", lambda *_a, **_k: next(processes)
+    )
+    provider = PulseCliVoiceInputProvider(executable="parec")
+    input_errors = []
+    callback_homes = []
+    error_homes = []
+    error_notified = threading.Event()
+    launch = tmp_path / "launch"
+    worker = tmp_path / "worker"
+    launch.mkdir()
+    worker.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+
+    def bad_callback(*_args):
+        callback_homes.append(get_hermes_home())
+        raise RuntimeError("consumer callback crashed")
+
+    def bad_error_handler(error):
+        error_homes.append(get_hermes_home())
+        input_errors.append(error)
+        error_notified.set()
+        raise RuntimeError("consumer error handler crashed")
+
+    stream = provider.open_stream(
+        phase="ordinary",
+        sample_rate=16_000,
+        channels=1,
+        dtype="int16",
+        blocksize=480,
+        callback=bad_callback,
+        on_error=bad_error_handler,
+    )
+    token = set_hermes_home_override(worker)
+    try:
+        stream.start()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert error_notified.wait(2)
+    assert wait_until(lambda: not stream.active, timeout=2)
+    assert len(input_errors) == 1
+    assert isinstance(input_errors[0], VoiceInputError)
+    assert input_errors[0].stage == "callback"
+    assert input_errors[0].retryable is False
+    assert callback_homes == [worker]
+    assert error_homes == [worker]
+    assert failed_process.terminated == 1 and failed_process.waited == 1
+    assert failed_process.stdout.closed is True
+
+    replacement = provider.open_stream(
+        phase="full_duplex",
+        sample_rate=16_000,
+        channels=1,
+        dtype="int16",
+        blocksize=480,
+    )
+    replacement.close(timeout=0.2)
 
 
 def test_pulse_cli_allows_only_one_capture_phase(monkeypatch):

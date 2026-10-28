@@ -13,6 +13,8 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
+from agent.memory_provider import ctx_bound, spawn_context_thread
+
 # Modifier aliases mirrored from the TUI parser (``ui-tui/src/lib/platform.ts`` ``_MOD_ALIASES``)
 # so one config value binds the same shortcut in both runtimes. ``super``/``win``/``windows`` are
 # deliberately absent: prompt_toolkit has no super/meta modifier, so those spellings are TUI-only
@@ -398,7 +400,7 @@ def start_continuous(
     # conflict on macOS.
     _play_beep(frequency=880, count=1)
     try:
-        rec.start(on_silence_stop=_continuous_on_silence)
+        rec.start(on_silence_stop=ctx_bound(_continuous_on_silence))
     except Exception as e:
         logger.error("failed to start continuous recording: %s", e)
         _debug(f"start_continuous: rec.start raised {type(e).__name__}: {e}")
@@ -449,8 +451,10 @@ def stop_continuous(force_transcribe: bool = False) -> None:
                         _safe_call(on_input_error, cancel_error)
                 _finish_stop(on_status)
                 raise
-            threading.Thread(
-                target=_finish_forced_stop, args=(wav_path, callbacks, track_no_speech), daemon=True
+            spawn_context_thread(
+                _finish_forced_stop,
+                name="voice-forced-stop",
+                args=(wav_path, callbacks, track_no_speech),
             ).start()
             return
         # cancel() (not stop()) discards buffered frames — the loop is over, we don't want to
@@ -584,7 +588,7 @@ def _rearm_after_turn(rec: Any, on_status, no_speech: int, on_input_error=None) 
     _debug(f"_continuous_on_silence: restarting loop (no_speech={no_speech})")
     _play_beep(frequency=880, count=1)
     try:
-        rec.start(on_silence_stop=_continuous_on_silence)
+        rec.start(on_silence_stop=ctx_bound(_continuous_on_silence))
     except Exception as e:
         logger.error("failed to restart continuous recording: %s", e)
         _debug(f"_continuous_on_silence: restart raised {type(e).__name__}: {e}")
@@ -639,7 +643,10 @@ def _speak_streaming(text: str, stop_event: Optional[threading.Event]) -> bool:
     return done_event.is_set()
 
 
-def _speak_whole_file(text: str) -> None:
+def _speak_whole_file(
+    text: str,
+    stop_event: Optional[threading.Event] = None,
+) -> None:
     """Sync path: clean, synthesize to a temp MP3 via ``text_to_speech_tool``, play, unlink."""
     from tools.tts_tool import text_to_speech_tool
 
@@ -671,7 +678,11 @@ def _speak_whole_file(text: str) -> None:
     play_paths = tts_result.get("file_paths") or [tts_result.get("file_path") or mp3_path]
     played_any = False
     for play_path in play_paths if tts_result.get("success") else []:
+        if stop_event is not None and stop_event.is_set():
+            break
         if os.path.isfile(play_path) and os.path.getsize(play_path) > 0:
+            if stop_event is not None and stop_event.is_set():
+                break
             _debug(f"speak_text: playing {play_path} ({os.path.getsize(play_path)} bytes)")
             play_audio_file(play_path)
             played_any = True
@@ -713,7 +724,7 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
                 return
         except Exception as e:
             _debug(f"speak_text: streaming dispatch unavailable ({e}); using sync path")
-        _speak_whole_file(text)
+        _speak_whole_file(text, stop_event)
     except Exception as e:
         logger.warning("Voice TTS playback failed: %s", e)
         _debug(f"speak_text raised {type(e).__name__}: {e}")
@@ -726,7 +737,9 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
             with _continuous_lock:
                 if _continuous_active and _continuous_recorder is not None:
                     try:
-                        _continuous_recorder.start(on_silence_stop=_continuous_on_silence)
+                        _continuous_recorder.start(
+                            on_silence_stop=ctx_bound(_continuous_on_silence)
+                        )
                         _debug("speak_text: recording resumed after TTS")
                     except Exception as e:
                         logger.warning("failed to resume recorder after TTS: %s", e)

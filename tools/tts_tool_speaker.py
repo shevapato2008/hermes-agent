@@ -22,6 +22,7 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Iterable, Iterator, List, Optional
 
+from agent.memory_provider import ctx_bound, spawn_context_thread
 from tools.tts_text_normalize import _strip_markdown_for_tts
 from tools.tts_tool_delivery import _origin, _remove_quietly as _unlink_quietly
 
@@ -109,13 +110,16 @@ class _SyncSentencePipeline:
         self._stop = stop_event
         self._queue: queue.Queue[Optional[tuple[str, Future]]] = queue.Queue(maxsize=max(1, lookahead))
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-sync-synth")
-        self._player = threading.Thread(target=self._drain, name="tts-sync-play", daemon=True)
+        self._player = spawn_context_thread(self._drain, name="tts-sync-play")
         self._player.start()
 
     def speak(self, cleaned: str) -> None:
         """Queue one sentence. Blocks only when the lookahead bound is full."""
         if not self._stop.is_set():
-            self._queue.put((cleaned, self._executor.submit(self._synthesize_to_tmp, cleaned)))
+            self._queue.put((
+                cleaned,
+                self._executor.submit(ctx_bound(self._synthesize_to_tmp), cleaned),
+            ))
 
     def close(self) -> None:
         """Flush queued sentences in order (skipped if stopped), then join."""
@@ -175,7 +179,9 @@ class _StreamerPlayback:
         self._audio_queue: queue.Queue[Optional[queue.Queue[Optional[bytes]]]] = queue.Queue()
         self._prefetch_threads: list[threading.Thread] = []
         self._prefetch_sem = threading.Semaphore(3)
-        self._worker = threading.Thread(target=self._playback_worker, daemon=True)
+        self._worker = spawn_context_thread(
+            self._playback_worker, name="tts-stream-play"
+        )
         self._worker.start()
 
     def _create_output_stream(self):
@@ -232,8 +238,11 @@ class _StreamerPlayback:
         self._prefetch_sem.acquire()
         chunk_queue: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=self._CHUNK_QUEUE_MAX)
         self._audio_queue.put(chunk_queue)
-        self._prefetch_threads.append(threading.Thread(
-            target=self._consume_to_queue, args=(audio_iter, chunk_queue), daemon=True))
+        self._prefetch_threads.append(spawn_context_thread(
+            self._consume_to_queue,
+            name="tts-stream-prefetch",
+            args=(audio_iter, chunk_queue),
+        ))
         self._prefetch_threads[-1].start()
 
     def _consume_to_queue(self, audio_iter: Iterator[bytes], chunk_queue: queue.Queue[Optional[bytes]]) -> None:

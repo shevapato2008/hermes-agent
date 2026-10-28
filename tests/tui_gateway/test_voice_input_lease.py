@@ -63,6 +63,7 @@ def voice(monkeypatch):
     monkeypatch.setattr(server, "_session_voice_enabled", lambda _sid: True)
     monkeypatch.setattr(server, "_tts_stream_stop", lambda **_kw: None)
     monkeypatch.setattr(server, "_stdio_transport", sink)
+    monkeypatch.setattr(server, "_current_voice_profile_home", lambda: None)
     monkeypatch.setattr(server, "_voice_event_sid", "")
     monkeypatch.setattr(server, "_voice_event_transport", None)
     monkeypatch.setattr(server, "_voice_capture_sid", "")
@@ -73,10 +74,18 @@ def voice(monkeypatch):
         "_voice_lease_epoch": 0,
         "_voice_lease_releasing": False,
         "_voice_lease_capture_id": None,
+        "_voice_lease_profile_home": None,
+        "_voice_lease_release_all": False,
         "_voice_release_tail_epoch": None,
         "_voice_pending_idle_scope": None,
+        "_voice_pending_disconnect_scope": None,
+        "_voice_authority_sid": "",
+        "_voice_authority_transport": None,
+        "_voice_authority_profile_home": None,
         "_voice_terminal_error_epochs": set(),
         "_voice_release_retry_active": False,
+        "_voice_tts_lease_generation": 0,
+        "_voice_tts_lease_desired": {},
         "_fd_listener_active": False,
         "_fd_listener_epoch": 0,
         "_output_drain_stop": None,
@@ -130,6 +139,17 @@ def test_record_result_and_callbacks_carry_captured_owner_epoch(voice):
         assert payload["capture_id"] == result["capture_id"]
 
 
+def test_record_after_toggle_allocates_capture_id(voice):
+    owner = _Sink()
+    toggled = voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
+
+    started = voice.rpc(owner, "voice.record", action="start", session_id="owner")
+
+    assert toggled["result"].get("capture_id") is None
+    assert started["result"]["capture_id"]
+    assert server._voice_lease_capture_id == started["result"]["capture_id"]
+
+
 def test_voice_toggle_on_claims_session_lease_and_off_acks_empty_owner(voice):
     owner = _Sink()
 
@@ -159,6 +179,303 @@ def test_local_toggle_lease_promotes_to_first_real_session_on_same_transport(voi
     assert started["result"]["lease_epoch"] == enabled["result"]["lease_epoch"]
 
 
+def test_idle_voice_authority_blocks_unrelated_turn_from_claiming_lease(voice):
+    owner, other = _Sink(), _Sink()
+    enabled = voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
+    epoch = enabled["result"]["lease_epoch"]
+    released, error = server._release_voice_lease(
+        session_id="owner", lease_epoch=epoch, transport=owner, stop_loop=False
+    )
+    assert released is True and error == ""
+    assert server._voice_lease_owner_sid == ""
+
+    assert server._full_duplex_scope("other", other) is None
+    reacquired = server._full_duplex_scope("owner", owner)
+    assert reacquired is not None
+    assert reacquired[0] == "owner"
+    assert reacquired[1] > epoch
+
+
+def test_same_session_new_transport_cannot_rebind_live_idle_authority(voice):
+    owner, replacement = _Sink(), _Sink()
+    enabled = voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
+    released, error = server._release_voice_lease(
+        session_id="owner",
+        lease_epoch=enabled["result"]["lease_epoch"],
+        transport=owner,
+        stop_loop=False,
+    )
+    assert released is True and error == ""
+
+    refused = voice.rpc(
+        replacement, "voice.toggle", action="on", session_id="owner"
+    )
+
+    assert refused["error"]["code"] == 4016
+    assert server._voice_authority_transport is owner
+
+
+def test_old_session_teardown_cannot_release_same_transport_handoff(voice):
+    shared = _Sink()
+    enabled = voice.rpc(shared, "voice.toggle", action="on", session_id="old")
+    old_epoch = enabled["result"]["lease_epoch"]
+    released, error = server._release_voice_lease(
+        session_id="old", lease_epoch=old_epoch, transport=shared, stop_loop=False
+    )
+    assert released is True and error == ""
+    new_epoch = server._claim_voice_authority(
+        "successor",
+        shared,
+        allow_unclaimed=True,
+        allow_same_transport_handoff=True,
+    )
+
+    stale = server._release_voice_for_transport(
+        shared, expected_session_id="old", expected_epoch=old_epoch
+    )
+
+    assert stale is False
+    assert new_epoch and new_epoch > old_epoch
+    assert server._voice_lease_owner_sid == "successor"
+    assert server._voice_authority_sid == "successor"
+
+
+def test_closed_transport_cannot_claim_voice_authority(voice):
+    disconnected = _Sink()
+    disconnected.close()
+
+    refused = voice.rpc(
+        disconnected, "voice.toggle", action="on", session_id="stale"
+    )
+
+    assert refused["error"]["code"] == 4016
+    assert server._voice_lease_owner_transport is None
+    assert server._voice_authority_transport is None
+
+
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("voice.toggle", {"action": "on", "session_id": "owner"}),
+        ("voice.record", {"action": "start", "session_id": "owner"}),
+    ],
+)
+def test_lease_and_authority_claim_have_no_visible_split_state(
+    voice, monkeypatch, method, params,
+):
+    windows = []
+
+    class _ObservingLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self._lock.release()
+            if (
+                server._voice_lease_owner_transport is not None
+                and server._voice_authority_transport is None
+            ):
+                windows.append("lease_without_authority")
+
+    monkeypatch.setattr(server, "_voice_sid_lock", _ObservingLock())
+    owner = _Sink()
+
+    response = voice.rpc(owner, method, **params)
+
+    assert "error" not in response
+    assert windows == []
+    assert server._voice_lease_owner_transport is owner
+    assert server._voice_authority_transport is owner
+
+
+def test_disconnected_idle_authority_cannot_be_claimed_by_an_ordinary_turn(voice):
+    owner, other = _Sink(), _Sink()
+    enabled = voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
+    released, error = server._release_voice_lease(
+        session_id="owner",
+        lease_epoch=enabled["result"]["lease_epoch"],
+        transport=owner,
+        stop_loop=False,
+    )
+    assert released is True and error == ""
+
+    assert server._release_voice_for_transport(owner) is True
+    assert server._full_duplex_scope("other", other) is None
+
+    explicitly_enabled = voice.rpc(
+        other, "voice.toggle", action="on", session_id="other"
+    )
+    assert explicitly_enabled["result"]["owner_session_id"] == "other"
+
+
+def test_unrelated_toggle_off_cannot_clear_idle_voice_authority(voice):
+    owner, other = _Sink(), _Sink()
+    enabled = voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
+    released, error = server._release_voice_lease(
+        session_id="owner",
+        lease_epoch=enabled["result"]["lease_epoch"],
+        transport=owner,
+        stop_loop=False,
+    )
+    assert released is True and error == ""
+
+    refused = voice.rpc(other, "voice.toggle", action="off", session_id="other")
+
+    assert refused["error"]["code"] == 4016
+    assert server._voice_mode_enabled() is True
+    assert server._full_duplex_scope("owner", owner) is not None
+
+
+def test_unrelated_toggle_tts_cannot_cut_voice_owners_output(voice, monkeypatch):
+    owner, other = _Sink(), _Sink()
+    voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    toggles = []
+    monkeypatch.setattr(server, "_set_voice_tts", lambda on: toggles.append(on))
+
+    refused = voice.rpc(other, "voice.toggle", action="tts", session_id="other")
+
+    assert refused["error"]["code"] == 4016
+    assert toggles == []
+
+
+def test_same_transport_other_session_cannot_toggle_physical_owners_tts(
+    voice, monkeypatch
+):
+    shared = _Sink()
+    assert server._acquire_voice_lease("owner", shared)
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    toggles = []
+    monkeypatch.setattr(server, "_set_voice_tts", lambda on: toggles.append(on))
+
+    refused = voice.rpc(shared, "voice.toggle", action="tts", session_id="other")
+
+    assert refused["error"]["code"] == 4016
+    assert toggles == []
+
+
+def test_stale_tts_toggle_revalidates_after_disconnect_handoff(voice, monkeypatch):
+    owner, successor = _Sink(), _Sink()
+    voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
+    monkeypatch.setenv("HERMES_VOICE_TTS", "0")
+    monkeypatch.setattr(server, "_voice_toggle_off_cleanup", lambda: None)
+    toggles = []
+    monkeypatch.setattr(server, "_set_voice_tts", lambda on: toggles.append(on))
+    started = threading.Event()
+    finished = threading.Event()
+    response = {}
+
+    def stale_toggle():
+        started.set()
+        response.update(voice.rpc(
+            owner, "voice.toggle", action="tts", session_id="owner"
+        ))
+        finished.set()
+
+    with server._voice_lifecycle_lock:
+        thread = threading.Thread(target=stale_toggle)
+        thread.start()
+        assert started.wait(1)
+        assert not finished.wait(0.1)
+        assert server._release_voice_for_transport(owner) is True
+        enabled = voice.rpc(
+            successor, "voice.toggle", action="on", session_id="successor"
+        )
+        assert "error" not in enabled
+
+    assert finished.wait(1)
+    thread.join(timeout=1)
+    assert response["error"]["code"] == 4016
+    assert toggles == []
+    assert server._voice_authority_transport is successor
+
+
+def test_stale_tts_warm_worker_cannot_reacquire_after_release(monkeypatch):
+    workers = []
+    holders = set()
+    operations = []
+
+    def start_worker(target, **_kwargs):
+        workers.append(target)
+
+    def acquire(lease):
+        operations.append(("acquire", lease))
+        holders.add(lease)
+
+    def release(lease):
+        operations.append(("release", lease))
+        holders.discard(lease)
+
+    monkeypatch.setattr(server, "_voice_tts_lease_generation", 0, raising=False)
+    monkeypatch.setattr(server, "_voice_tts_lease_desired", {}, raising=False)
+    monkeypatch.setattr(server, "_start_voice_thread", start_worker)
+    monkeypatch.setattr("tools.tts_tool_lifecycle.acquire_tts_lease", acquire)
+    monkeypatch.setattr("tools.tts_tool_lifecycle.release_tts_lease", release)
+
+    server._tts_lease_async("tui:voice-tts", True)
+    server._tts_lease_async("tui:voice-tts", False)
+    workers[1]()
+    workers[0]()
+
+    assert operations == [("release", "tui:voice-tts")]
+    assert holders == set()
+
+
+def test_authorized_voice_tts_cannot_fall_back_to_native_after_disconnect(
+    voice, monkeypatch,
+):
+    owner = _Sink()
+    voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
+    queued = []
+    run_now = False
+    spoken = []
+
+    def start_worker(target, *, args=(), **_kwargs):
+        if run_now:
+            target(*args)
+        else:
+            queued.append((target, args))
+
+    monkeypatch.setattr(server, "_start_voice_thread", start_worker)
+    monkeypatch.setattr(
+        voice.mic, "speak_text", lambda text, *_args: spoken.append(text), raising=False
+    )
+
+    response = voice.rpc(
+        owner, "voice.tts", text="stale reply", session_id="owner"
+    )
+    assert "error" not in response
+    assert len(queued) == 1
+
+    run_now = True
+    assert server._release_voice_for_transport(owner) is True
+    target, args = queued[0]
+    target(*args)
+
+    assert spoken == []
+
+
+def test_unrelated_voice_tts_is_refused_while_owner_is_idle(voice, monkeypatch):
+    owner, other = _Sink(), _Sink()
+    enabled = voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
+    released, error = server._release_voice_lease(
+        session_id="owner",
+        lease_epoch=enabled["result"]["lease_epoch"],
+        transport=owner,
+        stop_loop=False,
+    )
+    assert released is True and error == ""
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"barge_in": False}})
+
+    refused = voice.rpc(other, "voice.tts", text="not yours", session_id="other")
+
+    assert refused["error"]["code"] == 4016
+
+
 def test_unrelated_session_cannot_stop_or_replace_the_owner(voice):
     owner, other = _Sink(), _Sink()
     started = voice.rpc(owner, "voice.record", action="start", session_id="owner")
@@ -186,16 +503,19 @@ def test_initial_full_duplex_arm_acquires_and_passes_captured_scope(voice, monke
 
     monkeypatch.setattr(server.threading, "Thread", _Thread)
     monkeypatch.setattr(server, "_fd_listener_active", False)
+    assert server._install_voice_authority(
+        "owner", owner, allow_unclaimed=True
+    )
 
     server._arm_full_duplex_listener("owner", owner)
 
     assert server._voice_lease_owner_sid == "owner"
     assert server._voice_lease_owner_transport is owner
     assert server._voice_lease_epoch > 0
-    assert started == [(
-        server._full_duplex_listener,
-        ("owner", server._voice_lease_epoch, owner),
-    )]
+    assert len(started) == 1
+    target, args = started[0]
+    assert callable(target)
+    assert args == ("owner", server._voice_lease_epoch, owner)
 
 
 def test_full_duplex_trip_only_interrupts_captured_session(voice, monkeypatch):
@@ -262,6 +582,38 @@ def test_interrupting_another_session_does_not_cut_voice_owners_tts(voice, monke
     assert tts_stops == []
 
 
+def test_same_session_new_transport_interrupt_cannot_cut_or_resume_voice_owner(
+    voice, monkeypatch
+):
+    owner, replacement = _Sink(), _Sink()
+    assert server._claim_voice_authority("owner", owner, allow_unclaimed=True)
+    monkeypatch.setattr(server, "_voice_wake_owner", owner)
+    session = {
+        "history_lock": threading.RLock(),
+        "running": True,
+        "agent": types.SimpleNamespace(interrupt=lambda: None),
+    }
+    tts_stops, wake_resumes = [], []
+    monkeypatch.setattr(server, "_sess_nowait", lambda _params, _rid: (session, None))
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_tts_stream_stop", lambda **_kwargs: tts_stops.append(True))
+    monkeypatch.setattr(server, "_wake_resume_if_owner", wake_resumes.append)
+
+    token = bind_transport(replacement)
+    try:
+        response = server._methods["session.interrupt"](
+            "interrupt", {"session_id": "owner"}
+        )
+    finally:
+        reset_transport(token)
+
+    assert response["result"]["status"] == "interrupted"
+    assert tts_stops == []
+    assert wake_resumes == []
+
+
 def test_release_blocks_reacquire_until_physical_close_then_acks(voice):
     owner, other = _Sink(), _Sink()
     started = voice.rpc(owner, "voice.record", action="start", session_id="owner")
@@ -295,7 +647,7 @@ def test_release_blocks_reacquire_until_physical_close_then_acks(voice):
 
 
 def test_forced_stop_delivers_only_the_captured_epochs_transcript_tail(voice):
-    owner, replacement = _Sink(), _Sink()
+    owner = _Sink()
     started = voice.rpc(owner, "voice.record", action="start", session_id="owner")
     callbacks = dict(voice.mic.callbacks)
 
@@ -308,9 +660,7 @@ def test_forced_stop_delivers_only_the_captured_epochs_transcript_tail(voice):
     assert payload["lease_epoch"] == started["result"]["lease_epoch"]
     assert stopped["result"]["release_complete"] is True
 
-    restarted = voice.rpc(
-        replacement, "voice.record", action="start", session_id="replacement"
-    )
+    restarted = voice.rpc(owner, "voice.record", action="start", session_id="owner")
     callbacks["on_transcript"]("stale words")
     assert restarted["result"]["lease_epoch"] > started["result"]["lease_epoch"]
     assert [event["payload"]["text"] for event in _events(owner, "voice.transcript")] == [
@@ -387,16 +737,64 @@ def test_toggle_off_cleanup_finishes_before_successor_can_acquire(voice, monkeyp
 
 def test_session_teardown_releases_its_physical_voice_lease(voice, monkeypatch):
     owner, replacement = _Sink(), _Sink()
+    stopped = []
     voice.rpc(owner, "voice.record", action="start", session_id="owner")
     session = {"_sid": "owner", "_run_thread": None}
     monkeypatch.setattr(server, "_settle_isolated_turn_before_close", lambda _session: None)
     monkeypatch.setattr(server, "_teardown_session", lambda _session, **_kwargs: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.voice_mode",
+        types.SimpleNamespace(
+            stop_playback=lambda: stopped.append("playback"),
+            stop_thinking_sound=lambda: stopped.append("thinking"),
+        ),
+    )
 
     assert server._teardown_popped_session(session) is True
 
     assert voice.mic.stop_calls == 1
     assert server._voice_lease_owner_sid == ""
+    assert server._voice_authority_sid == ""
+    assert server._voice_mode_enabled() is False
+    assert server._voice_tts_enabled() is False
+    assert stopped == ["thinking", "playback"]
     assert server._acquire_voice_lease("replacement", replacement) is not None
+
+
+def test_stale_session_teardown_cannot_release_same_sid_successor_epoch(
+    voice, monkeypatch
+):
+    owner = _Sink()
+    enabled = voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
+    old_epoch = enabled["result"]["lease_epoch"]
+    released, error = server._release_voice_lease(
+        session_id="owner", lease_epoch=old_epoch, transport=owner, stop_loop=False
+    )
+    assert released is True and error == ""
+    original_authority_snapshot = server._voice_authority_snapshot
+    successor_epoch = []
+
+    def handoff_after_teardown_snapshot():
+        authority = original_authority_snapshot()
+        successor_epoch.append(
+            server._claim_voice_authority("owner", owner, allow_unclaimed=True)
+        )
+        return authority
+
+    monkeypatch.setattr(server, "_voice_authority_snapshot", handoff_after_teardown_snapshot)
+    monkeypatch.setattr(server, "_settle_isolated_turn_before_close", lambda _session: None)
+    monkeypatch.setattr(server, "_teardown_session", lambda _session, **_kwargs: None)
+
+    assert server._teardown_popped_session(
+        {"_sid": "owner", "_run_thread": None}
+    ) is True
+
+    assert successor_epoch[0] > old_epoch
+    assert server._voice_lease_epoch == successor_epoch[0]
+    assert server._voice_lease_owner_transport is owner
+    assert server._voice_authority_transport is owner
+    assert server._voice_mode_enabled() is True
 
 
 def test_unrelated_session_cannot_start_or_cut_streaming_tts(voice, monkeypatch):
@@ -466,7 +864,7 @@ def test_unrelated_session_cannot_start_fallback_tts_or_turn_audio(voice, monkey
 
 def test_reconnect_same_session_waits_for_old_transport_physical_release(voice):
     old, replacement = _Sink(), _Sink()
-    voice.rpc(old, "voice.record", action="start", session_id="owner")
+    voice.rpc(old, "voice.toggle", action="on", session_id="owner")
     release_started, allow_release = threading.Event(), threading.Event()
 
     def blocking_stop(**_kwargs):
@@ -475,38 +873,188 @@ def test_reconnect_same_session_waits_for_old_transport_physical_release(voice):
         voice.mic.active = False
 
     voice.mic.stop_impl = blocking_stop
-    released = {}
+    released = []
     worker = threading.Thread(
-        target=lambda: released.update(
-            voice.rpc(old, "voice.record", action="stop", session_id="owner")
-        )
+        target=lambda: released.append(server._release_voice_for_transport(old))
     )
     worker.start()
     assert release_started.wait(1)
 
     refused = voice.rpc(
-        replacement, "voice.record", action="start", session_id="owner"
+        replacement, "voice.toggle", action="on", session_id="owner"
     )
     assert refused["error"]["code"] == 4016
 
     allow_release.set()
     worker.join(2)
-    assert released["result"]["release_complete"] is True
+    assert released == [True]
     restarted = voice.rpc(
-        replacement, "voice.record", action="start", session_id="owner"
+        replacement, "voice.toggle", action="on", session_id="owner"
     )
-    assert restarted["result"]["status"] == "recording"
-    assert restarted["result"]["lease_epoch"] > released["result"]["lease_epoch"]
+    assert restarted["result"]["enabled"] is True
+    assert restarted["result"]["owner_session_id"] == "owner"
 
 
-def test_unleased_typed_stop_physically_clears_legacy_capture(voice):
+def test_disconnect_cleanup_is_consumed_by_overlapping_direct_release(
+    voice, monkeypatch
+):
+    from tools import voice_input
+
+    owner = _Sink()
+    enabled = voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    release_entered, allow_release = threading.Event(), threading.Event()
+
+    def blocking_release(**_kwargs):
+        release_entered.set()
+        assert allow_release.wait(2)
+        return True
+
+    monkeypatch.setattr(voice_input, "release_voice_input", blocking_release)
+    direct_result, disconnect_result = [], []
+    direct = threading.Thread(
+        target=lambda: direct_result.append(
+            server._release_voice_lease(
+                session_id="owner",
+                lease_epoch=enabled["result"]["lease_epoch"],
+                transport=owner,
+                stop_loop=False,
+            )
+        )
+    )
+    direct.start()
+    assert release_entered.wait(1)
+    disconnect = threading.Thread(
+        target=lambda: disconnect_result.append(
+            server._release_voice_for_transport(owner)
+        )
+    )
+    disconnect.start()
+    allow_release.set()
+    direct.join(2)
+    disconnect.join(2)
+
+    assert direct_result == [(True, "")]
+    assert disconnect_result == [False]
+    assert server._voice_mode_enabled() is False
+    assert server._voice_tts_enabled() is False
+    assert server._voice_authority_transport is None
+
+
+def test_disconnect_claim_after_consume_is_rechecked_before_owner_exposure(
+    voice, monkeypatch
+):
+    owner = _Sink()
+    enabled = voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
+    real_consume = server._consume_pending_voice_disconnect
+    first_consume, allow_finalize = threading.Event(), threading.Event()
+    calls = 0
+
+    def blocking_consume(*args):
+        nonlocal calls
+        result = real_consume(*args)
+        calls += 1
+        if calls == 1:
+            first_consume.set()
+            assert allow_finalize.wait(2)
+        return result
+
+    monkeypatch.setattr(server, "_consume_pending_voice_disconnect", blocking_consume)
+    direct_result = []
+    direct = threading.Thread(
+        target=lambda: direct_result.append(
+            server._release_voice_lease(
+                session_id="owner",
+                lease_epoch=enabled["result"]["lease_epoch"],
+                transport=owner,
+                stop_loop=False,
+            )
+        )
+    )
+    direct.start()
+    assert first_consume.wait(1)
+
+    assert server._release_voice_for_transport(owner) is False
+    allow_finalize.set()
+    direct.join(2)
+
+    assert direct_result == [(True, "")]
+    assert server._voice_pending_disconnect_scope is None
+    assert server._voice_lease_owner_transport is None
+    assert server._voice_authority_transport is None
+
+
+def test_unleased_typed_stop_physically_clears_all_legacy_capture_streams(
+    voice, monkeypatch
+):
+    from tools import voice_input
+
     voice.mic.active = True
+    releases = []
+    monkeypatch.setattr(
+        voice_input,
+        "release_voice_input",
+        lambda **kwargs: releases.append(kwargs) or True,
+    )
 
     assert server._consume_typed_stop_phrase("stop", "owner", emit=False) is True
 
     assert voice.mic.stop_calls == 1
     assert voice.mic.active is False
+    assert releases[-1]["exclusive_only"] is False
     assert server._voice_lease_owner_sid == ""
+
+
+def test_unleased_record_stop_physically_clears_all_legacy_capture_streams(
+    voice, monkeypatch
+):
+    from tools import voice_input
+
+    owner = _Sink()
+    voice.mic.active = True
+    releases = []
+    monkeypatch.setattr(
+        voice_input,
+        "release_voice_input",
+        lambda **kwargs: releases.append(kwargs) or True,
+    )
+
+    stopped = voice.rpc(owner, "voice.record", action="stop", session_id="owner")
+
+    assert stopped["result"]["release_complete"] is True
+    assert voice.mic.active is False
+    assert releases[-1]["exclusive_only"] is False
+
+
+def test_typed_stop_from_rebound_transport_cannot_release_same_session(voice):
+    owner, replacement = _Sink(), _Sink()
+    voice.rpc(owner, "voice.record", action="start", session_id="owner")
+
+    token = bind_transport(replacement)
+    try:
+        stopped = server._consume_typed_stop_phrase("stop", "owner", emit=False)
+    finally:
+        reset_transport(token)
+
+    assert stopped is False
+    assert voice.mic.stop_calls == 0
+    assert server._voice_lease_owner_transport is owner
+
+
+def test_stale_stop_callback_cannot_release_successor_epoch(voice):
+    owner = _Sink()
+    old_epoch = server._acquire_voice_lease("owner", owner)
+    released, error = server._release_voice_lease(
+        session_id="owner", lease_epoch=old_epoch, transport=owner, stop_loop=False
+    )
+    assert released is True and error == ""
+    successor_epoch = server._acquire_voice_lease("owner", owner)
+
+    server._vr_on_stop_phrase("stop", ("owner", old_epoch, owner, None))
+
+    assert successor_epoch > old_epoch
+    assert server._voice_lease_epoch == successor_epoch
+    assert server._voice_lease_owner_transport is owner
 
 
 def test_real_lease_releases_unleased_capture_before_installing_callbacks(voice):
@@ -519,6 +1067,53 @@ def test_real_lease_releases_unleased_capture_before_installing_callbacks(voice)
     assert response["result"]["status"] == "recording"
     assert voice.mic.operations[:2] == ["stop", "start"]
     assert "on_transcript" in voice.mic.callbacks
+
+
+def test_legacy_handoff_does_not_make_scoped_stop_release_shared_streams(
+    voice, monkeypatch
+):
+    from tools import voice_input
+
+    owner = _Sink()
+    voice.mic.active = True
+    exclusive = []
+    monkeypatch.setattr(
+        voice_input,
+        "release_voice_input",
+        lambda *, exclusive_only, **_kwargs: exclusive.append(exclusive_only) or True,
+    )
+
+    started = voice.rpc(owner, "voice.record", action="start", session_id="owner")
+    stopped = voice.rpc(owner, "voice.record", action="stop", session_id="owner")
+
+    assert started["result"]["status"] == "recording"
+    assert stopped["result"]["status"] == "stopped"
+    assert exclusive == [False, True]
+
+
+def test_unleased_start_failure_cleanup_still_releases_all_shared_streams(
+    voice, monkeypatch
+):
+    from tools import voice_input
+    from tools.voice_input import VoiceInputReleaseError
+
+    owner = _Sink()
+    voice.mic.active = True
+    exclusive = []
+
+    def release_input(*, exclusive_only, **_kwargs):
+        exclusive.append(exclusive_only)
+        if len(exclusive) == 1:
+            raise VoiceInputReleaseError("legacy stream still closing")
+        return True
+
+    monkeypatch.setattr(voice_input, "release_voice_input", release_input)
+
+    response = voice.rpc(owner, "voice.record", action="start", session_id="owner")
+
+    assert response["error"]["code"] == 5025
+    assert exclusive == [False, False]
+    assert server._voice_lease_owner_transport is None
 
 
 def test_release_failure_emits_scoped_error_without_false_ack_or_wake_resume(voice, monkeypatch):
@@ -547,6 +1142,31 @@ def test_release_failure_emits_scoped_error_without_false_ack_or_wake_resume(voi
     assert resumes == []
 
 
+def test_typed_stop_release_failure_is_consumed_as_rpc_error(voice, monkeypatch):
+    from tools import voice_input
+    from tools.voice_input import VoiceInputReleaseError
+
+    owner = _Sink()
+    started = voice.rpc(owner, "voice.record", action="start", session_id="owner")
+    monkeypatch.setattr(
+        voice_input,
+        "release_voice_input",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            VoiceInputReleaseError("capture still closing")
+        ),
+    )
+    monkeypatch.setattr(server, "_schedule_voice_release_retry", lambda *_args: None)
+
+    response = voice.rpc(
+        owner, "prompt.submit", session_id="owner", text="stop"
+    )
+
+    assert response["error"]["code"] == 5025
+    payload = _events(owner, "voice.input_error")[-1]["payload"]
+    assert payload["lease_epoch"] == started["result"]["lease_epoch"]
+    assert payload["released"] is False
+
+
 def test_release_failure_keeps_same_owner_restart_fenced_for_reaper(voice, monkeypatch):
     from tools.voice_input import VoiceInputReleaseError
 
@@ -569,6 +1189,50 @@ def test_release_failure_keeps_same_owner_restart_fenced_for_reaper(voice, monke
     assert restarted["error"]["code"] == 4016
     assert server._voice_lease_releasing is True
     assert len(retries) == 1
+
+
+def test_handoff_release_failure_reports_old_scope_before_refusing_new_start(
+    voice, monkeypatch
+):
+    from tools import voice_input
+    from tools.voice_input import VoiceInputReleaseError
+
+    shared = _Sink()
+    enabled = voice.rpc(shared, "voice.toggle", action="on", session_id="old")
+    monkeypatch.setattr(
+        voice_input,
+        "release_voice_input",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            VoiceInputReleaseError("voice input release is still in progress")
+        ),
+    )
+    monkeypatch.setattr(server, "_schedule_voice_release_retry", lambda *_args: None)
+
+    response = voice.rpc(
+        shared, "voice.record", action="start", session_id="successor"
+    )
+
+    assert response["error"]["code"] == 5025
+    payload = _events(shared, "voice.input_error")[-1]["payload"]
+    assert payload["owner_session_id"] == "old"
+    assert payload["lease_epoch"] == enabled["result"]["lease_epoch"]
+    assert payload["released"] is False
+    assert server._voice_lease_owner_sid == "old"
+    assert server._voice_lease_releasing is True
+
+
+def test_handoff_during_existing_release_is_busy_without_false_input_error(voice):
+    shared = _Sink()
+    voice.rpc(shared, "voice.toggle", action="on", session_id="old")
+    server._voice_lease_releasing = True
+
+    response = voice.rpc(
+        shared, "voice.record", action="start", session_id="successor"
+    )
+
+    assert response["error"]["code"] == 4016
+    assert _events(shared, "voice.input_error") == []
+    assert server._voice_lease_owner_sid == "old"
 
 
 def test_release_fence_suppresses_full_duplex_trigger_side_effects(voice, monkeypatch):
@@ -605,18 +1269,13 @@ def test_release_fence_suppresses_full_duplex_trigger_side_effects(voice, monkey
 def test_voice_scope_lookup_never_holds_sid_lock_while_waiting_for_sessions(
     voice, monkeypatch
 ):
-    """Pin the lock graph: sessions->sid may occur, so sid->sessions must not."""
+    """Pin the lock graph: voice scope lookup never waits for the sessions lock."""
     real_lock = threading.RLock()
     session_held = threading.Event()
-    scope_waiting = threading.Event()
-    sid_acquired = threading.Event()
     release_sessions = threading.Event()
-    scope_thread_id = {"value": None}
 
     class SignalingSessionsLock:
         def __enter__(self):
-            if threading.get_ident() == scope_thread_id["value"]:
-                scope_waiting.set()
             real_lock.acquire()
             return self
 
@@ -626,33 +1285,26 @@ def test_voice_scope_lookup_never_holds_sid_lock_while_waiting_for_sessions(
     sessions_lock = SignalingSessionsLock()
     monkeypatch.setattr(server, "_sessions_lock", sessions_lock)
 
-    owner, other = _Sink(), _Sink()
+    other = _Sink()
+    assert server._install_voice_authority("owner", other, allow_unclaimed=True)
 
-    def hold_sessions_then_acquire_sid():
+    def hold_sessions():
         with sessions_lock:
             session_held.set()
-            assert scope_waiting.wait(1)
-            server._acquire_voice_lease("owner", owner)
-            sid_acquired.set()
             assert release_sessions.wait(1)
 
-    def resolve_scope():
-        scope_thread_id["value"] = threading.get_ident()
-        server._full_duplex_scope(None, other)
-
-    holder = threading.Thread(target=hold_sessions_then_acquire_sid, daemon=True)
-    resolver = threading.Thread(target=resolve_scope, daemon=True)
+    holder = threading.Thread(target=hold_sessions, daemon=True)
     holder.start()
     assert session_held.wait(1)
+    resolver = threading.Thread(
+        target=lambda: server._full_duplex_scope("owner", other), daemon=True
+    )
     resolver.start()
-    assert scope_waiting.wait(1)
-
-    assert sid_acquired.wait(0.5), "voice sid lock was held while waiting for sessions lock"
+    resolver.join(1)
+    assert not resolver.is_alive(), "voice scope lookup waited for sessions lock"
     release_sessions.set()
     holder.join(1)
-    resolver.join(1)
     assert not holder.is_alive()
-    assert not resolver.is_alive()
 
 
 def test_full_duplex_open_barrier_rejects_scope_released_before_provider_open(
@@ -683,6 +1335,9 @@ def test_full_duplex_open_barrier_rejects_scope_released_before_provider_open(
         ),
     )
     monkeypatch.setattr(server, "_fd_listener_active", False)
+    assert server._install_voice_authority(
+        "owner", owner, allow_unclaimed=True
+    )
     server._arm_full_duplex_listener("owner", owner)
     epoch = server._voice_lease_epoch
     assert reached_guard.wait(1)
@@ -716,6 +1371,9 @@ def test_full_duplex_release_waits_for_atomic_open_barrier(voice, monkeypatch):
             is_audio_output_active=lambda: False,
             transcribe_recording=lambda _path: {"success": True, "transcript": ""},
         ),
+    )
+    assert server._install_voice_authority(
+        "owner", owner, allow_unclaimed=True
     )
     server._arm_full_duplex_listener("owner", owner)
     epoch = server._voice_lease_epoch
@@ -872,6 +1530,99 @@ def test_dead_owner_release_retries_until_physical_input_is_free(voice, monkeypa
     assert server._voice_lease_epoch == started["result"]["lease_epoch"]
 
 
+def test_successor_cannot_acquire_before_prior_retry_worker_exits(voice, monkeypatch):
+    from tools import voice_input
+    from tools.voice_input import VoiceInputReleaseError
+
+    owner, successor = _Sink(), _Sink()
+    epoch = server._acquire_voice_lease("owner", owner)
+    release_calls = []
+    retry_resuming = threading.Event()
+    allow_retry_exit = threading.Event()
+
+    def flaky_release(**_kwargs):
+        release_calls.append(True)
+        if len(release_calls) == 1:
+            raise VoiceInputReleaseError("initial close failed")
+        return True
+
+    def blocking_resume():
+        retry_resuming.set()
+        allow_retry_exit.wait(timeout=1)
+
+    monkeypatch.setattr(voice_input, "release_voice_input", flaky_release)
+    monkeypatch.setattr(server, "_resume_voice_wake", blocking_resume)
+    monkeypatch.setattr(server, "_VOICE_RELEASE_RETRY_SECONDS", 0.01, raising=False)
+
+    released, _error = server._release_voice_lease(
+        session_id="owner", lease_epoch=epoch, transport=owner, stop_loop=False
+    )
+    assert released is False
+    assert retry_resuming.wait(timeout=1)
+    assert server._voice_lease_owner_transport is None
+    assert server._voice_release_retry_active is True
+    try:
+        assert server._acquire_voice_lease("successor", successor) is None
+    finally:
+        allow_retry_exit.set()
+    wait_until(
+        lambda: not server._voice_release_retry_active,
+        timeout=1,
+        what="prior release retry worker exit",
+    )
+    assert server._acquire_voice_lease("successor", successor) is not None
+
+
+def test_disconnect_clears_logical_authority_during_retry_exit_tail(
+    voice, monkeypatch
+):
+    from tools import voice_input
+    from tools.voice_input import VoiceInputReleaseError
+
+    owner, successor = _Sink(), _Sink()
+    epoch = server._claim_voice_authority("owner", owner, allow_unclaimed=True)
+    release_calls = []
+    retry_resuming = threading.Event()
+    allow_retry_exit = threading.Event()
+
+    def flaky_release(**_kwargs):
+        release_calls.append(True)
+        if len(release_calls) == 1:
+            raise VoiceInputReleaseError("initial close failed")
+        return True
+
+    def blocking_resume():
+        retry_resuming.set()
+        allow_retry_exit.wait(timeout=1)
+
+    monkeypatch.setattr(voice_input, "release_voice_input", flaky_release)
+    monkeypatch.setattr(server, "_resume_voice_wake", blocking_resume)
+    monkeypatch.setattr(server, "_VOICE_RELEASE_RETRY_SECONDS", 0.01, raising=False)
+
+    released, _error = server._release_voice_lease(
+        session_id="owner", lease_epoch=epoch, transport=owner, stop_loop=False
+    )
+    assert released is False
+    assert retry_resuming.wait(timeout=1)
+    assert server._voice_lease_owner_transport is None
+    assert server._voice_authority_transport is owner
+    try:
+        assert server._release_voice_for_transport(
+            owner, expected_session_id="owner", expected_epoch=epoch
+        ) is True
+        assert server._voice_authority_transport is None
+        assert server._voice_mode_enabled() is False
+        assert server._acquire_voice_lease("successor", successor) is None
+    finally:
+        allow_retry_exit.set()
+    wait_until(
+        lambda: not server._voice_release_retry_active,
+        timeout=1,
+        what="logical-tail release retry worker exit",
+    )
+    assert server._acquire_voice_lease("successor", successor) is not None
+
+
 def test_wake_stop_reports_physical_release_truth_and_retains_failed_owner(voice, monkeypatch):
     from tools import wake_word
 
@@ -901,6 +1652,8 @@ def test_wake_diagnostics_rpc_is_strict_and_owner_scoped(voice, monkeypatch):
 
     owner = _Sink()
     resets = []
+    monkeypatch.setattr(server, "_wake_owner_transport", owner)
+    monkeypatch.setattr(server, "_wake_owner_profile_home", None)
 
     def diagnostics(*, owner, reset=False):
         resets.append(reset)

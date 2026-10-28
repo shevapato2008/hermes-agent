@@ -6,6 +6,7 @@ transcription, and TTS policy remain in :mod:`tools.voice_mode`.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -14,6 +15,10 @@ import threading
 import time
 from array import array
 from typing import Any, Callable, Mapping
+
+from agent.memory_provider import spawn_context_thread
+
+logger = logging.getLogger(__name__)
 
 
 class VoiceInputError(RuntimeError):
@@ -382,32 +387,44 @@ class _PulseCliStream:
         if self._callback is None or self._pump is not None:
             return self
 
+        def notify_after_pump(error, reader):
+            reader.join()
+            if self._stop.is_set():
+                return
+            try:
+                if self._on_error is not None:
+                    self._on_error(error)
+            except Exception:
+                logger.exception("pulse_cli input error callback failed")
+            finally:
+                try:
+                    self.close()
+                except VoiceInputError:
+                    pass
+
         def pump():
             try:
                 while not self._stop.is_set():
                     data, overflowed = self.read(self._blocksize)
                     self._callback(data, len(data), None, overflowed)
             except VoiceInputError as exc:
-                if not self._stop.is_set() and self._on_error is not None:
-                    pump_thread = threading.current_thread()
+                error = exc
+            except Exception as exc:  # health: allow BLE001 -- pump boundary: normalize provider/callback faults into one scoped VoiceInputError
+                error = VoiceInputError(
+                    f"pulse_cli input callback failed: {exc}",
+                    stage="callback",
+                    retryable=False,
+                )
+            else:
+                return
+            if not self._stop.is_set():
+                spawn_context_thread(
+                    notify_after_pump,
+                    args=(error, threading.current_thread()),
+                    name="hermes-pulse-input-error",
+                ).start()
 
-                    def notify_after_pump(error, reader):
-                        reader.join()
-                        if self._stop.is_set():
-                            return
-                        try:
-                            self._on_error(error)
-                        except Exception:
-                            pass
-
-                    threading.Thread(
-                        target=notify_after_pump,
-                        args=(exc, pump_thread),
-                        name="hermes-pulse-input-error",
-                        daemon=True,
-                    ).start()
-
-        self._pump = threading.Thread(target=pump, name="hermes-pulse-input", daemon=True)
+        self._pump = spawn_context_thread(pump, name="hermes-pulse-input")
         self._pump.start()
         return self
 

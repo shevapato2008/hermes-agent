@@ -84,6 +84,8 @@ def owner(monkeypatch):
     monkeypatch.setattr(server, "_voice_lease_capture_id", None)
     monkeypatch.setattr(server, "_voice_release_tail_epoch", None)
     monkeypatch.setattr(server, "_voice_pending_idle_scope", None)
+    monkeypatch.setattr(server, "_voice_authority_sid", "")
+    monkeypatch.setattr(server, "_voice_authority_transport", None)
     monkeypatch.setattr(server, "_voice_terminal_error_epochs", set())
     monkeypatch.setattr(server, "_voice_release_retry_active", False)
     monkeypatch.setenv("HERMES_VOICE", "0")

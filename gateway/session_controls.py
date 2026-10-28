@@ -745,7 +745,17 @@ class AuthorityConnection:
         if not local_voice_enabled(ref.session_id):
             return False
         from tui_gateway import server
-        return await asyncio.to_thread(server._consume_typed_stop_phrase, text, ref.session_id, emit=False)
+        try:
+            return await asyncio.to_thread(
+                server._consume_typed_stop_phrase, text, ref.session_id, emit=False
+            )
+        except server._TypedVoiceStopError as exc:
+            refusal = RuntimeStoreError(
+                "voice_release_failed", detail=str(exc)
+            )
+            refusal.wire_code = 5025
+            refusal.wire_message = str(exc)
+            raise refusal from exc
 
     def submission(self, ref, params):
         """The admission a ``prompt.submit``-shaped request asks for (``prompt.replace_queued`` too)."""

@@ -10,27 +10,19 @@ from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
 method = _registry.method
+_profile_scoped = _registry.profile_scoped
 
-def _resume_wake_after_interrupt(session_id: str = "") -> None:
-    """Re-arm a wake lease held by the interrupt caller or a voice capture.
-
-    ``_wake_resume_if_owner`` no-ops unless that object holds the lease, so an
-    in-progress capture owned by someone else is not stolen. Interrupt already
-    silenced TTS before it can return an error; this matches that cut. A
-    ``not_interrupted`` hosted-task mismatch must not call it.
-    """
-    with _voice_sid_lock:
-        # Legacy captures may only have a wake owner. Once a scoped microphone
-        # lease exists, an interrupt from another session cannot resume it.
-        voice_owner = _voice_wake_owner if (
-            not _voice_lease_owner_sid or _voice_lease_owner_sid == session_id
-        ) else None
-    seen = []
-    for owner in (_caller_transport(), voice_owner):
-        if owner is None or any(owner is item for item in seen):
-            continue
-        seen.append(owner)
-        _wake_resume_if_owner(owner)
+def _resume_wake_after_interrupt(session_id: str = "", session=None) -> None:
+    """Re-arm only the interrupt caller's exact voice/wake authority."""
+    owner = _caller_transport()
+    scope = (
+        _session_profile_runtime_scope(session, hydrate_secrets=False)
+        if session is not None
+        else contextlib.nullcontext()
+    )
+    with scope:
+        if _voice_control_scope_accepts(session_id, owner):
+            _wake_resume_if_owner(owner)
 
 
 # ── interrupt / steer / redirect ─────────────────────────────────────
@@ -72,9 +64,11 @@ def _recover_unreachable_compute_host_turn(sid: str, session: dict, inflight_at_
 
 
 @method("session.interrupt")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     resume_wake = True
     sid = str(params.get("session_id") or "")
+    session = None
     try:
         session, err = _sess_nowait(params, rid)
         if err:
@@ -85,12 +79,9 @@ def _(rid, params: dict) -> dict:
                 if not (session.get("running") and isinstance(task, dict) and task.get("task_id") == expected):
                     resume_wake = False
                     return _ok(rid, {"status": "not_interrupted", "interrupted": False})
-        owner_sid, _epoch, _owner_transport, _capture_id = _voice_scope_snapshot()
-        if not owner_sid or owner_sid == sid:
-            # One speaker belongs to the active voice session. A typed Stop in
-            # another session still interrupts that agent, but never cuts the
-            # owner's reply audio.
-            _tts_stream_stop()
+        with _session_profile_runtime_scope(session, hydrate_secrets=False):
+            if _voice_control_scope_accepts(sid, _caller_transport()):
+                _tts_stream_stop()
         _note_user_input(session)
         if _session_uses_compute_host(session):
             with session["history_lock"]:
@@ -115,7 +106,7 @@ def _(rid, params: dict) -> dict:
     finally:
         if resume_wake:
             try:
-                _resume_wake_after_interrupt(sid)
+                _resume_wake_after_interrupt(sid, session)
             except Exception:
                 logger.debug("session.interrupt wake resume failed", exc_info=True)
 

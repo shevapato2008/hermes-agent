@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+from agent.memory_provider import spawn_context_thread
 from hermes_constants import is_termux as _is_termux_environment
 from hermes_platform.host.runtime import is_wsl
 from tools.voice_mode_transcript import _voice_config, is_voice_stop_phrase, is_whisper_hallucination
@@ -547,8 +548,11 @@ def start_thinking_sound(should_play=None) -> bool:
             return True
         stop = threading.Event()
         _thinking_stop = stop
-    threading.Thread(target=_thinking_sound_loop, args=(stop, should_play),
-                     daemon=True, name="voice-thinking-sound").start()
+    spawn_context_thread(
+        _thinking_sound_loop,
+        args=(stop, should_play),
+        name="voice-thinking-sound",
+    ).start()
     return True
 
 
