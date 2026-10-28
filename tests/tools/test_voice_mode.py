@@ -590,6 +590,118 @@ class TestPlayAudioFile:
         mock_sd_obj.play.assert_called_once()
         mock_sd_obj.stop.assert_called_once()
 
+    def test_linux_mp3_uses_gstreamer_decoder_instead_of_aplay(
+        self, monkeypatch, tmp_path
+    ):
+        from tools import voice_mode as vm
+
+        audio_path = tmp_path / "reply.mp3"
+        audio_path.write_bytes(b"ID3 audio")
+        started = []
+
+        class _FakeProc:
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(command, **_kwargs):
+            started.append(command)
+            return _FakeProc()
+
+        monkeypatch.setattr(vm.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(
+            vm.shutil,
+            "which",
+            lambda command: (
+                f"/usr/bin/{command}"
+                if command in {"gst-launch-1.0", "aplay"}
+                else None
+            ),
+        )
+        monkeypatch.setattr(vm.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(vm, "_active_playback", None)
+        monkeypatch.setattr(
+            "tools.environments.local.hermes_subprocess_env", lambda **_kwargs: {}
+        )
+
+        assert vm._play_audio_file_impl(str(audio_path)) is True
+        assert started == [
+            [
+                "gst-launch-1.0",
+                "-q",
+                "filesrc",
+                f"location={audio_path}",
+                "!",
+                "decodebin",
+                "!",
+                "audioconvert",
+                "!",
+                "audioresample",
+                "!",
+                "pulsesink",
+            ]
+        ]
+
+    def test_linux_mp3_gstreamer_failure_does_not_fall_back_to_aplay(
+        self, monkeypatch, tmp_path
+    ):
+        from tools import voice_mode as vm
+
+        audio_path = tmp_path / "reply.mp3"
+        audio_path.write_bytes(b"not really mp3")
+        started = []
+
+        class _FailedProc:
+            returncode = 1
+
+            def wait(self, timeout=None):
+                return 1
+
+        monkeypatch.setattr(vm.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(
+            vm.shutil,
+            "which",
+            lambda command: (
+                f"/usr/bin/{command}"
+                if command in {"gst-launch-1.0", "aplay"}
+                else None
+            ),
+        )
+        monkeypatch.setattr(
+            vm.subprocess,
+            "Popen",
+            lambda command, **_kwargs: (started.append(command) or _FailedProc()),
+        )
+        monkeypatch.setattr(vm, "_active_playback", None)
+        monkeypatch.setattr(
+            "tools.environments.local.hermes_subprocess_env", lambda **_kwargs: {}
+        )
+
+        assert vm._play_audio_file_impl(str(audio_path)) is False
+        assert len(started) == 1
+        assert started[0][0] == "gst-launch-1.0"
+
+    def test_linux_mp3_never_falls_back_to_aplay(self, monkeypatch, tmp_path):
+        from tools import voice_mode as vm
+
+        audio_path = tmp_path / "reply.mp3"
+        audio_path.write_bytes(b"ID3 audio")
+        started = []
+
+        monkeypatch.setattr(vm.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(
+            vm.shutil,
+            "which",
+            lambda command: "/usr/bin/aplay" if command == "aplay" else None,
+        )
+        monkeypatch.setattr(
+            vm.subprocess, "Popen", lambda command, **_kwargs: started.append(command)
+        )
+
+        assert vm._play_audio_file_impl(str(audio_path)) is False
+        assert started == []
+
 # ============================================================================
 # macOS output policy (no sounddevice for OUTPUT -> avoids TCC prompt)
 # ============================================================================

@@ -212,6 +212,7 @@ def _install_fake_openwakeword(monkeypatch):
     monkeypatch.setitem(sys.modules, "openwakeword", oww)
     monkeypatch.setitem(sys.modules, "openwakeword.model", model_mod)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
+    monkeypatch.setattr(ww, "ensure_tflite_runtime", lambda: True)
     return calls
 
 
@@ -306,7 +307,8 @@ def _openwakeword_engine_with_scores(monkeypatch, cfg_wake, scores):
             self.models = {"hey_hermes": object()}
 
         def predict(self, frame):
-            return {"hey_hermes": next(seq)}
+            value = next(seq)
+            return value if isinstance(value, dict) else {"hey_hermes": value}
 
         def reset(self):
             pass
@@ -320,6 +322,43 @@ def _openwakeword_engine_with_scores(monkeypatch, cfg_wake, scores):
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
     monkeypatch.setattr(ww, "ensure_tflite_runtime", lambda: True)
     return ww._OpenWakeWordEngine({"provider": "openwakeword", **cfg_wake})
+
+
+def test_openwakeword_diagnostics_reset_scores_without_changing_fire(monkeypatch):
+    eng = _openwakeword_engine_with_scores(
+        monkeypatch,
+        {"sensitivity": 0.5, "confirmation_frames": 3},
+        [
+            {"hey_hermes": 0.61, "background": 0.20},
+            {"hey_hermes": 0.70, "background": 0.81},
+            {"hey_hermes": 0.62, "background": 0.10},
+        ],
+    )
+
+    assert eng.process([0]) is False
+    assert eng.process([0]) is False
+    assert eng.score_diagnostics() == {
+        "latest": 0.81,
+        "latest_label": "background",
+        "peak": 0.81,
+        "peak_label": "background",
+        "threshold": 0.5,
+        "confirmation_streak": 2,
+        "confirmation_frames": 3,
+    }
+
+    # Reset is diagnostic-only: it clears the score window but preserves the
+    # live detector's two-frame confirmation streak.
+    assert eng.score_diagnostics(reset=True) == {
+        "latest": None,
+        "latest_label": None,
+        "peak": None,
+        "peak_label": None,
+        "threshold": 0.5,
+        "confirmation_streak": 2,
+        "confirmation_frames": 3,
+    }
+    assert eng.process([0]) is True
 
 
 # ── sherpa-onnx open-vocabulary engine ───────────────────────────────────
@@ -781,3 +820,121 @@ def test_feed_audio_rejects_wrong_owner(monkeypatch, tmp_path):
     ww.start_listening(lambda: None, owner=owner, config={}, external_audio=True)
     assert ww.feed_audio(owner=object(), pcm_int16=b"\x00\x00") is False
     assert ww.stop_listening(owner=owner) is True
+
+
+def test_client_capture_diagnostics_aggregate_and_reset_for_owner(monkeypatch):
+    import json
+
+    np = pytest.importorskip("numpy")
+    engine = _FakeEngine(fire=False)
+    detector = ww.WakeWordDetector(engine, lambda: None, external_audio=True)
+    owner = object()
+    other = object()
+    monkeypatch.setattr(ww, "_detector", detector)
+    monkeypatch.setattr(ww, "_detector_owner", owner)
+
+    # Fill the bounded client queue without starting its consumer. Two oldest
+    # frames are dropped, while depth stays capped at 64.
+    pcm = np.array([100, -900, 250, 10], dtype=np.int16)
+    for _ in range(66):
+        detector.feed(pcm)
+
+    assert ww.get_wake_diagnostics(owner=other, reset=True) == {
+        "armed": True,
+        "owned_by_caller": False,
+        "reason": "not_owner",
+    }
+    queued = ww.get_wake_diagnostics(owner=owner)
+    assert queued["client_queue"] == {"depth": 64, "drops": 2}
+    assert queued["processed_frames"] == 0
+    assert queued["pcm_peak"] == {"latest": None, "peak": None}
+    assert queued["capture"] == "client"
+    assert queued["external_audio"] is True
+    assert "score" not in queued  # unsupported engines never fake a score
+
+    detector.start()
+    try:
+        detector.feed(pcm)
+        deadline = time.monotonic() + 2.0
+        observed = ww.get_wake_diagnostics(owner=owner)
+        while observed["processed_frames"] < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+            observed = ww.get_wake_diagnostics(owner=owner)
+        assert observed["processed_frames"] >= 1
+        assert observed["pcm_peak"] == {"latest": 900, "peak": 900}
+        assert observed["client_queue"]["drops"] == 2
+        json.dumps(observed, allow_nan=False)
+
+        lifecycle_resets = engine.resets
+        cleared = ww.get_wake_diagnostics(owner=owner, reset=True)
+        assert cleared["processed_frames"] == 0
+        assert cleared["pcm_peak"] == {"latest": None, "peak": None}
+        assert cleared["client_queue"]["drops"] == 0
+        assert detector.running is True
+        assert engine.closed is False
+        assert engine.resets == lifecycle_resets
+    finally:
+        detector.stop()
+
+    # A stale owner identity cannot make a stopped detector's values visible.
+    monkeypatch.setattr(ww, "_detector", None)
+    assert ww.get_wake_diagnostics(owner=owner) == {
+        "armed": False,
+        "owned_by_caller": False,
+        "reason": "unarmed",
+    }
+
+
+def test_local_playback_openwakeword_hit_fires_without_stt_request(
+    monkeypatch, tmp_path
+):
+    """A normal-threshold hit interrupts playback without a second STT gate."""
+    import httpx
+
+    engine = _openwakeword_engine_with_scores(
+        monkeypatch,
+        {"sensitivity": 0.35, "confirmation_frames": 1},
+        [0.36] + [0.0] * 40,
+    )
+    fake_sd = types.SimpleNamespace(InputStream=lambda **kw: _LoudStream(**kw))
+    monkeypatch.setattr(ww, "_import_audio", lambda: (fake_sd, None))
+    monkeypatch.setattr(ww, "_build_engine", lambda _cfg: engine)
+    monkeypatch.setattr(ww, "_lock_path", lambda: tmp_path / "wake.lock")
+
+    from tools import voice_mode
+
+    http_client_calls = []
+
+    class _UnexpectedHttpClient:
+        def __init__(self, **kwargs):
+            http_client_calls.append(kwargs)
+
+    monkeypatch.setattr(httpx, "Client", _UnexpectedHttpClient)
+
+    owner = object()
+    fired = threading.Event()
+    voice_mode.mark_audio_output_active(True)
+    try:
+        ww.start_listening(
+            fired.set,
+            owner=owner,
+            config={
+                "provider": "openwakeword",
+                "sensitivity": 0.35,
+                "confirmation_frames": 1,
+                # A stale config block must not resurrect the removed verifier.
+                "playback_verification": {
+                    "enabled": True,
+                    "candidate_threshold": 0.015,
+                },
+            },
+        )
+        deadline = time.monotonic() + 2.0
+        while not fired.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert fired.is_set() is True
+        assert http_client_calls == []
+    finally:
+        ww.stop_listening(owner=owner)
+        voice_mode.mark_audio_output_active(False)
