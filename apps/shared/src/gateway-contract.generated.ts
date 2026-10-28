@@ -3011,6 +3011,7 @@ export interface VoiceRecordResult {
   reason?: string | null
   owner_session_id?: string
   lease_epoch?: number
+  previous_lease_epoch?: number | null
   capture_id?: string | null
   released?: boolean | null
   release_complete?: boolean | null
@@ -6051,7 +6052,7 @@ export interface VoiceInterruptedPayload {
   lease_epoch: number
   capture_id?: string | null
 }
-/** A physical successor under the same logical SmartBox voice authority. */
+/** A physical successor under the same logical voice authority. */
 export interface VoiceLeaseChangedPayload {
   owner_session_id: string
   lease_epoch: number
@@ -6059,7 +6060,7 @@ export interface VoiceLeaseChangedPayload {
   previous_lease_epoch: number
   phase: VoiceLeasePhase
 }
-export type VoiceLeasePhase = 'full_duplex' | 'output_drain'
+export type VoiceLeasePhase = 'full_duplex' | 'output_drain' | 'ordinary_record'
 /** ``methods_voice._vr_on_status``; states come from the recorder (idle / listening / transcribing …). */
 export interface VoiceStatusPayload {
   owner_session_id: string

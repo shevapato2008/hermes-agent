@@ -46536,7 +46536,7 @@
       },
       "VoiceLeaseChangedPayload": {
         "additionalProperties": false,
-        "description": "A physical successor under the same logical SmartBox voice authority.",
+        "description": "A physical successor under the same logical voice authority.",
         "properties": {
           "owner_session_id": {
             "title": "Owner Session Id",
@@ -46578,7 +46578,8 @@
       "VoiceLeasePhase": {
         "enum": [
           "full_duplex",
-          "output_drain"
+          "output_drain",
+          "ordinary_record"
         ],
         "title": "VoiceLeasePhase",
         "type": "string"
@@ -46721,6 +46722,18 @@
             "default": 0,
             "title": "Lease Epoch",
             "type": "integer"
+          },
+          "previous_lease_epoch": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Previous Lease Epoch"
           },
           "capture_id": {
             "anyOf": [

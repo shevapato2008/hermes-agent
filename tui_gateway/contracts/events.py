@@ -803,10 +803,11 @@ class VoiceInterruptedPayload(VoiceScopePayload):
 class VoiceLeasePhase(WireEnum):
     full_duplex = "full_duplex"
     output_drain = "output_drain"
+    ordinary_record = "ordinary_record"
 
 
 class VoiceLeaseChangedPayload(VoiceScopePayload):
-    """A physical successor under the same logical SmartBox voice authority."""
+    """A physical successor under the same logical voice authority."""
 
     previous_lease_epoch: int
     phase: VoiceLeasePhase

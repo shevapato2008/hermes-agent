@@ -29,13 +29,16 @@ class _Mic:
     def __init__(self):
         self.active = False
         self.callbacks = {}
+        self.stop_impl = None
 
     def start_continuous(self, **kwargs):
         self.active = True
         self.callbacks = kwargs
         return True
 
-    def stop_continuous(self, **_kwargs):
+    def stop_continuous(self, **kwargs):
+        if self.stop_impl is not None:
+            return self.stop_impl(**kwargs)
         self.active = False
 
     def is_continuous_active(self):
@@ -128,6 +131,45 @@ def test_silent_ordinary_capture_reports_no_speech_after_release(phase_voice):
     assert payload["capture_id"] == started["result"]["capture_id"]
 
 
+def test_silent_capture_relisten_announces_the_ordinary_successor_epoch(
+    phase_voice, monkeypatch
+):
+    owner = _Sink()
+    first = phase_voice.rpc(
+        owner, "voice.record", action="start", session_id="runtime"
+    )
+    phase_voice.mic.active = False
+    phase_voice.mic.callbacks["on_status"]("idle")
+    terminal = _events(owner, "voice.status")[-1]["payload"]
+    assert terminal["outcome"] == "no_speech"
+    assert terminal["lease_epoch"] == first["result"]["lease_epoch"]
+    assert _events(owner, "voice.lease_changed") == []
+
+    original_start = phase_voice.mic.start_continuous
+    transitions_at_start = []
+
+    def start_continuous(**kwargs):
+        transitions_at_start.extend(_events(owner, "voice.lease_changed"))
+        return original_start(**kwargs)
+
+    monkeypatch.setattr(phase_voice.mic, "start_continuous", start_continuous)
+    second = phase_voice.rpc(
+        owner, "voice.record", action="start", session_id="runtime"
+    )
+
+    assert second["result"]["lease_epoch"] > first["result"]["lease_epoch"]
+    assert second["result"]["previous_lease_epoch"] == first["result"]["lease_epoch"]
+    assert second["result"]["capture_id"] != first["result"]["capture_id"]
+    assert [event["payload"] for event in transitions_at_start] == [
+        {
+            "owner_session_id": "runtime",
+            "lease_epoch": second["result"]["lease_epoch"],
+            "previous_lease_epoch": first["result"]["lease_epoch"],
+            "phase": "ordinary_record",
+        }
+    ]
+
+
 def test_record_to_full_duplex_announces_successor_epoch_before_listener(
     phase_voice, monkeypatch
 ):
@@ -167,6 +209,172 @@ def test_record_to_full_duplex_announces_successor_epoch_before_listener(
     assert server._arm_full_duplex_listener("runtime", owner) is True
     assert len(_events(owner, "voice.lease_changed")) == 1
     assert len(starts) == 1
+
+
+def test_transcript_releases_before_turn_claims_a_successor_epoch(
+    phase_voice, monkeypatch
+):
+    owner = _Sink()
+    first = phase_voice.rpc(
+        owner, "voice.record", action="start", session_id="runtime"
+    )
+    old_idle = phase_voice.mic.callbacks["on_status"]
+    starts = []
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_start_voice_thread",
+        lambda target, *, name, args=(): starts.append((name, args))
+        or types.SimpleNamespace(),
+    )
+    turn_threads = []
+    turn_results = []
+    original_write = owner.write
+
+    def write(frame):
+        written = original_write(frame)
+        if frame.get("params", {}).get("type") == "voice.transcript":
+            thread = threading.Thread(
+                target=lambda: turn_results.append(
+                    server._start_turn_voice("runtime", owner)
+                )
+            )
+            turn_threads.append(thread)
+            thread.start()
+        return written
+
+    monkeypatch.setattr(owner, "write", write)
+    phase_voice.mic.callbacks["on_transcript"]("hello")
+    assert len(turn_threads) == 1
+    turn_threads[0].join(2)
+    assert not turn_threads[0].is_alive()
+
+    # The recorder's old idle may arrive after prompt.submit has already armed
+    # the turn listener. It must be stale and unable to release that successor.
+    old_idle("idle")
+
+    transitions = _events(owner, "voice.lease_changed")
+    assert len(transitions) == 1
+    payload = transitions[0]["payload"]
+    assert payload == {
+        "owner_session_id": "runtime",
+        "lease_epoch": server._voice_lease_epoch,
+        "previous_lease_epoch": first["result"]["lease_epoch"],
+        "phase": "full_duplex",
+    }
+    assert payload["lease_epoch"] > first["result"]["lease_epoch"]
+    assert server._voice_lease_owner_sid == "runtime"
+    assert server._voice_lease_owner_transport is owner
+    assert starts == [
+        ("voice-full-duplex", ("runtime", payload["lease_epoch"], owner))
+    ]
+    assert len(turn_results) == 1
+
+
+def test_forced_stop_transcript_waits_for_inflight_physical_release(
+    phase_voice, monkeypatch
+):
+    from tools import voice_input
+
+    owner = _Sink()
+    phase_voice.rpc(owner, "voice.record", action="start", session_id="runtime")
+    callback = phase_voice.mic.callbacks["on_transcript"]
+    callback_started = threading.Event()
+    callback_done = threading.Event()
+    release_started = threading.Event()
+    allow_release = threading.Event()
+
+    def deliver_tail():
+        callback_started.set()
+        callback("final words")
+        callback_done.set()
+
+    callback_thread = threading.Thread(target=deliver_tail, name="forced-stop-tail")
+
+    def stop_and_transcribe(**_kwargs):
+        phase_voice.mic.active = False
+        callback_thread.start()
+
+    def blocking_release(**_kwargs):
+        release_started.set()
+        assert allow_release.wait(1)
+        return True
+
+    phase_voice.mic.stop_impl = stop_and_transcribe
+    monkeypatch.setattr(voice_input, "release_voice_input", blocking_release)
+    stop_reply = {}
+    stop_thread = threading.Thread(
+        target=lambda: stop_reply.update(
+            phase_voice.rpc(
+                owner, "voice.record", action="stop", session_id="runtime"
+            )
+        ),
+        name="forced-stop",
+    )
+    stop_thread.start()
+    assert callback_started.wait(1)
+    assert release_started.wait(1)
+    assert not callback_done.wait(0.1)
+
+    allow_release.set()
+    stop_thread.join(1)
+    callback_thread.join(1)
+
+    assert stop_reply["result"]["release_complete"] is True
+    assert [event["payload"]["text"] for event in _events(owner, "voice.transcript")] == [
+        "final words"
+    ]
+    assert _events(owner, "voice.input_error") == []
+
+
+def test_unowned_capture_stop_fences_same_transport_successor_start(
+    phase_voice, monkeypatch
+):
+    owner = _Sink()
+    phase_voice.rpc(owner, "voice.record", action="start", session_id="runtime")
+    phase_voice.mic.callbacks["on_transcript"]("first turn")
+    assert server._voice_lease_owner_transport is None
+    assert phase_voice.mic.active is True
+
+    successor_checked = threading.Event()
+    successor_done = threading.Event()
+    successor_reply = {}
+    original_capture_live = server._capture_live
+
+    def capture_live():
+        if threading.current_thread().name == "successor-record":
+            successor_checked.set()
+        return original_capture_live()
+
+    monkeypatch.setattr(server, "_capture_live", capture_live)
+
+    def start_successor():
+        successor_reply.update(
+            phase_voice.rpc(
+                owner, "voice.record", action="start", session_id="successor"
+            )
+        )
+        successor_done.set()
+
+    successor = threading.Thread(target=start_successor, name="successor-record")
+
+    def stop_old_wrapper(**_kwargs):
+        # The old wrapper finishes naturally after its active probe.  A same-
+        # transport successor may now pass its preflight, but must not claim or
+        # start until this old stop has returned through the lifecycle barrier.
+        phase_voice.mic.active = False
+        successor.start()
+        assert successor_checked.wait(1)
+        assert not successor_done.wait(0.1)
+
+    phase_voice.mic.stop_impl = stop_old_wrapper
+    assert server._stop_session_voice_capture("runtime", transport=owner) is True
+    successor.join(1)
+
+    assert not successor.is_alive()
+    assert successor_reply["result"]["status"] == "recording"
+    assert server._voice_lease_owner_sid == "successor"
+    assert phase_voice.mic.active is True
 
 
 def test_record_to_output_drain_announces_successor_epoch_before_monitor(

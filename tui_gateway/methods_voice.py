@@ -46,6 +46,16 @@ def _stop_session_voice_capture(
     session_id, *, transport=None, lease_epoch: int | None = None,
 ) -> bool:
     """Release *session_id*'s capture without touching another owner's input."""
+    with _voice_lifecycle_lock:
+        return _stop_session_voice_capture_guarded(
+            session_id, transport=transport, lease_epoch=lease_epoch
+        )
+
+
+def _stop_session_voice_capture_guarded(
+    session_id, *, transport=None, lease_epoch: int | None = None,
+) -> bool:
+    """Stop the captured wrapper while successor claim/start remains fenced."""
     global _voice_capture_gen
     with _voice_sid_lock:
         owner = _voice_lease_owner_sid
@@ -53,9 +63,24 @@ def _stop_session_voice_capture(
         owner_transport = _voice_lease_owner_transport
         capture_id = _voice_lease_capture_id
         if not owner:
-            return True
+            captured_transport = _voice_event_transport
+            captured_unowned = (
+                bool(session_id)
+                and session_id == _voice_capture_sid
+                and captured_transport is not None
+                and (transport is None or transport is captured_transport)
+                and (lease_epoch is None or lease_epoch == epoch)
+            )
+            if captured_unowned:
+                # The real recorder closes its provider before delivering the
+                # transcript, but its logical loop remains active until the
+                # subsequent idle callback.  A session-local /voice off in
+                # that gap must still invalidate and stop that captured loop.
+                _voice_capture_gen += 1
+        else:
+            captured_unowned = False
         caller = owner_transport if transport is None else transport
-        if (
+        if owner and (
             not session_id
             or session_id != owner
             or caller is not owner_transport
@@ -63,7 +88,14 @@ def _stop_session_voice_capture(
             or _current_voice_profile_home() != _voice_lease_profile_home
         ):
             return False
-        _voice_capture_gen += 1
+        if owner:
+            _voice_capture_gen += 1
+    if not owner:
+        if not captured_unowned or _capture_active_state() is False:
+            return True
+        from hermes_cli.voice import stop_continuous
+        stop_continuous()
+        return not _capture_live()
     released, error = _release_voice_lease(
         session_id=owner, lease_epoch=epoch, transport=owner_transport, stop_loop=True,
         before_expose=lambda: _resume_voice_wake(
@@ -1680,17 +1712,33 @@ def _(rid, params: dict) -> dict:
                 owner, epoch, owner_transport, capture_id = _voice_scope_snapshot()
         unleased_capture = owner_transport is None and capture_live
         requested_capture = capture_id or uuid.uuid4().hex
-        epoch = _claim_voice_authority(
-            sid,
-            transport,
-            capture_id=requested_capture,
-            allow_unclaimed=True,
-            allow_same_transport_handoff=same_transport_handoff,
-            release_all=unleased_capture,
-        )
-        if epoch is None:
-            return _err(rid, 4016, "voice capture is busy in another session")
-        owner, epoch, owner_transport, capture_id = _voice_scope_snapshot()
+        with _voice_lifecycle_lock:
+            predecessor_sid, predecessor_transport = _voice_authority_snapshot()
+            _, predecessor_epoch, _, _ = _voice_scope_snapshot()
+            previous_epoch = (
+                predecessor_epoch
+                if predecessor_sid == sid and predecessor_transport is transport
+                else None
+            )
+            epoch = _claim_voice_authority(
+                sid,
+                transport,
+                capture_id=requested_capture,
+                allow_unclaimed=True,
+                allow_same_transport_handoff=same_transport_handoff,
+                release_all=unleased_capture,
+            )
+            if epoch is None:
+                return _err(rid, 4016, "voice capture is busy in another session")
+            owner, epoch, owner_transport, capture_id = _voice_scope_snapshot()
+            record_predecessor_epoch = (
+                previous_epoch
+                if previous_epoch is not None and previous_epoch > 0 and previous_epoch != epoch
+                else None
+            )
+            _emit_voice_lease_changed(
+                owner, epoch, owner_transport, record_predecessor_epoch, "ordinary_record"
+            )
         scope = (owner, epoch, owner_transport, capture_id)
         with _voice_sid_lock:
             _voice_event_sid = sid or _voice_event_sid
@@ -1715,15 +1763,59 @@ def _(rid, params: dict) -> dict:
         # instead of falling back to the documented 200 / 3.0 defaults (Copilot round-12 on #19835).
         voice_cfg = _voice_cfg_dict()
         max_rec = _voice_cfg_number(voice_cfg.get("max_recording_seconds"), 120.0)
-        transcript_delivered = threading.Event()
+        transcript_ready = threading.Event()
 
         def live(fn):
             return _voice_capture_callback(
                 fn, session_id=owner, lease_epoch=epoch, transport=owner_transport)
 
+        def release_and_publish_transcript(text: str) -> None:
+            current_owner, current_epoch, current_transport, _ = _voice_scope_snapshot()
+            if (
+                current_epoch == epoch
+                and current_transport is None
+                and not current_owner
+            ):
+                # A forced stop already released this captured epoch.  Its
+                # recorder is still entitled to one final transcript tail.
+                _vr_emit("voice.transcript", {"text": text}, scope)
+                return
+            _mark_voice_release_tail(epoch)
+
+            def publish_after_release() -> None:
+                _resume_voice_wake(
+                    expected_transport=owner_transport,
+                    expected_epoch=epoch,
+                )
+                _vr_emit("voice.transcript", {"text": text}, scope)
+
+            released, release_error = _release_voice_lease(
+                session_id=owner,
+                lease_epoch=epoch,
+                transport=owner_transport,
+                stop_loop=False,
+                before_expose=publish_after_release,
+            )
+            if not released:
+                from tools.voice_input import VoiceInputReleaseError
+
+                _voice_terminal_error_epochs.add(epoch)
+                _vr_emit(
+                    "voice.input_error",
+                    _input_error_payload(
+                        VoiceInputReleaseError(release_error), released=False
+                    ),
+                    scope,
+                )
+
         def on_transcript(text: str) -> None:
-            if _vr_emit("voice.transcript", {"text": text}, scope):
-                transcript_delivered.set()
+            transcript_ready.set()
+            # A forced-stop tail may arrive on its background worker while
+            # the stop RPC still owns the physical-release fence.  Wait for
+            # that exact release to expose its terminal scope before deciding
+            # whether this callback must release or only publish the tail.
+            with _voice_lifecycle_lock:
+                release_and_publish_transcript(text)
 
         with _voice_input_start_barrier(owner, epoch, owner_transport) as can_start:
             if not can_start:
@@ -1742,7 +1834,7 @@ def _(rid, params: dict) -> dict:
             started = start_continuous(
                 on_transcript=live(on_transcript),
                 on_status=live(lambda state: _vr_on_status(
-                    state, scope, had_transcript=transcript_delivered.is_set())),
+                    state, scope, had_transcript=transcript_ready.is_set())),
                 on_silent_limit=live(lambda: _vr_on_silent_limit(scope)),
                 silence_threshold=_voice_cfg_number(voice_cfg.get("silence_threshold"), 200),
                 silence_duration=_voice_cfg_number(voice_cfg.get("silence_duration"), 3.0),
@@ -1766,10 +1858,16 @@ def _(rid, params: dict) -> dict:
                     session_id=owner, lease_epoch=epoch, transport=owner_transport,
                     capture_id=capture_id)
                 return _err(rid, 5025, release_error)
+        result_extra = (
+            {"previous_lease_epoch": record_predecessor_epoch}
+            if started is not False and record_predecessor_epoch is not None
+            else {}
+        )
         return _ok(rid, _voice_result_scope(
             session_id=owner, lease_epoch=epoch, capture_id=capture_id,
             status="busy" if started is False else "recording",
-            released=started is False, release_complete=started is False))
+            released=started is False, release_complete=started is False,
+            **result_extra))
     except Exception as e:
         owner, epoch, owner_transport, capture_id = _voice_scope_snapshot()
         released = False

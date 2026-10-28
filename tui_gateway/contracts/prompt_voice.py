@@ -406,6 +406,7 @@ class VoiceRecordResult(Result):
     reason: str | None = None  # "wake_owned" when another surface holds the mic
     owner_session_id: str = ""
     lease_epoch: int = 0
+    previous_lease_epoch: int | None = None
     capture_id: str | None = None
     released: bool | None = None
     release_complete: bool | None = None
