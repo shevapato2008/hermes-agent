@@ -15689,8 +15689,8 @@ def test_ensure_session_db_row_true_when_row_persisted(monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
-    assert server._ensure_session_db_row({"session_key": "k1", "cwd": "/tmp"}) is True
-    assert created == ["k1"]
+    assert server._ensure_session_db_row(session := {"session_key": "k1", "cwd": "/tmp"}) is True
+    assert (created, session.get("_session_row_persisted")) == (["k1"], True)
 
 
 def test_prompt_submit_fails_loudly_when_store_unavailable(monkeypatch):

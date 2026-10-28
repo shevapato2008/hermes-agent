@@ -292,7 +292,7 @@ def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: li
                             source=source, cwd=None if _is_remote_launch_cwd(record) else record["cwd"],
                             profile_name=profile_name_for_home(profile_home) or _current_profile_name(),
                             model=_session_default_route(record)[0], compensate=True, title_source="derived", user_id=_session_auth_user_id(record))
-            record["pending_title"] = None
+            record.update(_session_row_persisted=True, pending_title=None)
             # The first submit's _persist_branch_seed is the fallback for a failed seed, not a second copy.
             record["_branch_seed_persisted"] = True
     except Exception:
@@ -315,8 +315,8 @@ def _seed_row(record: dict) -> None:
         logger.warning("seeded-session persistence failed for %s; falling back to lazy row creation", key, exc_info=True)
     if not record.get("_branch_seed_persisted"):
         with contextlib.suppress(Exception), _session_db(record) as db:
-            if db is not None:
-                db.discard_unadmitted_session(key)
+            if db is not None and db.discard_unadmitted_session(key):
+                record["_session_row_persisted"] = False
         return
     try:
         if title := record.get("pending_title"):
@@ -413,7 +413,7 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) -> 
     now = time.time()
     with _sessions_lock:
         _sessions[sid] = {
-            "agent": None, "agent_error": None, "agent_ready": threading.Event(), "attached_images": [],
+            "_session_row_persisted": False, "agent": None, "agent_error": None, "agent_ready": threading.Event(), "attached_images": [],
             "close_on_disconnect": _flag(params, "close_on_disconnect"),
             "active_session_lease": None,  # claimed lazily on the first turn (_ensure_active_session_slot)
             "cols": int(params.get("cols", 80)), "created_at": now, "edit_snapshots": {},
@@ -705,17 +705,16 @@ class _Resume:
         return [] if self.omit_messages else self.db.get_ancestor_display_prefix(self.target)
 
 
-def _find_live_unpersisted(needle: str, home) -> str:
+def _find_live_unpersisted(needle: str, home, *, explicit_only: bool = False) -> str:
     """Runtime sid of a live, not-yet-persisted session matched by stored key or pending title."""
     want_home = str(home) if home is not None else None
     return next((
         live_sid for live_sid, record in list(_sessions.items())
         if isinstance(record, dict) and (record.get("profile_home") or None) == want_home
-        # Cold/deferred/lazy durable resumes also live in this registry while
-        # hydrating, but carry their original durable lineage key. They must
-        # keep the native DB/reuse path (including hydrating truth and rotated
-        # compression tips) rather than masquerade as a fresh draft.
+        # Durable resumes carry their lineage key and must keep the native DB/reuse path.
         and not record.get("resume_session_id")
+        # Pre-DB accepts explicit drafts; DB-miss fallback accepts legacy drafts.
+        and (record.get("_session_row_persisted") is False if explicit_only else record.get("_session_row_persisted") is not True)
         and (str(record.get("session_key") or "") == needle or (record.get("pending_title") or "") == needle)), "")
 
 
@@ -832,6 +831,8 @@ def _resume_locate(ctx: _Resume) -> dict | None:
         # with empty history — the live mirror streams the turn and the row exists by upgrade time.
         ctx.found = {}
         return None
+    if (live_sid := _find_live_unpersisted(ctx.target, ctx.profile_home)) and (live := _sessions.get(live_sid)) is not None:
+        return _resume_live_unpersisted(ctx, live_sid, live)
     if ctx.owns_db:
         _resume_adopt_stranded(ctx)
     # SmartBox voice keys are ephemeral reconnect handles. If their live record
@@ -1085,9 +1086,8 @@ def _(rid, params: dict) -> dict:
     if not (target := params.get("session_id", "")):
         return _err(rid, 4006, "session_id required")
     ctx = _Resume(rid, params, target)
-    # A freshly-created lazy session has no state.db row. Match the exact profile-scoped live record before
-    # opening SQLite; otherwise a reconnect needlessly depends on (and can be blocked by) the durable store.
-    live_sid = _find_live_unpersisted(ctx.target, ctx.profile_home)
+    # Explicit live drafts reattach without opening SQLite; all others keep DB-first behavior.
+    live_sid = _find_live_unpersisted(ctx.target, ctx.profile_home, explicit_only=True)
     if (live := _sessions.get(live_sid) if live_sid else None) is not None:
         return _resume_live_unpersisted(ctx, live_sid, live)
     # Profile scope: a DEDICATED handle we own until the agent takes it; else the shared launch db.

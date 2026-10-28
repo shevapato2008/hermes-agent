@@ -36,6 +36,7 @@ def live_lazy_session(home):
     """A live registry record shaped like session.create's lazy output."""
     sid = "live-lazy-1"
     record = {
+        "_session_row_persisted": False,
         "history": [],
         "history_lock": threading.Lock(),
         "last_active": 0.0,

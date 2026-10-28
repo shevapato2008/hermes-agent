@@ -665,11 +665,13 @@ def _teardown_popped_session(session: dict | None, *, end_reason: str = "tui_clo
     authority_sid, authority_transport = _voice_authority_snapshot()
     if sid == owner_sid and owner_transport is not None:
         _release_voice_for_transport(
-            owner_transport, expected_session_id=sid, expected_epoch=epoch
+            owner_transport, expected_session_id=sid, expected_epoch=epoch,
+            resume_wake=end_reason == "tui_close",
         )
     elif sid == authority_sid and authority_transport is not None:
         _release_voice_for_transport(
-            authority_transport, expected_session_id=sid, expected_epoch=epoch
+            authority_transport, expected_session_id=sid, expected_epoch=epoch,
+            resume_wake=end_reason == "tui_close",
         )
     try:
         _teardown_session(session, end_reason=end_reason)

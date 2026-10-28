@@ -19,11 +19,14 @@
     }
   ],
   "messages_omitted": false,
+  "persisted": true,
+  "queued": null,
   "resumed": "stored-running",
   "running": true,
   "session_id": "rt-running",
   "session_key": "stored-running",
   "started_at": 1700000000.0,
   "status": "working",
+  "stored_session_id": "stored-running",
   "turn_started_at": 1700000123.5
 }

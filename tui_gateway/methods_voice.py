@@ -1181,6 +1181,7 @@ def _voice_toggle_mode(rid, params: dict) -> dict:
         def finish_off() -> None:
             _voice_toggle_off_cleanup()
             _clear_voice_authority(session_id=sid, transport=caller)
+            _resume_voice_wake(expected_transport=transport)
 
         released, error = _release_voice_lease(
             session_id=owner, lease_epoch=epoch, transport=transport, stop_loop=True,
@@ -1400,11 +1401,26 @@ def _stop_voice_recording(rid, sid: str, transport) -> dict:
     owner, _epoch, _owner_transport, _capture_id = _voice_scope_snapshot()
     had_owner = bool(owner)
     _authority_sid, authority_transport = _voice_authority_snapshot()
+    capture_live = _capture_live()
+    if not had_owner and not capture_live:
+        if not _voice_authority_accepts(sid, transport, allow_unclaimed=True):
+            return _err(rid, 4016, "voice capture is owned by another session")
+        return _ok(
+            rid,
+            _voice_result_scope(
+                session_id="",
+                lease_epoch=_epoch,
+                status="stopped",
+                released=True,
+                release_complete=True,
+            ),
+        )
+    temporary_authority = authority_transport is None
     epoch = _claim_voice_authority(
         sid,
         transport,
         allow_unclaimed=authority_transport is None,
-        release_all=not had_owner and _capture_live(),
+        release_all=not had_owner and capture_live,
     )
     if epoch is None:
         return _err(rid, 4016, "voice capture is owned by another session")
@@ -1413,6 +1429,11 @@ def _stop_voice_recording(rid, sid: str, transport) -> dict:
         with _voice_sid_lock:
             _voice_event_sid = sid or _voice_event_sid
             _voice_event_transport = transport
+    temporary_cleanup = (
+        lambda *_args: _clear_voice_authority(
+            session_id=owner, transport=owner_transport
+        )
+    ) if temporary_authority else None
     _mark_voice_release_tail(epoch)
     released, error = _release_voice_lease(
         session_id=owner,
@@ -1420,6 +1441,8 @@ def _stop_voice_recording(rid, sid: str, transport) -> dict:
         transport=owner_transport,
         stop_loop=True,
         force_transcribe=True,
+        before_expose=temporary_cleanup,
+        on_failure=temporary_cleanup,
     )
     if not released:
         from tools.voice_input import VoiceInputReleaseError

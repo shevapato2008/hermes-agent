@@ -150,11 +150,16 @@ def test_record_after_toggle_allocates_capture_id(voice):
     assert server._voice_lease_capture_id == started["result"]["capture_id"]
 
 
-def test_voice_toggle_on_claims_session_lease_and_off_acks_empty_owner(voice):
+def test_voice_toggle_on_claims_session_lease_and_off_acks_empty_owner(
+    voice, monkeypatch
+):
     owner = _Sink()
+    wake_resumes = []
 
     enabled = voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
     epoch = enabled["result"]["lease_epoch"]
+    monkeypatch.setattr(server, "_voice_wake_owner", owner)
+    monkeypatch.setattr(server, "_wake_resume_if_owner", wake_resumes.append)
 
     assert enabled["result"]["owner_session_id"] == "owner"
     assert epoch > 0
@@ -164,6 +169,7 @@ def test_voice_toggle_on_claims_session_lease_and_off_acks_empty_owner(voice):
     assert disabled["result"]["lease_epoch"] == epoch
     assert disabled["result"]["released"] is True
     assert disabled["result"]["release_complete"] is True
+    assert wake_resumes == [owner]
 
 
 def test_local_toggle_lease_promotes_to_first_real_session_on_same_transport(voice):
@@ -737,8 +743,10 @@ def test_toggle_off_cleanup_finishes_before_successor_can_acquire(voice, monkeyp
 
 def test_session_teardown_releases_its_physical_voice_lease(voice, monkeypatch):
     owner, replacement = _Sink(), _Sink()
-    stopped = []
+    stopped, wake_resumes = [], []
     voice.rpc(owner, "voice.record", action="start", session_id="owner")
+    monkeypatch.setattr(server, "_voice_wake_owner", owner)
+    monkeypatch.setattr(server, "_wake_resume_if_owner", wake_resumes.append)
     session = {"_sid": "owner", "_run_thread": None}
     monkeypatch.setattr(server, "_settle_isolated_turn_before_close", lambda _session: None)
     monkeypatch.setattr(server, "_teardown_session", lambda _session, **_kwargs: None)
@@ -759,7 +767,96 @@ def test_session_teardown_releases_its_physical_voice_lease(voice, monkeypatch):
     assert server._voice_mode_enabled() is False
     assert server._voice_tts_enabled() is False
     assert stopped == ["thinking", "playback"]
+    assert wake_resumes == [owner]
+    assert server._voice_wake_owner is None
     assert server._acquire_voice_lease("replacement", replacement) is not None
+
+
+def test_ws_session_teardown_clears_wake_handoff_without_rearming(voice, monkeypatch):
+    owner = _Sink()
+    wake_resumes = []
+    voice.rpc(owner, "voice.record", action="start", session_id="owner")
+    monkeypatch.setattr(server, "_voice_wake_owner", owner)
+    monkeypatch.setattr(server, "_wake_resume_if_owner", wake_resumes.append)
+    monkeypatch.setattr(server, "_settle_isolated_turn_before_close", lambda _session: None)
+    monkeypatch.setattr(server, "_teardown_session", lambda _session, **_kwargs: None)
+
+    assert server._teardown_popped_session(
+        {"_sid": "owner", "_run_thread": None}, end_reason="ws_disconnect"
+    ) is True
+
+    assert wake_resumes == []
+    assert server._voice_wake_owner is None
+
+
+def test_session_teardown_release_retry_eventually_resumes_wake(voice, monkeypatch):
+    from tools import voice_input
+    from tools.voice_input import VoiceInputReleaseError
+
+    owner = _Sink()
+    attempts, wake_resumes = [], []
+    voice.rpc(owner, "voice.record", action="start", session_id="owner")
+
+    def release(**_kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise VoiceInputReleaseError("capture still closing")
+        return True
+
+    monkeypatch.setattr(voice_input, "release_voice_input", release)
+    monkeypatch.setattr(server, "_voice_wake_owner", owner)
+    monkeypatch.setattr(server, "_wake_resume_if_owner", wake_resumes.append)
+    monkeypatch.setattr(server, "_VOICE_RELEASE_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(server, "_settle_isolated_turn_before_close", lambda _session: None)
+    monkeypatch.setattr(server, "_teardown_session", lambda _session, **_kwargs: None)
+
+    assert server._teardown_popped_session(
+        {"_sid": "owner", "_run_thread": None}, end_reason="tui_close"
+    ) is True
+    wait_until(
+        lambda: wake_resumes == [owner],
+        timeout=1,
+        what="wake resume after session.close release retry",
+    )
+
+    assert len(attempts) == 2
+    assert server._voice_wake_owner is None
+
+
+def test_ws_teardown_release_retry_does_not_rearm_dead_wake_owner(
+    voice, monkeypatch
+):
+    from tools import voice_input
+    from tools.voice_input import VoiceInputReleaseError
+
+    owner = _Sink()
+    attempts, wake_resumes = [], []
+    voice.rpc(owner, "voice.record", action="start", session_id="owner")
+
+    def release(**_kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise VoiceInputReleaseError("capture still closing")
+        return True
+
+    monkeypatch.setattr(voice_input, "release_voice_input", release)
+    monkeypatch.setattr(server, "_voice_wake_owner", owner)
+    monkeypatch.setattr(server, "_wake_resume_if_owner", wake_resumes.append)
+    monkeypatch.setattr(server, "_VOICE_RELEASE_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(server, "_settle_isolated_turn_before_close", lambda _session: None)
+    monkeypatch.setattr(server, "_teardown_session", lambda _session, **_kwargs: None)
+
+    assert server._teardown_popped_session(
+        {"_sid": "owner", "_run_thread": None}, end_reason="ws_disconnect"
+    ) is True
+    wait_until(
+        lambda: len(attempts) == 2 and not server._voice_release_retry_active,
+        timeout=1,
+        what="WS voice release retry",
+    )
+
+    assert wake_resumes == []
+    assert server._voice_wake_owner is None
 
 
 def test_stale_session_teardown_cannot_release_same_sid_successor_epoch(
@@ -1010,7 +1107,7 @@ def test_unleased_record_stop_physically_clears_all_legacy_capture_streams(
 ):
     from tools import voice_input
 
-    owner = _Sink()
+    owner, successor = _Sink(), _Sink()
     voice.mic.active = True
     releases = []
     monkeypatch.setattr(
@@ -1024,6 +1121,70 @@ def test_unleased_record_stop_physically_clears_all_legacy_capture_streams(
     assert stopped["result"]["release_complete"] is True
     assert voice.mic.active is False
     assert releases[-1]["exclusive_only"] is False
+    assert server._voice_authority_sid == ""
+    assert server._voice_authority_transport is None
+    enabled = voice.rpc(successor, "voice.toggle", action="on", session_id="successor")
+    assert "error" not in enabled
+
+
+def test_noop_record_stop_does_not_claim_authority_or_block_successor(voice):
+    caller, successor = _Sink(), _Sink()
+
+    stopped = voice.rpc(caller, "voice.record", action="stop", session_id="caller")
+
+    assert stopped["result"]["status"] == "stopped"
+    assert stopped["result"]["owner_session_id"] == ""
+    assert stopped["result"]["released"] is True
+    assert stopped["result"]["release_complete"] is True
+    assert voice.mic.stop_calls == 0
+    assert server._voice_lease_owner_sid == ""
+    assert server._voice_lease_owner_transport is None
+    assert server._voice_authority_sid == ""
+    assert server._voice_authority_transport is None
+
+    enabled = voice.rpc(successor, "voice.toggle", action="on", session_id="successor")
+    assert "error" not in enabled
+    assert enabled["result"]["owner_session_id"] == "successor"
+
+
+def test_unleased_record_stop_retry_does_not_leave_temporary_authority(
+    voice, monkeypatch
+):
+    from tools import voice_input
+    from tools.voice_input import VoiceInputReleaseError
+
+    caller, successor = _Sink(), _Sink()
+    voice.mic.active = True
+    attempts, retries = [], []
+
+    def release(**_kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise VoiceInputReleaseError("legacy capture still closing")
+        return True
+
+    monkeypatch.setattr(voice_input, "release_voice_input", release)
+    monkeypatch.setattr(
+        server,
+        "_start_voice_thread",
+        lambda target, **_kwargs: retries.append(target),
+    )
+    monkeypatch.setattr(server, "_VOICE_RELEASE_RETRY_SECONDS", 0)
+
+    stopped = voice.rpc(caller, "voice.record", action="stop", session_id="caller")
+
+    assert stopped["error"]["code"] == 5025
+    assert server._voice_lease_releasing is True
+    assert server._voice_authority_transport is None
+    assert len(retries) == 1
+
+    retries[0]()
+
+    assert len(attempts) == 2
+    assert server._voice_lease_owner_transport is None
+    assert server._voice_authority_transport is None
+    enabled = voice.rpc(successor, "voice.toggle", action="on", session_id="successor")
+    assert "error" not in enabled
 
 
 def test_typed_stop_from_rebound_transport_cannot_release_same_session(voice):
