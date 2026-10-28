@@ -1,0 +1,435 @@
+"""SmartBox voice phases keep one logical authority across physical captures."""
+
+from __future__ import annotations
+
+import sys
+import threading
+import types
+
+import pytest
+
+from tui_gateway import server
+from tui_gateway.transport import FanoutTransport, bind_transport, reset_transport
+
+
+class _Sink:
+    def __init__(self):
+        self.frames = []
+        self._closed = False
+
+    def write(self, obj):
+        self.frames.append(obj)
+        return True
+
+    def close(self):
+        self._closed = True
+
+
+class _Mic:
+    def __init__(self):
+        self.active = False
+        self.callbacks = {}
+
+    def start_continuous(self, **kwargs):
+        self.active = True
+        self.callbacks = kwargs
+        return True
+
+    def stop_continuous(self, **_kwargs):
+        self.active = False
+
+    def is_continuous_active(self):
+        return self.active
+
+    def set_voice_busy_probe(self, _probe):
+        pass
+
+
+@pytest.fixture
+def phase_voice(monkeypatch):
+    mic, stdio = _Mic(), _Sink()
+    monkeypatch.setitem(sys.modules, "hermes_cli.voice", mic)
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {}})
+    monkeypatch.setattr(server, "_session_voice_enabled", lambda _sid: True)
+    monkeypatch.setattr(server, "_tts_stream_stop", lambda **_kw: None)
+    monkeypatch.setattr(server, "_stdio_transport", stdio)
+    monkeypatch.setattr(server, "_current_voice_profile_home", lambda: None)
+    for name, value in {
+        "_voice_event_sid": "",
+        "_voice_event_transport": None,
+        "_voice_capture_sid": "",
+        "_voice_capture_gen": 0,
+        "_voice_lease_owner_sid": "",
+        "_voice_lease_owner_transport": None,
+        "_voice_lease_epoch": 0,
+        "_voice_lease_releasing": False,
+        "_voice_lease_capture_id": None,
+        "_voice_lease_profile_home": None,
+        "_voice_lease_release_all": False,
+        "_voice_release_tail_epoch": None,
+        "_voice_pending_idle_scope": None,
+        "_voice_pending_disconnect_scope": None,
+        "_voice_authority_sid": "",
+        "_voice_authority_transport": None,
+        "_voice_authority_profile_home": None,
+        "_voice_terminal_error_epochs": set(),
+        "_voice_release_retry_active": False,
+        "_wake_resume_retry_active": False,
+        "_wake_resume_retry_epoch": None,
+        "_voice_tts_lease_generation": 0,
+        "_voice_tts_lease_desired": {},
+        "_fd_listener_active": False,
+        "_fd_listener_epoch": 0,
+        "_output_drain_stop": None,
+        "_output_drain_epoch": 0,
+        "_sessions": {},
+    }.items():
+        monkeypatch.setattr(server, name, value, raising=False)
+    from tools import voice_input
+
+    monkeypatch.setattr(voice_input, "release_voice_input", lambda **_kw: True)
+
+    def rpc(transport, method, **params):
+        token = bind_transport(transport)
+        try:
+            return server.handle_request(
+                {"id": method, "method": method, "params": params}
+            )
+        finally:
+            reset_transport(token)
+
+    return types.SimpleNamespace(mic=mic, rpc=rpc)
+
+
+def _events(sink, kind):
+    return [
+        frame["params"]
+        for frame in sink.frames
+        if frame.get("params", {}).get("type") == kind
+    ]
+
+
+def test_silent_ordinary_capture_reports_no_speech_after_release(phase_voice):
+    owner = _Sink()
+    started = phase_voice.rpc(
+        owner, "voice.record", action="start", session_id="runtime"
+    )
+
+    phase_voice.mic.callbacks["on_status"]("transcribing")
+    phase_voice.mic.callbacks["on_status"]("idle")
+
+    payload = _events(owner, "voice.status")[-1]["payload"]
+    assert payload["state"] == "idle"
+    assert payload["outcome"] == "no_speech"
+    assert payload["released"] is True
+    assert payload["release_complete"] is True
+    assert payload["capture_id"] == started["result"]["capture_id"]
+
+
+def test_record_to_full_duplex_announces_successor_epoch_before_listener(
+    phase_voice, monkeypatch
+):
+    owner = _Sink()
+    enabled = phase_voice.rpc(
+        owner, "voice.toggle", action="on", session_id="runtime"
+    )
+    started = phase_voice.rpc(
+        owner, "voice.record", action="start", session_id="runtime"
+    )
+    assert started["result"]["lease_epoch"] == enabled["result"]["lease_epoch"]
+    phase_voice.mic.callbacks["on_transcript"]("hello")
+    phase_voice.mic.callbacks["on_status"]("idle")
+    assert _events(owner, "voice.status")[-1]["payload"]["outcome"] == "complete"
+
+    starts = []
+
+    def start_thread(target, *, name, args=()):
+        transition = _events(owner, "voice.lease_changed")
+        assert transition, "the successor epoch must be published before its listener starts"
+        starts.append((target, name, args))
+        return types.SimpleNamespace()
+
+    monkeypatch.setattr(server, "_start_voice_thread", start_thread)
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda *_args: None)
+    server._start_turn_voice("runtime", owner)
+
+    payload = _events(owner, "voice.lease_changed")[-1]["payload"]
+    assert payload == {
+        "owner_session_id": "runtime",
+        "lease_epoch": server._voice_lease_epoch,
+        "previous_lease_epoch": enabled["result"]["lease_epoch"],
+        "phase": "full_duplex",
+    }
+    assert payload["lease_epoch"] > payload["previous_lease_epoch"]
+    assert starts[0][2] == ("runtime", payload["lease_epoch"], owner)
+    assert server._arm_full_duplex_listener("runtime", owner) is True
+    assert len(_events(owner, "voice.lease_changed")) == 1
+    assert len(starts) == 1
+
+
+def test_record_to_output_drain_announces_successor_epoch_before_monitor(
+    phase_voice, monkeypatch
+):
+    owner = _Sink()
+    enabled = phase_voice.rpc(
+        owner, "voice.toggle", action="on", session_id="runtime"
+    )
+    phase_voice.rpc(owner, "voice.record", action="start", session_id="runtime")
+    phase_voice.mic.callbacks["on_transcript"]("hello")
+    phase_voice.mic.callbacks["on_status"]("idle")
+
+    starts = []
+
+    def start_thread(target, *, name, args=()):
+        transition = _events(owner, "voice.lease_changed")
+        assert transition, "the successor epoch must be published before its monitor starts"
+        starts.append((target, name, args))
+        return types.SimpleNamespace()
+
+    monkeypatch.setattr(server, "_start_voice_thread", start_thread)
+    assert server._arm_output_drain_monitor("runtime", owner) is True
+
+    payload = _events(owner, "voice.lease_changed")[-1]["payload"]
+    assert payload == {
+        "owner_session_id": "runtime",
+        "lease_epoch": server._voice_lease_epoch,
+        "previous_lease_epoch": enabled["result"]["lease_epoch"],
+        "phase": "output_drain",
+    }
+    assert payload["lease_epoch"] > payload["previous_lease_epoch"]
+    assert starts[0][1] == "voice-output-drain"
+    assert starts[0][2][:3] == ("runtime", payload["lease_epoch"], owner)
+    assert server._arm_output_drain_monitor("runtime", owner) is True
+    assert len(_events(owner, "voice.lease_changed")) == 1
+    assert len(starts) == 1
+
+
+@pytest.mark.parametrize(
+    ("arm_name", "phase"),
+    [
+        ("_arm_full_duplex_listener", "full_duplex"),
+        ("_arm_output_drain_monitor", "output_drain"),
+    ],
+)
+def test_concurrent_successor_arms_cannot_lose_the_epoch_transition(
+    phase_voice, monkeypatch, arm_name, phase
+):
+    owner = _Sink()
+    enabled = phase_voice.rpc(
+        owner, "voice.toggle", action="on", session_id="runtime"
+    )
+    old_epoch = enabled["result"]["lease_epoch"]
+    released, error = server._release_voice_lease(
+        session_id="runtime",
+        lease_epoch=old_epoch,
+        transport=owner,
+        stop_loop=False,
+    )
+    assert released is True and error == ""
+
+    predecessor_claimed = threading.Event()
+    expose_predecessor = threading.Event()
+    original_scope = server._full_duplex_scope
+
+    def gated_scope(*args, **kwargs):
+        scope = original_scope(*args, **kwargs)
+        if threading.current_thread().name == "predecessor-arm":
+            predecessor_claimed.set()
+            assert expose_predecessor.wait(2)
+        return scope
+
+    starts = []
+    monkeypatch.setattr(server, "_full_duplex_scope", gated_scope)
+    monkeypatch.setattr(
+        server,
+        "_start_voice_thread",
+        lambda target, *, name, args=(): starts.append((name, args))
+        or types.SimpleNamespace(),
+    )
+    arm = getattr(server, arm_name)
+    results = []
+    first = threading.Thread(
+        target=lambda: results.append(arm("runtime", owner)),
+        name="predecessor-arm",
+    )
+    second = threading.Thread(
+        target=lambda: results.append(arm("runtime", owner)),
+        name="successor-arm",
+    )
+    first.start()
+    assert predecessor_claimed.wait(1)
+    second.start()
+    expose_predecessor.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert results == [True, True]
+    transitions = _events(owner, "voice.lease_changed")
+    assert len(transitions) == 1
+    assert transitions[0]["payload"] == {
+        "owner_session_id": "runtime",
+        "lease_epoch": server._voice_lease_epoch,
+        "previous_lease_epoch": old_epoch,
+        "phase": phase,
+    }
+    assert len(starts) == 1
+
+
+def test_voice_tts_announces_the_successor_epoch_before_scheduling_speech(
+    phase_voice, monkeypatch
+):
+    owner = _Sink()
+    enabled = phase_voice.rpc(
+        owner, "voice.toggle", action="on", session_id="runtime"
+    )
+    old_epoch = enabled["result"]["lease_epoch"]
+    released, error = server._release_voice_lease(
+        session_id="runtime",
+        lease_epoch=old_epoch,
+        transport=owner,
+        stop_loop=False,
+    )
+    assert released is True and error == ""
+    scheduled = []
+
+    def start_thread(target, *, name, args=()):
+        transitions = _events(owner, "voice.lease_changed")
+        assert transitions, "the successor epoch must be published before speech is scheduled"
+        scheduled.append((name, args))
+        return types.SimpleNamespace()
+
+    monkeypatch.setattr(server, "_start_voice_thread", start_thread)
+    response = phase_voice.rpc(
+        owner, "voice.tts", text="hello", session_id="runtime"
+    )
+
+    payload = _events(owner, "voice.lease_changed")[-1]["payload"]
+    assert payload == {
+        "owner_session_id": "runtime",
+        "lease_epoch": response["result"]["lease_epoch"],
+        "previous_lease_epoch": old_epoch,
+        "phase": "full_duplex",
+    }
+    assert scheduled[0][0] == "voice-tts-rpc"
+
+
+@pytest.mark.parametrize(
+    ("source", "barge_in", "expected"),
+    [
+        ("smartbox_voice", True, "full_duplex"),
+        ("smartbox_voice", False, "output_drain"),
+        ("desktop", True, None),
+    ],
+)
+def test_toggle_on_rearms_running_smartbox_session_exactly_once(
+    phase_voice, monkeypatch, source, barge_in, expected
+):
+    owner = _Sink()
+    monkeypatch.setenv("HERMES_VOICE_TTS", "0")
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {"runtime": {"running": True, "source": source, "transport": owner}},
+    )
+    monkeypatch.setattr(
+        server, "_load_cfg", lambda: {"voice": {"barge_in": barge_in}}
+    )
+    armed = []
+    monkeypatch.setattr(
+        server,
+        "_start_voice_thread",
+        lambda target, *, name, args=(): armed.append((name, args))
+        or types.SimpleNamespace(),
+    )
+
+    enabled = phase_voice.rpc(owner, "voice.toggle", action="on", session_id="runtime")
+    assert "error" not in enabled
+    assert armed == [], "toggle on must return its epoch before any resumed worker starts"
+    first = phase_voice.rpc(
+        owner, "voice.toggle", action="reattach", session_id="runtime"
+    )
+    second = phase_voice.rpc(
+        owner, "voice.toggle", action="reattach", session_id="runtime"
+    )
+
+    if expected is None:
+        assert first["error"]["code"] == 4016
+        assert second["error"]["code"] == 4016
+        assert armed == []
+        return
+    for response in (first, second):
+        result = response["result"]
+        assert result["reattached"] is True
+        assert result["phase"] == expected
+        assert result["owner_session_id"] == "runtime"
+        assert result["lease_epoch"] == enabled["result"]["lease_epoch"]
+    thread_name = (
+        "voice-full-duplex" if expected == "full_duplex" else "voice-output-drain"
+    )
+    assert len(armed) == 1
+    assert armed[0][0] == thread_name
+    assert armed[0][1][:3] == (
+        "runtime", enabled["result"]["lease_epoch"], owner
+    )
+
+
+def test_reattach_accepts_the_exact_owner_inside_a_live_session_fanout(
+    phase_voice, monkeypatch
+):
+    owner, viewer = _Sink(), _Sink()
+    monkeypatch.setenv("HERMES_VOICE_TTS", "0")
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {
+            "runtime": {
+                "running": True,
+                "source": "smartbox_voice",
+                "transport": FanoutTransport(viewer, owner),
+                "profile_home": None,
+            }
+        },
+    )
+    armed = []
+    monkeypatch.setattr(
+        server,
+        "_start_voice_thread",
+        lambda target, *, name, args=(): armed.append((name, args))
+        or types.SimpleNamespace(),
+    )
+
+    enabled = phase_voice.rpc(owner, "voice.toggle", action="on", session_id="runtime")
+    response = phase_voice.rpc(
+        owner, "voice.toggle", action="reattach", session_id="runtime"
+    )
+
+    assert response["result"]["reattached"] is True
+    assert response["result"]["lease_epoch"] == enabled["result"]["lease_epoch"]
+    assert armed == [
+        (
+            "voice-full-duplex",
+            ("runtime", enabled["result"]["lease_epoch"], owner),
+        )
+    ]
+
+
+def test_tts_enabled_parameter_is_an_idempotent_set(phase_voice, monkeypatch):
+    owner = _Sink()
+    phase_voice.rpc(owner, "voice.toggle", action="on", session_id="runtime")
+    monkeypatch.setenv("HERMES_VOICE_TTS", "0")
+    monkeypatch.setattr(server, "_tts_lease_async", lambda *_args: None)
+
+    first = phase_voice.rpc(
+        owner, "voice.toggle", action="tts", session_id="runtime", enabled=True
+    )
+    second = phase_voice.rpc(
+        owner, "voice.toggle", action="tts", session_id="runtime", enabled=True
+    )
+
+    assert first["result"]["tts"] is True
+    assert second["result"]["tts"] is True
+    assert first["result"]["owner_session_id"] == "runtime"
+    assert second["result"]["lease_epoch"] == first["result"]["lease_epoch"]

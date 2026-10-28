@@ -800,6 +800,18 @@ class VoiceInterruptedPayload(VoiceScopePayload):
     pass
 
 
+class VoiceLeasePhase(WireEnum):
+    full_duplex = "full_duplex"
+    output_drain = "output_drain"
+
+
+class VoiceLeaseChangedPayload(VoiceScopePayload):
+    """A physical successor under the same logical SmartBox voice authority."""
+
+    previous_lease_epoch: int
+    phase: VoiceLeasePhase
+
+
 class VoiceStatusPayload(VoiceScopePayload):
     """``methods_voice._vr_on_status``; states come from the recorder (idle / listening / transcribing …)."""
 
@@ -849,6 +861,8 @@ class WakeDetectedPayload(Payload):
 
 
 event("voice.interrupted", VoiceInterruptedPayload, doc="Barge-in interrupted the lease owner's turn.")
+event("voice.lease_changed", VoiceLeaseChangedPayload,
+      doc="The logical voice owner moved to a successor physical input epoch.")
 event("voice.status", VoiceStatusPayload, doc="Voice recorder state changed.")
 event("voice.partial", VoicePartialPayload, doc="Live STT text so far while the user is still speaking.")
 event("voice.transcript", VoiceTranscriptPayload, doc="A voice capture produced text (or a stop phrase / silence limit).")

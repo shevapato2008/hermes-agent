@@ -38,7 +38,9 @@ _voice_lease_capture_id: str | None = None
 _voice_lease_profile_home: str | None = None
 _voice_lease_release_all = False
 _voice_release_tail_epoch: int | None = None
-_voice_pending_idle_scope: tuple[str, int, Optional[Transport], str | None] | None = None
+_voice_pending_idle_scope: tuple[
+    str, int, Optional[Transport], str | None, str
+] | None = None
 _voice_pending_disconnect_scope: tuple[str, int, Optional[Transport]] | None = None
 _voice_authority_sid: str = ""
 _voice_authority_transport: Optional[Transport] = None
@@ -619,7 +621,7 @@ def _flush_pending_voice_idle(session_id: str, lease_epoch: int, transport) -> N
             _voice_release_tail_epoch = None
     _voice_emit(
         "voice.status",
-        {"state": "idle", "outcome": "complete", "released": True,
+        {"state": "idle", "outcome": scope[4], "released": True,
          "release_complete": True},
         session_id=session_id, lease_epoch=lease_epoch, transport=transport,
         capture_id=scope[3])

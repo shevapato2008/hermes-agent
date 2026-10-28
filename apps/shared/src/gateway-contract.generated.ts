@@ -2977,9 +2977,10 @@ export interface ApprovalRespondResult {
 export interface VoiceToggleParams {
   action?: VoiceToggleAction
   session_id?: string | null
+  enabled?: boolean | null
   profile?: string | null
 }
-export type VoiceToggleAction = 'status' | 'on' | 'off' | 'tts'
+export type VoiceToggleAction = 'status' | 'on' | 'off' | 'tts' | 'reattach'
 /** ``methods_voice.py::_voice_status_payload`` (+ the requirements probe on ``status``, the spoken stop hint on ``on``). */
 export interface VoiceToggleResult {
   enabled: boolean
@@ -2995,7 +2996,10 @@ export interface VoiceToggleResult {
   capture_id?: string | null
   released?: boolean | null
   release_complete?: boolean | null
+  reattached?: boolean | null
+  phase?: VoiceTogglePhase | null
 }
+export type VoiceTogglePhase = 'full_duplex' | 'output_drain'
 export interface VoiceRecordParams {
   action?: VoiceRecordAction
   session_id?: string | null
@@ -6047,6 +6051,15 @@ export interface VoiceInterruptedPayload {
   lease_epoch: number
   capture_id?: string | null
 }
+/** A physical successor under the same logical SmartBox voice authority. */
+export interface VoiceLeaseChangedPayload {
+  owner_session_id: string
+  lease_epoch: number
+  capture_id?: string | null
+  previous_lease_epoch: number
+  phase: VoiceLeasePhase
+}
+export type VoiceLeasePhase = 'full_duplex' | 'output_drain'
 /** ``methods_voice._vr_on_status``; states come from the recorder (idle / listening / transcribing …). */
 export interface VoiceStatusPayload {
   owner_session_id: string
@@ -6631,7 +6644,7 @@ export interface RpcMethods {
   'verification.status': { params: VerificationStatusParams; result: VerificationStatusResult }
   /** VAD-bounded push-to-talk; the transcript arrives as a voice.transcript event. */
   'voice.record': { params: VoiceRecordParams; result: VoiceRecordResult }
-  /** /voice parity: report, flip voice mode on/off, or toggle speech output. */
+  /** /voice parity plus SmartBox live-turn reattach after a resumed transport handoff. */
   'voice.toggle': { params: VoiceToggleParams; result: VoiceToggleResult }
   /** Speak text through the backend TTS engine (barge-in aware). */
   'voice.tts': { params: VoiceTtsParams; result: VoiceTtsResult }
@@ -7257,6 +7270,8 @@ export interface BackendGatewayEventMap {
   'voice.input_error': VoiceInputErrorPayload
   /** Barge-in interrupted the lease owner's turn. */
   'voice.interrupted': VoiceInterruptedPayload
+  /** The logical voice owner moved to a successor physical input epoch. */
+  'voice.lease_changed': VoiceLeaseChangedPayload
   /** The owning turn and every backend audio-output pipeline are idle. */
   'voice.output_drained': VoiceOutputDrainedPayload
   /** Live STT text so far while the user is still speaking. */
@@ -7347,6 +7362,7 @@ export const GATEWAY_EVENT_TYPES = [
   'tool.start',
   'voice.input_error',
   'voice.interrupted',
+  'voice.lease_changed',
   'voice.output_drained',
   'voice.partial',
   'voice.status',

@@ -344,11 +344,18 @@ class VoiceToggleAction(WireEnum):
     on = "on"
     off = "off"
     tts = "tts"
+    reattach = "reattach"
+
+
+class VoiceTogglePhase(WireEnum):
+    full_duplex = "full_duplex"
+    output_drain = "output_drain"
 
 
 class VoiceToggleParams(Params):
     action: VoiceToggleAction = VoiceToggleAction.status
     session_id: str | None = None
+    enabled: bool | None = None  # action=tts: idempotent set; omitted preserves toggle behavior
     profile: str | None = None
 
 
@@ -369,10 +376,12 @@ class VoiceToggleResult(Result):
     capture_id: str | None = None
     released: bool | None = None
     release_complete: bool | None = None
+    reattached: bool | None = None
+    phase: VoiceTogglePhase | None = None
 
 
 method("voice.toggle", params=VoiceToggleParams, result=VoiceToggleResult,
-       doc="/voice parity: report, flip voice mode on/off, or toggle speech output.")
+       doc="/voice parity plus SmartBox live-turn reattach after a resumed transport handoff.")
 
 
 class VoiceRecordAction(WireEnum):

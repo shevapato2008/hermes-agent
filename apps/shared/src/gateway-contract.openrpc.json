@@ -4508,7 +4508,7 @@
     },
     {
       "name": "voice.toggle",
-      "summary": "/voice parity: report, flip voice mode on/off, or toggle speech output.",
+      "summary": "/voice parity plus SmartBox live-turn reattach after a resumed transport handoff.",
       "params": [
         {
           "name": "params",
@@ -46534,6 +46534,55 @@
         "title": "VoiceInterruptedPayload",
         "type": "object"
       },
+      "VoiceLeaseChangedPayload": {
+        "additionalProperties": false,
+        "description": "A physical successor under the same logical SmartBox voice authority.",
+        "properties": {
+          "owner_session_id": {
+            "title": "Owner Session Id",
+            "type": "string"
+          },
+          "lease_epoch": {
+            "title": "Lease Epoch",
+            "type": "integer"
+          },
+          "capture_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Capture Id"
+          },
+          "previous_lease_epoch": {
+            "title": "Previous Lease Epoch",
+            "type": "integer"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/VoiceLeasePhase"
+          }
+        },
+        "required": [
+          "owner_session_id",
+          "lease_epoch",
+          "previous_lease_epoch",
+          "phase"
+        ],
+        "title": "VoiceLeaseChangedPayload",
+        "type": "object"
+      },
+      "VoiceLeasePhase": {
+        "enum": [
+          "full_duplex",
+          "output_drain"
+        ],
+        "title": "VoiceLeasePhase",
+        "type": "string"
+      },
       "VoiceOutputDrainedPayload": {
         "additionalProperties": false,
         "properties": {
@@ -46803,7 +46852,8 @@
           "status",
           "on",
           "off",
-          "tts"
+          "tts",
+          "reattach"
         ],
         "title": "VoiceToggleAction",
         "type": "string"
@@ -46827,6 +46877,18 @@
             "default": null,
             "title": "Session Id"
           },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Enabled"
+          },
           "profile": {
             "anyOf": [
               {
@@ -46842,6 +46904,14 @@
         },
         "title": "VoiceToggleParams",
         "type": "object"
+      },
+      "VoiceTogglePhase": {
+        "enum": [
+          "full_duplex",
+          "output_drain"
+        ],
+        "title": "VoiceTogglePhase",
+        "type": "string"
       },
       "VoiceToggleResult": {
         "additionalProperties": false,
@@ -46964,6 +47034,29 @@
             ],
             "default": null,
             "title": "Release Complete"
+          },
+          "reattached": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reattached"
+          },
+          "phase": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VoiceTogglePhase"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": [
@@ -50390,6 +50483,18 @@
           "name": "payload",
           "schema": {
             "$ref": "#/components/schemas/VoiceInterruptedPayload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "voice.lease_changed",
+      "summary": "The logical voice owner moved to a successor physical input epoch.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/VoiceLeaseChangedPayload"
           }
         }
       ]

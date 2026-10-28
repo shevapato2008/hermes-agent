@@ -216,11 +216,18 @@ def _voice_output_scope_allowed(
         acquired = _acquire_voice_lease(str(session_id), transport)
         return acquired == epoch and _voice_scope_matches(
             str(session_id), epoch, transport)
+    authority_sid, authority_transport = _voice_authority_snapshot()
+    if authority_transport is not None:
+        sid = str(session_id or authority_sid)
+        requested_transport = transport or authority_transport
+        return _voice_authority_accepts(
+            sid, requested_transport, allow_unclaimed=False
+        )
     if require_voice_scope:
-        return _full_duplex_scope(session_id, transport) is not None
+        return False
     if not _voice_mode_enabled():
         return True  # native TTS-only behavior without a voice/microphone lease
-    return _full_duplex_scope(session_id, transport) is not None
+    return False
 
 
 @contextlib.contextmanager
@@ -302,6 +309,7 @@ _fd_listener_epoch = 0
 _fd_speak_pipelines: set[tuple[threading.Event, threading.Event]] = set()
 _output_drain_lock = threading.Lock()
 _output_drain_stop: threading.Event | None = None
+_output_drain_epoch = 0
 
 
 def _full_duplex_scope(session_id: str | None = None, transport=None):
@@ -321,13 +329,14 @@ def _full_duplex_scope(session_id: str | None = None, transport=None):
             owner_transport,
             allow_unclaimed=True,
         )
-        return (sid, promoted, owner_transport) if promoted is not None else None
+        return (sid, promoted, owner_transport, None) if promoted is not None else None
 
     authority_sid, authority_transport = _voice_authority_snapshot()
     if authority_transport is None:
         return None
     sid = str(session_id or authority_sid)
     requested_transport = transport or authority_transport
+    previous_epoch = epoch
     epoch = _claim_voice_authority(
         sid,
         requested_transport,
@@ -335,35 +344,59 @@ def _full_duplex_scope(session_id: str | None = None, transport=None):
     )
     if epoch is None:
         return None
-    return sid, epoch, requested_transport
+    return sid, epoch, requested_transport, (
+        previous_epoch if previous_epoch > 0 and previous_epoch != epoch else None
+    )
+
+
+def _emit_voice_lease_changed(
+    session_id: str,
+    lease_epoch: int,
+    transport,
+    previous_lease_epoch: int | None,
+    phase: str,
+) -> bool:
+    if previous_lease_epoch is None or previous_lease_epoch == lease_epoch:
+        return False
+    return _voice_emit(
+        "voice.lease_changed",
+        {"previous_lease_epoch": previous_lease_epoch, "phase": phase},
+        session_id=session_id,
+        lease_epoch=lease_epoch,
+        transport=transport,
+    )
 
 
 def _arm_full_duplex_listener(session_id: str | None = None, transport=None) -> bool:
     """Arm one full-duplex listener with an immutable session/epoch/transport scope."""
-    scope = _full_duplex_scope(session_id, transport)
-    if scope is None:
-        return False
-    _cancel_output_drain_monitor()
-    sid, epoch, owner_transport = scope
-    global _fd_listener_active, _fd_listener_epoch
-    with _fd_listener_lock:
-        if _fd_listener_active:
-            if _fd_listener_epoch == epoch:
-                return True
-            # A physically released, stale listener may still be unwinding its
-            # transcription. Its finally must not clear this successor slot.
-            if _voice_scope_matches(sid, epoch, owner_transport):
-                _fd_listener_epoch = epoch
+    with _voice_lifecycle_lock:
+        scope = _full_duplex_scope(session_id, transport)
+        if scope is None:
+            return False
+        _cancel_output_drain_monitor()
+        sid, epoch, owner_transport, previous_epoch = scope
+        global _fd_listener_active, _fd_listener_epoch
+        with _fd_listener_lock:
+            if _fd_listener_active:
+                if _fd_listener_epoch == epoch:
+                    return True
+                # A physically released, stale listener may still be unwinding its
+                # transcription. Its finally must not clear this successor slot.
+                if _voice_scope_matches(sid, epoch, owner_transport):
+                    _fd_listener_epoch = epoch
+                else:
+                    return False
             else:
-                return False
-        else:
-            _fd_listener_active = True
-            _fd_listener_epoch = epoch
-    _start_voice_thread(
-        _full_duplex_listener,
-        name="voice-full-duplex",
-        args=(sid, epoch, owner_transport),
-    )
+                _fd_listener_active = True
+                _fd_listener_epoch = epoch
+        _emit_voice_lease_changed(
+            sid, epoch, owner_transport, previous_epoch, "full_duplex"
+        )
+        _start_voice_thread(
+            _full_duplex_listener,
+            name="voice-full-duplex",
+            args=(sid, epoch, owner_transport),
+        )
     return True
 
 
@@ -384,30 +417,42 @@ def _fd_tts_pending() -> bool:
 
 def _cancel_output_drain_monitor() -> None:
     """Cancel the microphone-free monitor for an older turn, if any."""
-    global _output_drain_stop
+    global _output_drain_stop, _output_drain_epoch
     with _output_drain_lock:
         stop, _output_drain_stop = _output_drain_stop, None
+        _output_drain_epoch = 0
     if stop is not None:
         stop.set()
 
 
 def _arm_output_drain_monitor(session_id: str, transport=None) -> bool:
     """Emit one scoped output-drained event without opening the microphone."""
-    global _output_drain_stop
-    scope = _full_duplex_scope(session_id, transport)
-    if scope is None or not _voice_mode_enabled():
-        return False
-    sid, epoch, owner_transport = scope
-    stop = threading.Event()
-    with _output_drain_lock:
-        previous, _output_drain_stop = _output_drain_stop, stop
-    if previous is not None:
-        previous.set()
-    _start_voice_thread(
-        _output_drain_monitor,
-        name="voice-output-drain",
-        args=(sid, epoch, owner_transport, stop),
-    )
+    global _output_drain_stop, _output_drain_epoch
+    with _voice_lifecycle_lock:
+        scope = _full_duplex_scope(session_id, transport)
+        if scope is None or not _voice_mode_enabled():
+            return False
+        sid, epoch, owner_transport, previous_epoch = scope
+        stop = threading.Event()
+        with _output_drain_lock:
+            if (
+                _output_drain_stop is not None
+                and not _output_drain_stop.is_set()
+                and _output_drain_epoch == epoch
+            ):
+                return True
+            previous, _output_drain_stop = _output_drain_stop, stop
+            _output_drain_epoch = epoch
+        if previous is not None:
+            previous.set()
+        _emit_voice_lease_changed(
+            sid, epoch, owner_transport, previous_epoch, "output_drain"
+        )
+        _start_voice_thread(
+            _output_drain_monitor,
+            name="voice-output-drain",
+            args=(sid, epoch, owner_transport, stop),
+        )
     return True
 
 
@@ -415,7 +460,7 @@ def _output_drain_monitor(
     session_id: str, lease_epoch: int, transport, stop: threading.Event,
 ) -> None:
     """Wait until this turn and every backend audio pipeline are idle."""
-    global _output_drain_stop
+    global _output_drain_stop, _output_drain_epoch
     try:
         from tools.voice_mode import is_audio_output_active
 
@@ -433,6 +478,7 @@ def _output_drain_monitor(
                 if _output_drain_stop is not stop or stop.is_set():
                     return
                 _output_drain_stop = None
+                _output_drain_epoch = 0
             _voice_emit(
                 "voice.output_drained",
                 session_id=session_id,
@@ -446,6 +492,7 @@ def _output_drain_monitor(
         with _output_drain_lock:
             if _output_drain_stop is stop:
                 _output_drain_stop = None
+                _output_drain_epoch = 0
 
 
 def _full_duplex_listener(session_id: str, lease_epoch: int, transport) -> None:
@@ -1242,6 +1289,19 @@ def _set_voice_tts(on: bool) -> None:
     _tts_lease_async("tui:voice-tts", on)
 
 
+def _running_smartbox_voice_session(session_id: str, transport) -> bool:
+    """True only for the live SmartBox turn containing this profile's caller."""
+    with _sessions_lock:
+        record = _sessions.get(session_id)
+        return bool(
+            record
+            and record.get("running")
+            and record.get("source") == "smartbox_voice"
+            and _live_profile_matches(record, _current_voice_profile_home())
+            and _session_transport_contains(record, transport)
+        )
+
+
 def _voice_toggle_off_cleanup() -> None:
     """No-throw cleanup that runs before an old owner lease becomes acquirable."""
     os.environ["HERMES_VOICE"] = "0"
@@ -1288,13 +1348,49 @@ def _voice_toggle_tts(rid, params: dict) -> dict:
             )
         if not physical_owned or not authority_owned:
             return _err(rid, 4016, "voice output is owned by another session")
-        _set_voice_tts(not _voice_tts_enabled())
+        current = _voice_tts_enabled()
+        desired = not current if params.get("enabled") is None else params["enabled"]
+        if desired != current:
+            _set_voice_tts(desired)
         return _ok(rid, _voice_status_payload())
+
+
+def _voice_toggle_reattach(rid, params: dict) -> dict:
+    """Re-arm a resumed SmartBox turn only after the client adopted ``toggle on``'s epoch."""
+    sid = str(params.get("session_id") or "")
+    transport = _caller_transport()
+    if not sid or not _voice_mode_enabled():
+        return _err(rid, 4016, "voice turn is not attachable")
+    if not _running_smartbox_voice_session(sid, transport):
+        return _err(rid, 4016, "voice turn is not attachable")
+    owner, _epoch, owner_transport, _capture_id = _voice_scope_snapshot()
+    if (
+        owner != sid
+        or owner_transport is not transport
+        or not _voice_control_scope_accepts(sid, transport)
+    ):
+        return _err(rid, 4016, "voice turn is not attachable")
+    phase = (
+        "full_duplex"
+        if _voice_cfg_dict().get("barge_in", True)
+        else "output_drain"
+    )
+    armed = (
+        _arm_full_duplex_listener(sid, transport)
+        if phase == "full_duplex"
+        else _arm_output_drain_monitor(sid, transport)
+    )
+    if not armed:
+        return _err(rid, 4016, "voice input is busy in another session")
+    return _ok(
+        rid,
+        _voice_status_payload(reattached=True, phase=phase),
+    )
 
 
 _VOICE_TOGGLE_ACTIONS = {
     "status": _voice_toggle_status, "on": _voice_toggle_mode, "off": _voice_toggle_mode,
-    "tts": _voice_toggle_tts}
+    "tts": _voice_toggle_tts, "reattach": _voice_toggle_reattach}
 
 
 @method("voice.toggle")
@@ -1333,14 +1429,15 @@ def _vr_on_input_error(error, scope) -> None:
             scope)
 
 
-def _vr_on_status(state, scope) -> None:
+def _vr_on_status(state, scope, *, had_transcript: bool = False) -> None:
     global _voice_pending_idle_scope, _voice_release_tail_epoch
     sid, epoch, transport, capture_id = scope
     if state == "idle":
+        outcome = "complete" if had_transcript else "no_speech"
         with _voice_sid_lock:
             releasing = epoch == _voice_lease_epoch and _voice_lease_releasing
             if releasing:
-                _voice_pending_idle_scope = scope
+                _voice_pending_idle_scope = (*scope, outcome)
                 return
         if epoch in _voice_terminal_error_epochs:
             return
@@ -1357,7 +1454,7 @@ def _vr_on_status(state, scope) -> None:
             return
         _voice_emit(
             "voice.status",
-            {"state": state, "outcome": "complete", "released": True,
+            {"state": state, "outcome": outcome, "released": True,
              "release_complete": True},
             session_id=sid, lease_epoch=epoch, transport=transport,
             capture_id=capture_id)
@@ -1618,9 +1715,15 @@ def _(rid, params: dict) -> dict:
         # instead of falling back to the documented 200 / 3.0 defaults (Copilot round-12 on #19835).
         voice_cfg = _voice_cfg_dict()
         max_rec = _voice_cfg_number(voice_cfg.get("max_recording_seconds"), 120.0)
+        transcript_delivered = threading.Event()
+
         def live(fn):
             return _voice_capture_callback(
                 fn, session_id=owner, lease_epoch=epoch, transport=owner_transport)
+
+        def on_transcript(text: str) -> None:
+            if _vr_emit("voice.transcript", {"text": text}, scope):
+                transcript_delivered.set()
 
         with _voice_input_start_barrier(owner, epoch, owner_transport) as can_start:
             if not can_start:
@@ -1637,8 +1740,9 @@ def _(rid, params: dict) -> dict:
                 with _voice_sid_lock:
                     _voice_wake_owner = transport
             started = start_continuous(
-                on_transcript=live(lambda text: _vr_emit("voice.transcript", {"text": text}, scope)),
-                on_status=live(lambda state: _vr_on_status(state, scope)),
+                on_transcript=live(on_transcript),
+                on_status=live(lambda state: _vr_on_status(
+                    state, scope, had_transcript=transcript_delivered.is_set())),
                 on_silent_limit=live(lambda: _vr_on_silent_limit(scope)),
                 silence_threshold=_voice_cfg_number(voice_cfg.get("silence_threshold"), 200),
                 silence_duration=_voice_cfg_number(voice_cfg.get("silence_duration"), 3.0),
@@ -1727,10 +1831,14 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         return _err(rid, 5026, "voice module not available" if isinstance(e, ImportError) else str(e))
     if not owner and _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
-        scope = _full_duplex_scope(sid, caller)
-        if scope is None:
-            return _err(rid, 4016, "voice input is busy in another session")
-        owner, epoch, owner_transport = scope
+        with _voice_lifecycle_lock:
+            scope = _full_duplex_scope(sid, caller)
+            if scope is None:
+                return _err(rid, 4016, "voice input is busy in another session")
+            owner, epoch, owner_transport, previous_epoch = scope
+            _emit_voice_lease_changed(
+                owner, epoch, owner_transport, previous_epoch, "full_duplex"
+            )
     _start_voice_thread(
         _speak_text_with_barge,
         name="voice-tts-rpc",

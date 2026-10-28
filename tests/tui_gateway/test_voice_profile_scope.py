@@ -309,3 +309,41 @@ def test_same_transport_cannot_stop_wake_from_another_profile(monkeypatch, tmp_p
     assert server._wake_owner_transport is transport
     assert server._wake_owner_profile_home == str(worker.resolve())
     assert stopped == []
+
+
+def test_reattach_rejects_a_live_session_from_another_profile(monkeypatch, tmp_path):
+    _launch, worker = _bind_profiles(monkeypatch, tmp_path)
+    transport = object()
+    armed = []
+    monkeypatch.setenv("HERMES_VOICE_TTS", "0")
+    monkeypatch.setattr(server, "_stdio_transport", transport)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {}})
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {
+            "runtime": {
+                "running": True,
+                "source": "smartbox_voice",
+                "transport": transport,
+                "profile_home": str(worker),
+            }
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_start_voice_thread",
+        lambda target, *, name, args=(): armed.append((name, args)),
+    )
+
+    enabled = server._methods["voice.toggle"](
+        "on", {"action": "on", "session_id": "runtime", "profile": "launch"}
+    )
+    refused = server._methods["voice.toggle"](
+        "reattach",
+        {"action": "reattach", "session_id": "runtime", "profile": "launch"},
+    )
+
+    assert "error" not in enabled
+    assert refused["error"]["code"] == 4016
+    assert armed == []
