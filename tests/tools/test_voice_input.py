@@ -140,6 +140,54 @@ def test_pulse_cli_eof_is_terminal(monkeypatch):
     stream.close(timeout=0.2)
 
 
+def test_pulse_pump_error_callback_can_close_through_helper_thread(monkeypatch):
+    """The pump must exit before dispatching an error that synchronously tears it down."""
+    from tools.voice_input import PulseCliVoiceInputProvider
+
+    process = _FakeProcess([b""])
+    monkeypatch.setattr("tools.voice_input.subprocess.Popen", lambda *_a, **_k: process)
+    provider = PulseCliVoiceInputProvider(executable="parec")
+    callback_done = threading.Event()
+    close_errors = []
+    callback_threads = []
+    stream = None
+
+    def on_error(_error):
+        callback_threads.append(threading.current_thread().name)
+
+        def close_from_helper():
+            try:
+                stream.close(timeout=0.1)
+            except BaseException as exc:
+                close_errors.append(exc)
+
+        helper = threading.Thread(target=close_from_helper)
+        helper.start()
+        helper.join(timeout=2)
+        if helper.is_alive():
+            close_errors.append(AssertionError("voice input close helper did not finish"))
+        callback_done.set()
+
+    stream = provider.open_stream(
+        phase="ordinary",
+        sample_rate=16_000,
+        channels=1,
+        dtype="int16",
+        blocksize=480,
+        callback=lambda *_args: None,
+        on_error=on_error,
+    )
+    stream.start()
+    assert callback_done.wait(2)
+    try:
+        assert close_errors == []
+        assert callback_threads != ["hermes-pulse-input"]
+        assert stream.active is False
+        assert process.terminated == 1 and process.waited == 1
+    finally:
+        provider.release_active(timeout=1)
+
+
 def test_pulse_cli_allows_only_one_capture_phase(monkeypatch):
     from tools.voice_input import PulseCliVoiceInputProvider, VoiceInputBusyError
 

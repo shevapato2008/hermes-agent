@@ -389,10 +389,23 @@ class _PulseCliStream:
                     self._callback(data, len(data), None, overflowed)
             except VoiceInputError as exc:
                 if not self._stop.is_set() and self._on_error is not None:
-                    try:
-                        self._on_error(exc)
-                    except Exception:
-                        pass
+                    pump_thread = threading.current_thread()
+
+                    def notify_after_pump(error, reader):
+                        reader.join()
+                        if self._stop.is_set():
+                            return
+                        try:
+                            self._on_error(error)
+                        except Exception:
+                            pass
+
+                    threading.Thread(
+                        target=notify_after_pump,
+                        args=(exc, pump_thread),
+                        name="hermes-pulse-input-error",
+                        daemon=True,
+                    ).start()
 
         self._pump = threading.Thread(target=pump, name="hermes-pulse-input", daemon=True)
         self._pump.start()
