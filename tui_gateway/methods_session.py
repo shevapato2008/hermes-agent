@@ -834,7 +834,11 @@ def _resume_locate(ctx: _Resume) -> dict | None:
         return None
     if ctx.owns_db:
         _resume_adopt_stranded(ctx)
-    if not ctx.found and not ctx.lazy and _is_server_minted_key(ctx.target) \
+    # SmartBox voice keys are ephemeral reconnect handles. If their live record
+    # is gone after a restart, materializing an empty durable chat would create
+    # phantom history; the bridge must start a fresh session instead.
+    if not ctx.found and not ctx.lazy and _str_param(ctx.params, "source") != "smartbox_voice" \
+            and _is_server_minted_key(ctx.target) \
             and not _any_live_session_claims_key(ctx.target):
         _resume_materialize_minted(ctx)
     return None if ctx.found else _err(ctx.rid, 4007, "session not found")
