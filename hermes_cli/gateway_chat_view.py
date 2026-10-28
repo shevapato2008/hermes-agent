@@ -211,6 +211,7 @@ class GatewayChatView:
             "approval.settled": self._settled, "clarify.settled": self._settled,
             "session.info": self._session_info,
             "status.update": self._notice, "notification.show": self._notice,
+            "voice.input_error": self._voice_input_error,
         }.get(kind)
         if handler:
             handler(admission, payload)
@@ -223,6 +224,12 @@ class GatewayChatView:
         # The owner already applied display.warning_notifications; it publishes only what shows.
         if not self.quiet and str(payload.get("text") or "").strip():
             print(str(payload["text"]).strip(), file=sys.stderr, flush=True)
+
+    def _voice_input_error(self, admission, payload):
+        del admission
+        message = str(payload.get("message") or "voice input failed").strip()
+        if not self.quiet:
+            print(f"voice error: {message}", file=sys.stderr, flush=True)
 
     def _tool_start(self, admission, payload):
         # Deltas before a tool call are interim commentary the final reply does not repeat;

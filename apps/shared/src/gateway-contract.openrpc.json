@@ -4543,6 +4543,24 @@
       }
     },
     {
+      "name": "wake.diagnostics",
+      "summary": "Read or reset owner-scoped wake measurements without exposing audio.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/WakeDiagnosticsParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/WakeDiagnosticsResult"
+        }
+      }
+    },
+    {
       "name": "wake.feed",
       "summary": "Push client-captured PCM into the armed detector (mic-less remote backends).",
       "params": [
@@ -34921,6 +34939,18 @@
             "default": null,
             "title": "Stored Session Id"
           },
+          "persisted": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Persisted"
+          },
           "resumed": {
             "anyOf": [
               {
@@ -38346,6 +38376,7 @@
       },
       "SessionResumeResult": {
         "additionalProperties": false,
+        "description": "Authoritative reconciliation shape on every resume path.",
         "properties": {
           "session_id": {
             "title": "Session Id",
@@ -38366,16 +38397,12 @@
             "$ref": "#/components/schemas/SessionLiveInfo"
           },
           "stored_session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Stored Session Id"
+            "title": "Stored Session Id",
+            "type": "string"
+          },
+          "persisted": {
+            "title": "Persisted",
+            "type": "boolean"
           },
           "resumed": {
             "anyOf": [
@@ -38426,16 +38453,8 @@
             "title": "Hydrating"
           },
           "running": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Running"
+            "title": "Running",
+            "type": "boolean"
           },
           "turn_started_at": {
             "anyOf": [
@@ -38462,16 +38481,8 @@
             "title": "Started At"
           },
           "status": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Status"
+            "title": "Status",
+            "type": "string"
           },
           "inflight": {
             "anyOf": [
@@ -38481,8 +38492,7 @@
               {
                 "type": "null"
               }
-            ],
-            "default": null
+            ]
           },
           "queued": {
             "anyOf": [
@@ -38492,8 +38502,7 @@
               {
                 "type": "null"
               }
-            ],
-            "default": null
+            ]
           },
           "pending_approval": {
             "anyOf": [
@@ -38559,7 +38568,13 @@
           "session_id",
           "message_count",
           "messages",
-          "info"
+          "info",
+          "stored_session_id",
+          "persisted",
+          "running",
+          "status",
+          "inflight",
+          "queued"
         ],
         "title": "SessionResumeResult",
         "type": "object"
@@ -46422,16 +46437,166 @@
         "title": "VerificationStatusResult",
         "type": "object"
       },
+      "VoiceInputErrorPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "owner_session_id": {
+            "title": "Owner Session Id",
+            "type": "string"
+          },
+          "lease_epoch": {
+            "title": "Lease Epoch",
+            "type": "integer"
+          },
+          "capture_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Capture Id"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "stage": {
+            "title": "Stage",
+            "type": "string"
+          },
+          "retryable": {
+            "title": "Retryable",
+            "type": "boolean"
+          },
+          "fatal": {
+            "title": "Fatal",
+            "type": "boolean"
+          },
+          "outcome": {
+            "title": "Outcome",
+            "type": "string"
+          },
+          "released": {
+            "title": "Released",
+            "type": "boolean"
+          },
+          "release_complete": {
+            "title": "Release Complete",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "owner_session_id",
+          "lease_epoch",
+          "message",
+          "stage",
+          "retryable",
+          "fatal",
+          "outcome",
+          "released",
+          "release_complete"
+        ],
+        "title": "VoiceInputErrorPayload",
+        "type": "object"
+      },
+      "VoiceInterruptedPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "owner_session_id": {
+            "title": "Owner Session Id",
+            "type": "string"
+          },
+          "lease_epoch": {
+            "title": "Lease Epoch",
+            "type": "integer"
+          },
+          "capture_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Capture Id"
+          }
+        },
+        "required": [
+          "owner_session_id",
+          "lease_epoch"
+        ],
+        "title": "VoiceInterruptedPayload",
+        "type": "object"
+      },
+      "VoiceOutputDrainedPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "owner_session_id": {
+            "title": "Owner Session Id",
+            "type": "string"
+          },
+          "lease_epoch": {
+            "title": "Lease Epoch",
+            "type": "integer"
+          },
+          "capture_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Capture Id"
+          }
+        },
+        "required": [
+          "owner_session_id",
+          "lease_epoch"
+        ],
+        "title": "VoiceOutputDrainedPayload",
+        "type": "object"
+      },
       "VoicePartialPayload": {
         "additionalProperties": false,
         "description": "``methods_voice`` voice.record ``on_partial`` \u2014 live STT text so far (``stt.streaming``).",
         "properties": {
+          "owner_session_id": {
+            "title": "Owner Session Id",
+            "type": "string"
+          },
+          "lease_epoch": {
+            "title": "Lease Epoch",
+            "type": "integer"
+          },
+          "capture_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Capture Id"
+          },
           "text": {
             "title": "Text",
             "type": "string"
           }
         },
         "required": [
+          "owner_session_id",
+          "lease_epoch",
           "text"
         ],
         "title": "VoicePartialPayload",
@@ -46497,6 +46662,52 @@
             ],
             "default": null,
             "title": "Reason"
+          },
+          "owner_session_id": {
+            "default": "",
+            "title": "Owner Session Id",
+            "type": "string"
+          },
+          "lease_epoch": {
+            "default": 0,
+            "title": "Lease Epoch",
+            "type": "integer"
+          },
+          "capture_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Capture Id"
+          },
+          "released": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Released"
+          },
+          "release_complete": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Release Complete"
           }
         },
         "required": [
@@ -46518,12 +46729,70 @@
         "additionalProperties": false,
         "description": "``methods_voice._vr_on_status``; states come from the recorder (idle / listening / transcribing \u2026).",
         "properties": {
+          "owner_session_id": {
+            "title": "Owner Session Id",
+            "type": "string"
+          },
+          "lease_epoch": {
+            "title": "Lease Epoch",
+            "type": "integer"
+          },
+          "capture_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Capture Id"
+          },
           "state": {
             "title": "State",
             "type": "string"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Outcome"
+          },
+          "released": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Released"
+          },
+          "release_complete": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Release Complete"
           }
         },
         "required": [
+          "owner_session_id",
+          "lease_epoch",
           "state"
         ],
         "title": "VoiceStatusPayload",
@@ -46545,6 +46814,18 @@
           "action": {
             "$ref": "#/components/schemas/VoiceToggleAction",
             "default": "status"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
           },
           "profile": {
             "anyOf": [
@@ -46637,6 +46918,52 @@
             ],
             "default": null,
             "title": "Details"
+          },
+          "owner_session_id": {
+            "default": "",
+            "title": "Owner Session Id",
+            "type": "string"
+          },
+          "lease_epoch": {
+            "default": 0,
+            "title": "Lease Epoch",
+            "type": "integer"
+          },
+          "capture_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Capture Id"
+          },
+          "released": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Released"
+          },
+          "release_complete": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Release Complete"
           }
         },
         "required": [
@@ -46651,6 +46978,26 @@
         "additionalProperties": false,
         "description": "``methods_voice._vr_transcript`` / ``_deliver_fd_transcript`` / typed stop phrase in methods_prompt.",
         "properties": {
+          "owner_session_id": {
+            "title": "Owner Session Id",
+            "type": "string"
+          },
+          "lease_epoch": {
+            "title": "Lease Epoch",
+            "type": "integer"
+          },
+          "capture_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Capture Id"
+          },
           "text": {
             "anyOf": [
               {
@@ -46698,8 +47045,36 @@
             ],
             "default": null,
             "title": "No Speech Limit"
+          },
+          "retryable_empty": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Retryable Empty"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Outcome"
           }
         },
+        "required": [
+          "owner_session_id",
+          "lease_epoch"
+        ],
         "title": "VoiceTranscriptPayload",
         "type": "object"
       },
@@ -46709,6 +47084,18 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
           },
           "profile": {
             "anyOf": [
@@ -46735,6 +47122,28 @@
           "status": {
             "title": "Status",
             "type": "string"
+          },
+          "owner_session_id": {
+            "default": "",
+            "title": "Owner Session Id",
+            "type": "string"
+          },
+          "lease_epoch": {
+            "default": 0,
+            "title": "Lease Epoch",
+            "type": "integer"
+          },
+          "capture_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Capture Id"
           }
         },
         "required": [
@@ -46852,6 +47261,148 @@
           "start_new_session"
         ],
         "title": "WakeDetectedPayload",
+        "type": "object"
+      },
+      "WakeDiagnosticsParams": {
+        "additionalProperties": false,
+        "properties": {
+          "reset": {
+            "default": false,
+            "title": "Reset",
+            "type": "boolean"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          }
+        },
+        "title": "WakeDiagnosticsParams",
+        "type": "object"
+      },
+      "WakeDiagnosticsResult": {
+        "additionalProperties": false,
+        "description": "Owner-only, bounded measurements; no captured audio is retained.",
+        "properties": {
+          "armed": {
+            "title": "Armed",
+            "type": "boolean"
+          },
+          "owned_by_caller": {
+            "title": "Owned By Caller",
+            "type": "boolean"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reason"
+          },
+          "capture": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Capture"
+          },
+          "external_audio": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "External Audio"
+          },
+          "processed_frames": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Processed Frames"
+          },
+          "pcm_peak": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Pcm Peak"
+          },
+          "client_queue": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "integer"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Client Queue"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Score"
+          }
+        },
+        "required": [
+          "armed",
+          "owned_by_caller"
+        ],
+        "title": "WakeDiagnosticsResult",
         "type": "object"
       },
       "WakeFeedParams": {
@@ -47049,10 +47600,20 @@
           "paused": {
             "title": "Paused",
             "type": "boolean"
+          },
+          "released": {
+            "title": "Released",
+            "type": "boolean"
+          },
+          "release_complete": {
+            "title": "Release Complete",
+            "type": "boolean"
           }
         },
         "required": [
-          "paused"
+          "paused",
+          "released",
+          "release_complete"
         ],
         "title": "WakePauseResult",
         "type": "object"
@@ -47075,10 +47636,20 @@
           "resumed": {
             "title": "Resumed",
             "type": "boolean"
+          },
+          "released": {
+            "title": "Released",
+            "type": "boolean"
+          },
+          "release_complete": {
+            "title": "Release Complete",
+            "type": "boolean"
           }
         },
         "required": [
-          "resumed"
+          "resumed",
+          "released",
+          "release_complete"
         ],
         "title": "WakeResumeResult",
         "type": "object"
@@ -47461,11 +48032,21 @@
           "disabled_persisted": {
             "title": "Disabled Persisted",
             "type": "boolean"
+          },
+          "released": {
+            "title": "Released",
+            "type": "boolean"
+          },
+          "release_complete": {
+            "title": "Release Complete",
+            "type": "boolean"
           }
         },
         "required": [
           "stopped",
-          "disabled_persisted"
+          "disabled_persisted",
+          "released",
+          "release_complete"
         ],
         "title": "WakeStopResult",
         "type": "object"
@@ -49790,14 +50371,37 @@
       ]
     },
     {
-      "name": "voice.interrupted",
-      "summary": "Barge-in: the spoken interjection interrupted the turn; no payload.",
+      "name": "voice.input_error",
+      "summary": "The scoped microphone/STT pipeline failed terminally.",
       "params": [
         {
           "name": "payload",
           "schema": {
-            "type": "object",
-            "additionalProperties": false
+            "$ref": "#/components/schemas/VoiceInputErrorPayload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "voice.interrupted",
+      "summary": "Barge-in interrupted the lease owner's turn.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/VoiceInterruptedPayload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "voice.output_drained",
+      "summary": "The owning turn and every backend audio-output pipeline are idle.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/VoiceOutputDrainedPayload"
           }
         }
       ]

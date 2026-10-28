@@ -788,28 +788,56 @@ event("browser.controller.cancel", BrowserControllerCancelPayload, doc="Withdraw
 # ── voice ─────────────────────────────────────────────────────────────────────────────────────
 
 
-event("voice.interrupted", None, doc="Barge-in: the spoken interjection interrupted the turn; no payload.")
+class VoiceScopePayload(Payload):
+    """The immutable input lease that produced a voice event."""
+
+    owner_session_id: str
+    lease_epoch: int
+    capture_id: str | None = None
 
 
-class VoiceStatusPayload(Payload):
+class VoiceInterruptedPayload(VoiceScopePayload):
+    pass
+
+
+class VoiceStatusPayload(VoiceScopePayload):
     """``methods_voice._vr_on_status``; states come from the recorder (idle / listening / transcribing …)."""
 
     state: str
+    outcome: str | None = None
+    released: bool | None = None
+    release_complete: bool | None = None
 
 
-class VoicePartialPayload(Payload):
+class VoicePartialPayload(VoiceScopePayload):
     """``methods_voice`` voice.record ``on_partial`` — live STT text so far (``stt.streaming``)."""
 
     text: str
 
 
-class VoiceTranscriptPayload(Payload):
+class VoiceTranscriptPayload(VoiceScopePayload):
     """``methods_voice._vr_transcript`` / ``_deliver_fd_transcript`` / typed stop phrase in methods_prompt."""
 
     text: str | None = None
     stop_phrase: bool | None = None
     typed: bool | None = None
     no_speech_limit: bool | None = None
+    retryable_empty: bool | None = None
+    outcome: str | None = None
+
+
+class VoiceOutputDrainedPayload(VoiceScopePayload):
+    pass
+
+
+class VoiceInputErrorPayload(VoiceScopePayload):
+    message: str
+    stage: str  # provider | open | read | stt | close
+    retryable: bool
+    fatal: bool
+    outcome: str  # error
+    released: bool
+    release_complete: bool
 
 
 class WakeDetectedPayload(Payload):
@@ -820,9 +848,13 @@ class WakeDetectedPayload(Payload):
     start_new_session: bool
 
 
+event("voice.interrupted", VoiceInterruptedPayload, doc="Barge-in interrupted the lease owner's turn.")
 event("voice.status", VoiceStatusPayload, doc="Voice recorder state changed.")
 event("voice.partial", VoicePartialPayload, doc="Live STT text so far while the user is still speaking.")
 event("voice.transcript", VoiceTranscriptPayload, doc="A voice capture produced text (or a stop phrase / silence limit).")
+event("voice.input_error", VoiceInputErrorPayload, doc="The scoped microphone/STT pipeline failed terminally.")
+event("voice.output_drained", VoiceOutputDrainedPayload,
+      doc="The owning turn and every backend audio-output pipeline are idle.")
 event("wake.detected", WakeDetectedPayload, doc="A wake phrase fired.")
 
 
@@ -896,6 +928,6 @@ __all__ = [
     "TerminalOutputPayload", "TipShowPayload", "TodoUpdatedPayload", "ToolCompletePayload",
     "ToolGeneratingPayload", "ToolLabel", "ToolLabelKind", "ToolOutputRiskPayload", "ToolProgressPayload",
     "ToolStartPayload",
-    "TurnStatus", "VoicePartialPayload", "VoiceStatusPayload",
+    "TurnStatus", "VoiceOutputDrainedPayload", "VoicePartialPayload", "VoiceStatusPayload",
     "VoiceTranscriptPayload", "WakeDetectedPayload",
 ]

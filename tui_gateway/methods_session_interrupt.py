@@ -11,7 +11,7 @@ from .method_ctx import HandlerRegistry, bind_module
 _registry = HandlerRegistry()
 method = _registry.method
 
-def _resume_wake_after_interrupt() -> None:
+def _resume_wake_after_interrupt(session_id: str = "") -> None:
     """Re-arm a wake lease held by the interrupt caller or a voice capture.
 
     ``_wake_resume_if_owner`` no-ops unless that object holds the lease, so an
@@ -20,7 +20,11 @@ def _resume_wake_after_interrupt() -> None:
     ``not_interrupted`` hosted-task mismatch must not call it.
     """
     with _voice_sid_lock:
-        voice_owner = _voice_wake_owner
+        # Legacy captures may only have a wake owner. Once a scoped microphone
+        # lease exists, an interrupt from another session cannot resume it.
+        voice_owner = _voice_wake_owner if (
+            not _voice_lease_owner_sid or _voice_lease_owner_sid == session_id
+        ) else None
     seen = []
     for owner in (_caller_transport(), voice_owner):
         if owner is None or any(owner is item for item in seen):
@@ -69,8 +73,8 @@ def _recover_unreachable_compute_host_turn(sid: str, session: dict, inflight_at_
 
 @method("session.interrupt")
 def _(rid, params: dict) -> dict:
-    _tts_stream_stop()  # keypress barge-in also silences streaming TTS (voice is process-global)
     resume_wake = True
+    sid = str(params.get("session_id") or "")
     try:
         session, err = _sess_nowait(params, rid)
         if err:
@@ -81,7 +85,12 @@ def _(rid, params: dict) -> dict:
                 if not (session.get("running") and isinstance(task, dict) and task.get("task_id") == expected):
                     resume_wake = False
                     return _ok(rid, {"status": "not_interrupted", "interrupted": False})
-        sid = str(params.get("session_id") or "")
+        owner_sid, _epoch, _owner_transport, _capture_id = _voice_scope_snapshot()
+        if not owner_sid or owner_sid == sid:
+            # One speaker belongs to the active voice session. A typed Stop in
+            # another session still interrupts that agent, but never cuts the
+            # owner's reply audio.
+            _tts_stream_stop()
         _note_user_input(session)
         if _session_uses_compute_host(session):
             with session["history_lock"]:
@@ -106,7 +115,7 @@ def _(rid, params: dict) -> dict:
     finally:
         if resume_wake:
             try:
-                _resume_wake_after_interrupt()
+                _resume_wake_after_interrupt(sid)
             except Exception:
                 logger.debug("session.interrupt wake resume failed", exc_info=True)
 

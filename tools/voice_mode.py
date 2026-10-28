@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 from collections import deque
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 import tempfile
 import threading
@@ -61,6 +61,26 @@ def _import_audio():
     return sd, np
 
 
+def _import_numpy():
+    """Import the provider-neutral PCM math dependency.
+
+    RK/server installs carry numpy through ``server-voice`` without pulling in
+    sounddevice or PortAudio.
+    """
+    import numpy as np
+
+    return np
+
+
+def _provider_numpy(provider):
+    """Use the existing PortAudio import seam for desktop tests and lean RK numpy otherwise."""
+    from tools.voice_input import PortAudioVoiceInputProvider
+
+    if isinstance(provider, PortAudioVoiceInputProvider):
+        return _import_audio()[1]
+    return _import_numpy()
+
+
 def _sounddevice_output_allowed() -> bool:
     """False on macOS: PortAudio/CoreAudio OUTPUT init triggers a kTCCServiceMediaLibrary
     prompt, so output goes through ``afplay`` there. Input (recording) is unaffected.
@@ -104,6 +124,16 @@ def _unlink_quietly(path: Optional[str]) -> None:
 
 
 def _audio_unavailable_reason() -> str:
+    from tools.voice_input import configured_voice_input_provider, get_voice_input_provider
+
+    if configured_voice_input_provider() != "portaudio":
+        try:
+            provider = get_voice_input_provider()
+            if provider.is_available():
+                return ""
+            return f"{configured_voice_input_provider()} input executable is unavailable"
+        except Exception as exc:
+            return str(exc)
     try:
         _import_audio()
     except ImportError as exc:
@@ -114,10 +144,11 @@ def _audio_unavailable_reason() -> str:
 
 
 def _audio_available() -> bool:
+    from tools.voice_input import get_voice_input_provider
+
     try:
-        _import_audio()
-        return True
-    except (ImportError, OSError):
+        return bool(get_voice_input_provider(import_audio=_import_audio).is_available())
+    except (ImportError, OSError, ValueError):
         return False
 
 
@@ -293,6 +324,20 @@ def detect_audio_environment() -> dict:
     SSH, containers and WSL normally have no audio devices, but a reachable sound
     server (PulseAudio/PipeWire socket or forwarding env vars) is honored.
     """
+    from tools.voice_input import configured_voice_input_provider, get_voice_input_provider
+
+    provider_name = configured_voice_input_provider()
+    if provider_name != "portaudio":
+        try:
+            available = bool(get_voice_input_provider().is_available())
+        except Exception as exc:
+            return {"available": False, "warnings": [str(exc)], "notices": []}
+        return {
+            "available": available,
+            "warnings": [] if available else [f"{provider_name} input executable is unavailable"],
+            "notices": [f"Audio capture uses the configured {provider_name} provider"] if available else [],
+        }
+
     warnings, notices = [], []
     termux_mic_cmd = _termux_microphone_command()
     termux_app_installed = _termux_api_app_installed()
@@ -556,6 +601,7 @@ class _RecorderBase:
         self._recording, self._start_time, self._current_rms = False, 0.0, 0
         # Live STT (``stt.streaming``): hosts set ``on_live_partial`` to render partial text.
         self.on_live_partial: Optional[Callable[[str], None]] = None
+        self.on_input_error: Optional[Callable[[BaseException], None]] = None
         self._live: Any = None
 
     def _open_live_session(self, sample_rate: int) -> None:
@@ -671,6 +717,8 @@ class AudioRecorder(_RecorderBase):
     def __init__(self) -> None:
         super().__init__()
         self._stream: Any = None
+        self._provider_stream: Any = None
+        self._provider: Any = None
         self._frames: list[Any] = []
         self._sample_rate: int = SAMPLE_RATE
         self._on_silence_stop = None
@@ -779,6 +827,21 @@ class AudioRecorder(_RecorderBase):
         if self._should_auto_stop(rms, now):
             self._fire_silence_callback()
 
+    def _on_stream_error(self, error: BaseException) -> None:
+        """Stop accepting PCM and forward an asynchronous provider failure once."""
+        with self._lock:
+            self._recording = False
+            callback = self.on_input_error
+        live = self._detach_live()
+        if live is not None:
+            with suppress(Exception):
+                live.cancel()
+        if callback is not None:
+            try:
+                callback(error)
+            except Exception:
+                logger.debug("voice input error callback failed", exc_info=True)
+
     def _ensure_stream(self) -> None:
         """Create the audio InputStream and keep it alive while usable.
 
@@ -789,16 +852,20 @@ class AudioRecorder(_RecorderBase):
         can still deactivate the stream when another input stream opens; in
         that case the dead object must be closed and rebuilt before capture.
         """
-        if self._stream is not None:
+        active_stream = self._provider_stream or self._stream
+        if active_stream is not None:
             try:
-                if self._stream.active:
+                if active_stream.active:
                     return
             except Exception:
                 logger.debug("Audio input stream liveness probe failed", exc_info=True)
 
             logger.debug("Rebuilding inactive audio input stream")
             self._close_stream_with_timeout()
-        sd, np = _import_audio()
+        from tools.voice_input import get_voice_input_provider
+
+        provider = get_voice_input_provider(import_audio=_import_audio)
+        np = _provider_numpy(provider)
 
         def _callback(indata, frames, time_info, status):
             if status:
@@ -809,8 +876,9 @@ class AudioRecorder(_RecorderBase):
         stream = None
         for attempt in range(2):
             try:  # may block on CoreAudio (first call only)
-                stream = sd.InputStream(samplerate=self._sample_rate, channels=CHANNELS, dtype=DTYPE,
-                                        callback=_callback)
+                stream = provider.open_stream(
+                    phase="ordinary", sample_rate=self._sample_rate, channels=CHANNELS,
+                    dtype=DTYPE, callback=_callback, on_error=self._on_stream_error)
                 stream.start()
                 break
             except Exception as e:
@@ -826,17 +894,28 @@ class AudioRecorder(_RecorderBase):
                         f"Failed to open audio input stream: {e}. "
                         "Check that a microphone is connected and accessible.") from e
                 logger.info("Audio input stream start timed out; retrying once")
-        self._stream = stream
+        from tools.voice_input import PortAudioVoiceInputProvider
+        self._provider = provider
+        self._provider_stream = stream
+        # Keep the established desktop recorder seam: tests/plugins inspecting
+        # ``_stream`` still see the native PortAudio object.
+        self._stream = stream._raw if isinstance(provider, PortAudioVoiceInputProvider) else stream
 
     def start(self, on_silence_stop=None) -> None:
         """Start capturing; *on_silence_stop* is invoked (daemon thread, no args) when
         silence follows speech. Raises ``RuntimeError`` if sounddevice/numpy are missing."""
+        from tools.voice_input import get_voice_input_provider
         try:
-            sd, _ = _import_audio()
+            provider = get_voice_input_provider(import_audio=_import_audio)
+            _provider_numpy(provider)
         except OSError as e:
             raise RuntimeError(_portaudio_missing_message()) from e
         except ImportError as e:
-            raise RuntimeError(f"Voice mode requires sounddevice and numpy.\n{_voice_capture_install_hint(e)}") from e
+            from tools.voice_input import PortAudioVoiceInputProvider
+            prefix = ("Voice mode requires sounddevice and numpy."
+                      if isinstance(provider, PortAudioVoiceInputProvider)
+                      else "Voice mode requires its configured input provider and numpy.")
+            raise RuntimeError(f"{prefix}\n{e}") from e
         with self._lock:
             if self._recording:
                 return
@@ -846,24 +925,37 @@ class AudioRecorder(_RecorderBase):
             self._peak_rms = 0
             self._current_rms = 0
             self._on_silence_stop = on_silence_stop
-        self._sample_rate = _default_input_samplerate(sd)
+        self._sample_rate = provider.preferred_sample_rate()
         self._ensure_stream()
         self._open_live_session(self._sample_rate)
         with self._lock:
             self._recording = True
         logger.info("Voice recording started (rate=%d, channels=%d)", self._sample_rate, CHANNELS)
 
-    def _close_stream_with_timeout(self, timeout: float = 3.0) -> None:
+    def _close_stream_with_timeout(self, timeout: float = 3.0, *, strict: bool = False) -> None:
         """Close the stream with a timeout to prevent CoreAudio hangs."""
-        if self._stream is None:
+        if self._stream is None and self._provider_stream is None:
             return
-        stream, self._stream = self._stream, None
+        stream = self._provider_stream or self._stream
+        provider_owned = self._provider_stream is not None
+        self._provider_stream, self._stream = None, None
+        errors: list[BaseException] = []
 
         def _do_close():
-            with suppress(Exception):
-                stream.stop()
-            with suppress(Exception):
-                stream.close()
+            if not provider_owned:
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+                try:
+                    stream.close()
+                except BaseException as exc:
+                    errors.append(exc)
+                return
+            try:
+                stream.close(timeout=timeout)
+            except BaseException as exc:
+                errors.append(exc)
 
         t = threading.Thread(target=_do_close, daemon=True)
         t.start()
@@ -872,12 +964,23 @@ class AudioRecorder(_RecorderBase):
         while t.is_alive() and clock.monotonic() < deadline:  # short joins keep Ctrl+C responsive
             t.join(timeout=0.1)
         if t.is_alive():
-            logger.warning("Audio stream close timed out after %.1fs — forcing ahead", timeout)
+            message = f"Audio stream close timed out after {timeout:.1f}s"
+            if strict:
+                from tools.voice_input import VoiceInputReleaseError
+                raise VoiceInputReleaseError(message)
+            logger.warning("%s — forcing ahead", message)
+        if errors:
+            if strict:
+                from tools.voice_input import VoiceInputReleaseError
+                raise VoiceInputReleaseError(f"voice input close failed: {errors[0]}") from errors[0]
+            logger.warning("Audio stream close failed: %s", errors[0])
 
     def stop(self) -> Optional[str]:
         """Stop recording (stream stays alive) and return the WAV path, or None if unusable."""
         wav_path = self._stop_capture()
         _park_live_session(wav_path, self._detach_live())
+        if self._provider is not None and self._provider.requires_exclusive_handoff:
+            self._close_stream_with_timeout(strict=True)
         return wav_path
 
     def _stop_capture(self) -> Optional[str]:
@@ -887,7 +990,7 @@ class AudioRecorder(_RecorderBase):
             self._recording, self._current_rms = False, 0
             if not self._frames:
                 return None
-            _, np = _import_audio()
+            np = _provider_numpy(self._provider)
             audio_data = np.concatenate(self._frames, axis=0)
             self._frames = []
             logger.info("Voice recording stopped (%.1fs, %d samples)",
@@ -915,6 +1018,8 @@ class AudioRecorder(_RecorderBase):
     def cancel(self) -> None:
         """Stop recording and discard all captured audio (stream stays alive)."""
         self._discard()
+        if self._provider is not None and self._provider.requires_exclusive_handoff:
+            self._close_stream_with_timeout(strict=True)
         logger.info("Voice recording cancelled")
 
     def shutdown(self) -> None:
@@ -1412,6 +1517,8 @@ def full_duplex_listen(
     on_trigger: Optional[Callable[[str], None]] = None, multiplier: Optional[float] = None,
     sustained_ms: int = 300, calibration_ms: int = 450, grace_ms: int = 500, pre_roll_ms: int = 1200,
     endpoint_silence_ms: int = 1250, max_utterance_ms: int = 30_000,
+    on_input_error: Optional[Callable[[BaseException], None]] = None,
+    start_barrier: Optional[Callable[[], Any]] = None,
 ) -> Optional[str]:
     """Listen across an ENTIRE agent turn; return the captured interruption WAV path.
 
@@ -1424,9 +1531,16 @@ def full_duplex_listen(
     from the *pre_roll_ms* buffer until *endpoint_silence_ms* of quiet. ``None``
     when *should_stop* ends the turn without speech.
     """
+    from tools.voice_input import VoiceInputError, get_voice_input_provider
+
     try:
-        sd, np = _import_audio()
-    except (ImportError, OSError):
+        provider = get_voice_input_provider(import_audio=_import_audio)
+        np = _provider_numpy(provider)
+    except Exception as exc:
+        error = exc if isinstance(exc, VoiceInputError) else VoiceInputError(
+            f"voice input provider failed: {exc}", stage="provider", retryable=True)
+        if on_input_error is not None:
+            on_input_error(error)
         return None
     block = int(SAMPLE_RATE * 0.03)  # 30ms blocks
     endpoint_blocks = max(1, endpoint_silence_ms // 30)
@@ -1435,8 +1549,17 @@ def full_duplex_listen(
         calib_blocks=max(1, calibration_ms // 30), trip_blocks=max(1, sustained_ms // 30),
         grace_blocks=max(0, grace_ms // 30))
     pre_roll: deque = deque(maxlen=max(1, pre_roll_ms // 30))
+    stream = None
     try:
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=block) as stream:
+        barrier = start_barrier() if start_barrier is not None else nullcontext(True)
+        with barrier as allowed:
+            if allowed is False:
+                return None
+            stream = provider.open_stream(
+                phase="full_duplex", sample_rate=SAMPLE_RATE, channels=1, dtype="int16",
+                blocksize=block, on_error=on_input_error)
+            stream.start()
+        try:
             while not should_stop():
                 data, _ = stream.read(block)
                 pre_roll.append(data.copy())
@@ -1451,8 +1574,14 @@ def full_duplex_listen(
                         logger.debug("full-duplex trigger callback failed: %s", e)
                 return _capture_until_quiet(stream, np, block, pre_roll, endpoint_blocks=endpoint_blocks,
                                             max_blocks=max(1, max_utterance_ms // 30))
+        finally:
+            stream.close()
     except Exception as e:
-        logger.debug("Full-duplex listener failed: %s", e)
+        error = e if isinstance(e, VoiceInputError) else VoiceInputError(
+            f"full-duplex voice input failed: {e}", stage="read", retryable=True)
+        logger.debug("Full-duplex listener failed: %s", error)
+        if on_input_error is not None:
+            on_input_error(error)
     return None
 
 

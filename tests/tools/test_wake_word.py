@@ -492,6 +492,34 @@ class _FakeEngine:
         self.closed = True
 
 
+def test_client_capture_diagnostics_are_owner_scoped_and_resettable(monkeypatch):
+    detector = ww.WakeWordDetector(
+        _FakeEngine(fire=False), lambda: None, external_audio=True
+    )
+    owner, other = object(), object()
+    monkeypatch.setattr(ww, "_detector", detector)
+    monkeypatch.setattr(ww, "_detector_owner", owner)
+    pcm = _Frame([100, -900, 250, 10])
+
+    assert ww.get_wake_diagnostics(owner=other, reset=True) == {
+        "armed": True,
+        "owned_by_caller": False,
+        "reason": "not_owner",
+    }
+    queued = ww.get_wake_diagnostics(owner=owner)
+    assert queued["capture"] == "client"
+    assert queued["client_queue"] == {"depth": 0, "drops": 0}
+    assert queued["processed_frames"] == 0
+    detector._note_frame_diagnostics(pcm)
+    observed = ww.get_wake_diagnostics(owner=owner)
+    assert observed["processed_frames"] == 1
+    assert observed["pcm_peak"] == {"latest": 900, "peak": 900}
+    cleared = ww.get_wake_diagnostics(owner=owner, reset=True)
+    assert cleared["processed_frames"] == 0
+    assert cleared["pcm_peak"] == {"latest": None, "peak": None}
+    assert cleared["client_queue"]["drops"] == 0
+
+
 def _fake_audio(monkeypatch):
     fake_sd = types.SimpleNamespace(InputStream=lambda **kw: _FakeStream(**kw))
     monkeypatch.setattr(ww, "_import_audio", lambda: (fake_sd, None))

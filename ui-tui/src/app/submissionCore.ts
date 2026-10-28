@@ -162,7 +162,11 @@ function settleControlReply(
     item.settle?.(true)
 
     if (deps.gw.isCanonical) {
-      deps.gw.publishLocalEvent({ payload: { stop_phrase: true, typed: true }, session_id: sid, type: 'voice.transcript' })
+      deps.gw.publishLocalEvent({
+        payload: { lease_epoch: 0, owner_session_id: sid, stop_phrase: true, typed: true },
+        session_id: sid,
+        type: 'voice.transcript'
+      })
     }
 
     return true
@@ -416,7 +420,7 @@ export function submitPrompt(
 
           if (deps.gw.isCanonical) {
             deps.gw.publishLocalEvent({
-              payload: { stop_phrase: true, typed: true },
+              payload: { lease_epoch: 0, owner_session_id: sid, stop_phrase: true, typed: true },
               session_id: sid,
               type: 'voice.transcript'
             })

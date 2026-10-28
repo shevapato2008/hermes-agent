@@ -20,7 +20,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Optional
 
 # The engine classes are re-exported on purpose: _build_engine resolves the
 # _PROVIDERS names on THIS module so a test (or plugin) can swap one engine.
@@ -511,6 +511,11 @@ class WakeWordDetector:
         self._lock, self._last_fire = threading.Lock(), 0.0
         # Client-capture PCM queue (int16 mono frames). Local mode ignores this.
         self._audio_q: queue.Queue[Any] = queue.Queue(maxsize=64)
+        self._diagnostics_lock = threading.Lock()
+        self._latest_pcm_peak: int | None = None
+        self._peak_pcm_peak: int | None = None
+        self._processed_frames = 0
+        self._client_queue_drops = 0
         # True when the stream is open but every frame is (near-)silence, so status
         # surfaces can tell "armed" from "deaf".
         self.audio_silent, self._silent_frames = False, 0
@@ -544,10 +549,58 @@ class WakeWordDetector:
                 self._audio_q.put_nowait(chunk)
             except Exception:
                 # Drop oldest on overflow so we stay real-time
-                with suppress(Exception):
+                dropped = False
+                try:
                     self._audio_q.get_nowait()
+                    dropped = True
+                except Exception:
+                    pass
+                if dropped:
+                    with self._diagnostics_lock:
+                        self._client_queue_drops += 1
                 with suppress(Exception):
                     self._audio_q.put_nowait(chunk)
+
+    def _note_frame_diagnostics(self, frame) -> None:
+        """Record only bounded scalar measurements, never PCM."""
+        try:
+            peak = int(abs(frame).max()) if len(frame) else 0
+        except Exception:
+            peak = _SILENCE_PEAK + 1
+        with self._diagnostics_lock:
+            self._processed_frames += 1
+            self._latest_pcm_peak = peak
+            if self._peak_pcm_peak is None or peak > self._peak_pcm_peak:
+                self._peak_pcm_peak = peak
+
+    def diagnostics(self, *, reset: bool = False) -> dict[str, Any]:
+        """Return/reset this detector's bounded, JSON-safe measurement window."""
+        with self._diagnostics_lock:
+            if reset:
+                self._latest_pcm_peak = None
+                self._peak_pcm_peak = None
+                self._processed_frames = 0
+                self._client_queue_drops = 0
+            snapshot: dict[str, Any] = {
+                "capture": "client" if self.external_audio else "local",
+                "external_audio": self.external_audio,
+                "processed_frames": self._processed_frames,
+                "pcm_peak": {
+                    "latest": self._latest_pcm_peak,
+                    "peak": self._peak_pcm_peak,
+                },
+                "client_queue": {
+                    "depth": self._audio_q.qsize(),
+                    "drops": self._client_queue_drops,
+                },
+            }
+        score_diagnostics = getattr(self.engine, "score_diagnostics", None)
+        if callable(score_diagnostics):
+            with suppress(Exception):
+                score = score_diagnostics(reset=reset)
+                if isinstance(score, dict):
+                    snapshot["score"] = score
+        return snapshot
 
     def start(self) -> None:
         """Open the mic (or client feeder) and begin listening. Idempotent."""
@@ -740,6 +793,7 @@ class WakeWordDetector:
                 frame = data[:, 0] if getattr(data, "ndim", 1) == 2 else data
                 if cap.rate != SAMPLE_RATE:
                     frame = _resample_audio_frame(cap.np, frame, frame_length)
+                self._note_frame_diagnostics(frame)
                 self._note_silence(frame, silent_alert_frames)
                 try:
                     if self.engine.process(frame):
@@ -917,6 +971,21 @@ def get_last_match() -> Optional[tuple[str, str]]:
     """(matched phrase, profile) of the most recent wake fire when the engine reports
     per-phrase matches (sherpa multi-profile routing); None otherwise."""
     return None if (det := _current_detector()) is None else getattr(det.engine, "last_match", None)
+
+
+def get_wake_diagnostics(*, owner: object, reset: bool = False) -> dict[str, Any]:
+    """Return measurements only to the active detector's exact owner."""
+    with _detector_lock:
+        if _detector is None:
+            return {"armed": False, "owned_by_caller": False, "reason": "unarmed"}
+        if owner is None or _detector_owner is not owner:
+            return {"armed": True, "owned_by_caller": False, "reason": "not_owner"}
+        return {
+            "armed": True,
+            "owned_by_caller": True,
+            "reason": None,
+            **_detector.diagnostics(reset=reset),
+        }
 
 
 def feed_audio(*, owner: object, pcm_int16) -> bool:

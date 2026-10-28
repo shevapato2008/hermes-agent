@@ -255,9 +255,22 @@ def _consume_typed_stop_phrase(text, sid=None, *, emit: bool = True) -> bool:
     except Exception:  # an unreadable voice config never swallows the message: it reaches the agent
         logger.debug("typed stop-phrase check failed; submitting the text", exc_info=True)
         return False
-    _end_session_voice_chat(sid, stop_loop=True, stop_tts=True)
+    owner, epoch, transport, capture_id = _voice_scope_snapshot()
+    if owner and owner != str(sid or ""):
+        return False
+    if not owner:
+        transport = _caller_transport()
+        epoch = _acquire_voice_lease(str(sid or ""), transport)
+        if epoch is None:
+            return False
+        owner, epoch, transport, capture_id = _voice_scope_snapshot()
+    if not _end_session_voice_chat(sid, stop_loop=True, stop_tts=True):
+        return False
     if emit:
-        _voice_emit("voice.transcript", {"stop_phrase": True, "typed": True})
+        _voice_emit(
+            "voice.transcript", {"stop_phrase": True, "typed": True},
+            session_id=owner, lease_epoch=epoch, transport=transport,
+            capture_id=capture_id)
     logger.info("prompt.submit: typed stop phrase — voice chat ended")
     return True
 

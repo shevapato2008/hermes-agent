@@ -1241,6 +1241,18 @@ DEFAULT_CONFIG = {
         },
         "record_key": "ctrl+b",
         "submit_mode": "direct",  # TUI: direct submits immediately; draft = editable transcript
+        # Physical microphone backend. PortAudio preserves the upstream desktop default; RK
+        # deployments use a private Pulse server/source through the bounded ``parec`` provider.
+        "input": {
+            "provider": "portaudio",  # portaudio | pulse_cli
+            "exclusive_handoff": False,
+            "release_timeout_seconds": 3.0,
+            "pulse_cli": {
+                "server": "",
+                "source": "echo-cancel-source",
+                "executable": "parec",
+            },
+        },
         "max_recording_seconds": 120,
         "auto_tts": False,
         # Desktop remote clients call STT/TTS providers DIRECTLY (config + key fetched over

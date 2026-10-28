@@ -617,6 +617,10 @@ class _Resume:
 
     def __init__(self, rid, params: dict, target: str) -> None:
         self.rid, self.params, self.target = rid, params, target
+        # ``target`` may advance to a compression tip. Keep the caller's
+        # lineage key so reconciliation can update its durable alias without
+        # pretending the original request named the rotated id.
+        self.lineage_key = target
         self.db, self.owns_db, self.found, self.profile_resume_cwd = None, False, None, ""
         self.cols = _int_param(params, "cols", 80)
         # ``profile`` (app-global remote mode): resume from another local profile's state.db.
@@ -707,6 +711,11 @@ def _find_live_unpersisted(needle: str, home) -> str:
     return next((
         live_sid for live_sid, record in list(_sessions.items())
         if isinstance(record, dict) and (record.get("profile_home") or None) == want_home
+        # Cold/deferred/lazy durable resumes also live in this registry while
+        # hydrating, but carry their original durable lineage key. They must
+        # keep the native DB/reuse path (including hydrating truth and rotated
+        # compression tips) rather than masquerade as a fresh draft.
+        and not record.get("resume_session_id")
         and (str(record.get("session_key") or "") == needle or (record.get("pending_title") or "") == needle)), "")
 
 
@@ -719,22 +728,36 @@ def _resume_live_unpersisted(ctx: _Resume, live_sid: str, live: dict) -> dict:
     with _session_resume_lock:
         if (refusal := _reattach_refusal(ctx.rid, live_sid, live)) is not None:
             return refusal
-        live["last_active"] = time.time()
-        if (transport := current_transport()) is not None:
-            with live.setdefault("history_lock", threading.Lock()):
-                _rebind_live_transport(live_sid, live, transport)
-        else:
+        history_lock = live.setdefault("history_lock", threading.Lock())
+        transport = current_transport()
+        if transport is None:
             _cancel_ws_orphan_reap(live_sid)
-    messages = ctx.messages(live.get("history") or [])  # count the wire, as every other resume path does
+        # This path is selected before opening state.db: the record has not been persisted yet, so the
+        # in-memory projection is both authoritative and the only useful source. Reuse the normal live
+        # snapshot for running/inflight/queued/status truth while deliberately suppressing its DB read.
+        payload = _live_session_payload(
+            live_sid, live, cols=ctx.cols, touch=True, omit_messages=True, transport=transport)
+    if not ctx.omit_messages:
+        with history_lock:
+            history = list(live.get("display_history_prefix") or []) + list(live.get("history") or [])
+        messages = ctx.messages(history)
+        payload.update(message_count=len(messages), messages=messages, messages_omitted=False)
     # The chat's own pick, not the profile default: a warm reattach that reported `_resolve_model()` flipped the
     # Desktop picker on every reload while the session was still live, and back once it had been dropped.
     model, provider = _live_session_identity(live)
-    return _ok(ctx.rid, _attach_todo_state({
-        "session_id": live_sid, "stored_session_id": str(live.get("session_key") or ""),
-        "message_count": len(messages), "messages": messages,
-        "info": {"model": model, "provider": provider, "lazy": True,
-                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
-                 "profile_name": profile_name_for_home(live.get("profile_home")) or _response_profile_name(ctx.profile)}}, live))
+    payload["info"].update(
+        model=model, provider=provider, lazy=True, desktop_contract=DESKTOP_BACKEND_CONTRACT,
+        profile_name=profile_name_for_home(live.get("profile_home")) or _response_profile_name(ctx.profile))
+    payload.update(
+        resumed=ctx.lineage_key,
+        stored_session_id=str(live.get("session_key") or ""),
+        persisted=False,
+        running=bool(payload.get("running", live.get("running"))),
+        status=str(payload.get("status") or ("working" if live.get("running") else "idle")),
+        inflight=payload.get("inflight"),
+        queued=payload.get("queued"),
+    )
+    return _ok(ctx.rid, payload)
 
 
 def _resume_adopt_stranded(ctx: _Resume) -> None:
@@ -809,9 +832,6 @@ def _resume_locate(ctx: _Resume) -> dict | None:
         # with empty history — the live mirror streams the turn and the row exists by upgrade time.
         ctx.found = {}
         return None
-    live_sid = _find_live_unpersisted(ctx.target, ctx.profile_home)
-    if (live := _sessions.get(live_sid) if live_sid else None) is not None:
-        return _resume_live_unpersisted(ctx, live_sid, live)
     if ctx.owns_db:
         _resume_adopt_stranded(ctx)
     if not ctx.found and not ctx.lazy and _is_server_minted_key(ctx.target) \
@@ -881,7 +901,15 @@ def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
     payload = _live_session_payload(sid, session, cols=ctx.cols, touch=True, omit_messages=ctx.omit_messages,
                                     transport=current_transport() or _stdio_transport,
                                     inline_images=ctx.inline_images)
-    payload["resumed"] = ctx.target
+    payload.update(
+        resumed=ctx.lineage_key,
+        stored_session_id=ctx.target,
+        persisted=True,
+        running=bool(payload.get("running", session.get("running"))),
+        status=str(payload.get("status") or ("working" if session.get("running") else "idle")),
+        inflight=payload.get("inflight"),
+        queued=payload.get("queued"),
+    )
     if ctx.defer_history:
         payload.update(messages=[], hydrating=bool(session.get("resume_hydrating")),
                        message_count=int(session.get("resume_message_count") or payload["message_count"]))
@@ -901,9 +929,11 @@ def _resume_response(
         messages = ctx.messages(display)
     if message_count is None:
         message_count = len(count_source) if ctx.omit_messages else len(messages)
-    payload = {"session_id": sid, "resumed": ctx.target, "message_count": message_count, "messages": messages,
+    payload = {"session_id": sid, "resumed": ctx.lineage_key,
+               "stored_session_id": ctx.target, "persisted": True,
+               "message_count": message_count, "messages": messages,
                **({"messages_omitted": ctx.omit_messages} if hydrating is None else {"hydrating": hydrating}),
-               "info": info, "inflight": None, "running": running, "session_key": ctx.target,
+               "info": info, "inflight": None, "queued": None, "running": running, "session_key": ctx.target,
                "started_at": record["created_at"] if started_at is None else started_at, "status": status}
     if auto_continue is not None:
         payload["auto_continue"] = auto_continue
@@ -1051,6 +1081,11 @@ def _(rid, params: dict) -> dict:
     if not (target := params.get("session_id", "")):
         return _err(rid, 4006, "session_id required")
     ctx = _Resume(rid, params, target)
+    # A freshly-created lazy session has no state.db row. Match the exact profile-scoped live record before
+    # opening SQLite; otherwise a reconnect needlessly depends on (and can be blocked by) the durable store.
+    live_sid = _find_live_unpersisted(ctx.target, ctx.profile_home)
+    if (live := _sessions.get(live_sid) if live_sid else None) is not None:
+        return _resume_live_unpersisted(ctx, live_sid, live)
     # Profile scope: a DEDICATED handle we own until the agent takes it; else the shared launch db.
     ctx.db, ctx.owns_db = _profile_session_db(ctx.profile_home)
     try:

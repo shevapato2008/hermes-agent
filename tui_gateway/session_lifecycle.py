@@ -660,6 +660,9 @@ def _teardown_popped_session(session: dict | None, *, end_reason: str = "tui_clo
             logger.debug("failed waiting for session turn thread", exc_info=True)
     if end_reason != "tui_shutdown":
         _settle_isolated_turn_before_close(session)
+    sid = str(session.get("_sid") or "")
+    if sid and _voice_scope_snapshot()[0] == sid:
+        _stop_session_voice_capture(sid)
     try:
         _teardown_session(session, end_reason=end_reason)
     finally:

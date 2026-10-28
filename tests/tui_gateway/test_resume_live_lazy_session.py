@@ -16,6 +16,8 @@ Contract:
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 import tui_gateway.server as srv
@@ -35,6 +37,7 @@ def live_lazy_session(home):
     sid = "live-lazy-1"
     record = {
         "history": [],
+        "history_lock": threading.Lock(),
         "last_active": 0.0,
         "pending_title": "Bot Chat",
         "pending_hidden": True,
@@ -58,6 +61,41 @@ def test_resume_by_stored_key_reattaches(live_lazy_session):
     assert "error" not in out, out
     assert out["result"]["session_id"] == sid
     assert out["result"]["stored_session_id"] == record["session_key"]
+    assert out["result"]["persisted"] is False
+    assert out["result"]["running"] is False
+    assert out["result"]["inflight"] is None
+    assert out["result"]["queued"] is None
+    assert out["result"]["status"] == "idle"
+
+
+def test_live_reattach_precedes_profile_database_lookup(live_lazy_session, monkeypatch):
+    _sid, record = live_lazy_session
+
+    def fail_if_opened(_profile_home):
+        pytest.fail("live-unpersisted resume must not open the profile database")
+
+    monkeypatch.setattr(srv, "_profile_session_db", fail_if_opened)
+    out = _resume({"profile": "ops", "session_id": record["session_key"], "omit_messages": True})
+    assert "error" not in out, out
+
+
+def test_live_reattach_projects_running_inflight_queue_and_status(live_lazy_session):
+    sid, record = live_lazy_session
+    record.update(
+        running=True,
+        inflight_turn={"user": "current", "assistant": "partial", "streaming": True},
+        queued_prompt={"text": "next", "transport": object()},
+    )
+
+    out = _resume({"profile": "ops", "session_id": record["session_key"], "omit_messages": True})
+    assert "error" not in out, out
+    result = out["result"]
+    assert result["session_id"] == sid
+    assert result["stored_session_id"] == record["session_key"]
+    assert result["running"] is True
+    assert result["status"] == "working"
+    assert result["inflight"] == {"user": "current", "assistant": "partial", "streaming": True}
+    assert result["queued"] == {"user": "next"}
 
 
 def test_resume_by_pending_title_reattaches(live_lazy_session):

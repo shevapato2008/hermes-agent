@@ -79,6 +79,7 @@ class LiveSessionSnapshot(Result):
     messages: list[TranscriptMessage]
     info: SessionLiveInfo
     stored_session_id: str | None = None
+    persisted: bool | None = None
     resumed: str | None = None
     session_key: str | None = None
     messages_omitted: bool | None = None
@@ -195,7 +196,14 @@ class SessionResumeParams(SessionParams):
 
 
 class SessionResumeResult(LiveSessionSnapshot):
-    pass
+    """Authoritative reconciliation shape on every resume path."""
+
+    stored_session_id: str
+    persisted: bool
+    running: bool
+    status: str
+    inflight: InflightTurn | None
+    queued: QueuedPrompt | None
 
 
 method("session.resume", params=SessionResumeParams, result=SessionResumeResult,

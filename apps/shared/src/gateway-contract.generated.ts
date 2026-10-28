@@ -2976,6 +2976,7 @@ export interface ApprovalRespondResult {
 }
 export interface VoiceToggleParams {
   action?: VoiceToggleAction
+  session_id?: string | null
   profile?: string | null
 }
 export type VoiceToggleAction = 'status' | 'on' | 'off' | 'tts'
@@ -2989,6 +2990,11 @@ export interface VoiceToggleResult {
   audio_available?: boolean | null
   stt_available?: boolean | null
   details?: string | null
+  owner_session_id?: string
+  lease_epoch?: number
+  capture_id?: string | null
+  released?: boolean | null
+  release_complete?: boolean | null
 }
 export interface VoiceRecordParams {
   action?: VoiceRecordAction
@@ -2999,14 +3005,23 @@ export type VoiceRecordAction = 'start' | 'stop'
 export interface VoiceRecordResult {
   status: VoiceRecordStatus
   reason?: string | null
+  owner_session_id?: string
+  lease_epoch?: number
+  capture_id?: string | null
+  released?: boolean | null
+  release_complete?: boolean | null
 }
 export type VoiceRecordStatus = 'recording' | 'stopped' | 'busy'
 export interface VoiceTtsParams {
   text: string
+  session_id?: string | null
   profile?: string | null
 }
 export interface VoiceTtsResult {
   status: string
+  owner_session_id?: string
+  lease_epoch?: number
+  capture_id?: string | null
 }
 /** ``surface`` names the caller ("tui" | "gui"); ``persist`` is the explicit gesture that also flips ``wake_word.enabled`` on; ``client_capture`` asks for PCM streamed via wake.feed. */
 export interface WakeStartParams {
@@ -3037,6 +3052,8 @@ export interface WakeStopResult {
   reason?: string | null
   stopped: boolean
   disabled_persisted: boolean
+  released: boolean
+  release_complete: boolean
 }
 export interface WakeControlParams {
   profile?: string | null
@@ -3044,10 +3061,14 @@ export interface WakeControlParams {
 export interface WakePauseResult {
   reason?: string | null
   paused: boolean
+  released: boolean
+  release_complete: boolean
 }
 export interface WakeResumeResult {
   reason?: string | null
   resumed: boolean
+  released: boolean
+  release_complete: boolean
 }
 export interface WakeStatusParams {
   surface?: string | null
@@ -3082,6 +3103,22 @@ export interface WakeInputDevice {
   hostapi_index?: number | null
   hostapi?: string | null
   [key: string]: unknown
+}
+export interface WakeDiagnosticsParams {
+  reset?: boolean
+  profile?: string | null
+}
+/** Owner-only, bounded measurements; no captured audio is retained. */
+export interface WakeDiagnosticsResult {
+  armed: boolean
+  owned_by_caller: boolean
+  reason?: string | null
+  capture?: string | null
+  external_audio?: boolean | null
+  processed_frames?: number | null
+  pcm_peak?: Record<string, number | null> | null
+  client_queue?: Record<string, number> | null
+  score?: Record<string, unknown> | null
 }
 /** ``pcm`` (or the ``pcm_b64`` alias): base64 int16 mono little-endian, 16 kHz only. */
 export interface WakeFeedParams {
@@ -3186,22 +3223,24 @@ export interface SessionResumeParams {
   close_on_disconnect?: boolean
   inline_images?: boolean
 }
+/** Authoritative reconciliation shape on every resume path. */
 export interface SessionResumeResult {
   session_id: string
   message_count: number
   messages: TranscriptMessage[]
   info: SessionLiveInfo
-  stored_session_id?: string | null
+  stored_session_id: string
+  persisted: boolean
   resumed?: string | null
   session_key?: string | null
   messages_omitted?: boolean | null
   hydrating?: boolean | null
-  running?: boolean | null
+  running: boolean
   turn_started_at?: number | null
   started_at?: number | null
-  status?: string | null
-  inflight?: InflightTurn | null
-  queued?: QueuedPrompt | null
+  status: string
+  inflight: InflightTurn | null
+  queued: QueuedPrompt | null
   pending_approval?: PendingApproval | null
   open_requests?: OpenRequestEntry[] | null
   pending_connection?: ConnectionRequestPayload | null
@@ -3267,6 +3306,7 @@ export interface SessionActivateResult {
   messages: TranscriptMessage[]
   info: SessionLiveInfo
   stored_session_id?: string | null
+  persisted?: boolean | null
   resumed?: string | null
   session_key?: string | null
   messages_omitted?: boolean | null
@@ -6002,20 +6042,56 @@ export interface BrowserControllerCancelPayload {
   command_id: string
   tool_call_id?: string | null
 }
+export interface VoiceInterruptedPayload {
+  owner_session_id: string
+  lease_epoch: number
+  capture_id?: string | null
+}
 /** ``methods_voice._vr_on_status``; states come from the recorder (idle / listening / transcribing …). */
 export interface VoiceStatusPayload {
+  owner_session_id: string
+  lease_epoch: number
+  capture_id?: string | null
   state: string
+  outcome?: string | null
+  released?: boolean | null
+  release_complete?: boolean | null
 }
 /** ``methods_voice`` voice.record ``on_partial`` — live STT text so far (``stt.streaming``). */
 export interface VoicePartialPayload {
+  owner_session_id: string
+  lease_epoch: number
+  capture_id?: string | null
   text: string
 }
 /** ``methods_voice._vr_transcript`` / ``_deliver_fd_transcript`` / typed stop phrase in methods_prompt. */
 export interface VoiceTranscriptPayload {
+  owner_session_id: string
+  lease_epoch: number
+  capture_id?: string | null
   text?: string | null
   stop_phrase?: boolean | null
   typed?: boolean | null
   no_speech_limit?: boolean | null
+  retryable_empty?: boolean | null
+  outcome?: string | null
+}
+export interface VoiceInputErrorPayload {
+  owner_session_id: string
+  lease_epoch: number
+  capture_id?: string | null
+  message: string
+  stage: string
+  retryable: boolean
+  fatal: boolean
+  outcome: string
+  released: boolean
+  release_complete: boolean
+}
+export interface VoiceOutputDrainedPayload {
+  owner_session_id: string
+  lease_epoch: number
+  capture_id?: string | null
 }
 /** ``methods_voice`` wake detector ``_on_detect``. */
 export interface WakeDetectedPayload {
@@ -6559,6 +6635,8 @@ export interface RpcMethods {
   'voice.toggle': { params: VoiceToggleParams; result: VoiceToggleResult }
   /** Speak text through the backend TTS engine (barge-in aware). */
   'voice.tts': { params: VoiceTtsParams; result: VoiceTtsResult }
+  /** Read or reset owner-scoped wake measurements without exposing audio. */
+  'wake.diagnostics': { params: WakeDiagnosticsParams; result: WakeDiagnosticsResult }
   /** Push client-captured PCM into the armed detector (mic-less remote backends). */
   'wake.feed': { params: WakeFeedParams; result: WakeFeedResult }
   /** Release the mic (e.g. while the desktop's browser captures audio). */
@@ -6826,6 +6904,7 @@ export const RPC_METHODS = [
   'voice.record',
   'voice.toggle',
   'voice.tts',
+  'wake.diagnostics',
   'wake.feed',
   'wake.pause',
   'wake.resume',
@@ -7174,8 +7253,12 @@ export interface BackendGatewayEventMap {
   'tool.progress': ToolProgressPayload
   /** A tool call began (stable id + full args). */
   'tool.start': ToolStartPayload
-  /** Barge-in: the spoken interjection interrupted the turn; no payload. */
-  'voice.interrupted': Record<string, never>
+  /** The scoped microphone/STT pipeline failed terminally. */
+  'voice.input_error': VoiceInputErrorPayload
+  /** Barge-in interrupted the lease owner's turn. */
+  'voice.interrupted': VoiceInterruptedPayload
+  /** The owning turn and every backend audio-output pipeline are idle. */
+  'voice.output_drained': VoiceOutputDrainedPayload
   /** Live STT text so far while the user is still speaking. */
   'voice.partial': VoicePartialPayload
   /** Voice recorder state changed. */
@@ -7262,7 +7345,9 @@ export const GATEWAY_EVENT_TYPES = [
   'tool.output_risk',
   'tool.progress',
   'tool.start',
+  'voice.input_error',
   'voice.interrupted',
+  'voice.output_drained',
   'voice.partial',
   'voice.status',
   'voice.transcript',

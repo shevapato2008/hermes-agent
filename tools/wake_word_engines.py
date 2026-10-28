@@ -15,7 +15,9 @@ audio libraries.
 from __future__ import annotations
 
 import logging
+import math
 import os
+import threading
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -101,6 +103,9 @@ class _OpenWakeWordEngine(_Engine):
         self._threshold = ww._sensitivity(cfg)
         self._confirm_needed = ww._confirmation_frames(cfg)
         self._confirm_streak = 0
+        self._score_lock = threading.Lock()
+        self._latest_score: float | None = None
+        self._peak_score: float | None = None
         self._features = OpenWakeWordFeatures.from_builtin()
         self._model = OpenWakeWord.from_model(model_ref)
         self._labels = [self._model.id]
@@ -110,25 +115,52 @@ class _OpenWakeWordEngine(_Engine):
         # bytes. process_streaming() yields embeddings as the window fills and
         # the model yields one 0..1 score per completed window.
         over = False
+        latest: float | None = None
         for emb in self._features.process_streaming(frame.tobytes()):
             for score in self._model.process_streaming(emb):
+                try:
+                    numeric = float(score)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(numeric):
+                    latest = numeric if latest is None else max(latest, numeric)
                 if score >= self._threshold:
                     over = True
         # Require N consecutive over-threshold frames: a real phrase holds the
         # score high across frames, a stray ambient phoneme spikes just one.
-        if over:
-            self._confirm_streak += 1
-            if self._confirm_streak >= self._confirm_needed:
-                self._confirm_streak = 0
-                return True
+        with self._score_lock:
+            if latest is not None:
+                self._latest_score = latest
+                if self._peak_score is None or latest > self._peak_score:
+                    self._peak_score = latest
+            if over:
+                self._confirm_streak += 1
+                if self._confirm_streak >= self._confirm_needed:
+                    self._confirm_streak = 0
+                    return True
+                return False
+            self._confirm_streak = 0
             return False
-        self._confirm_streak = 0
-        return False
+
+    def score_diagnostics(self, *, reset: bool = False) -> dict[str, Any]:
+        """Return/reset scalar scores without disturbing detector state."""
+        with self._score_lock:
+            if reset:
+                self._latest_score = None
+                self._peak_score = None
+            return {
+                "latest": self._latest_score,
+                "peak": self._peak_score,
+                "threshold": float(self._threshold),
+                "confirmation_streak": int(self._confirm_streak),
+                "confirmation_frames": int(self._confirm_needed),
+            }
 
     def reset(self) -> None:
         # Clears pyopen-wakeword's rolling feature/prediction buffer so stale
         # audio captured before a pause can't re-fire the moment we resume.
-        self._confirm_streak = 0
+        with self._score_lock:
+            self._confirm_streak = 0
         with suppress(Exception):
             self._features.reset()
             self._model.reset()

@@ -190,3 +190,30 @@ def test_dingtalk_extra_includes_qrcode_for_qr_auth():
 
     dingtalk_extra = optional_dependencies["dingtalk"]
     assert any(dep.startswith("qrcode") for dep in dingtalk_extra)
+
+
+def test_server_voice_extra_reuses_the_lightweight_current_voice_stack():
+    optional_dependencies = _load_optional_dependencies()
+
+    server_pins = _exact_pins(optional_dependencies["server-voice"])
+    expected = {
+        "edge-tts": _exact_pins(optional_dependencies["edge-tts"])["edge-tts"],
+        "numpy": _exact_pins(optional_dependencies["audio-io"])["numpy"],
+        "pyopen-wakeword": _exact_pins(
+            optional_dependencies["wake-openwakeword"]
+        )["pyopen-wakeword"],
+    }
+
+    assert server_pins == expected
+    excluded = {"sounddevice", "faster-whisper", "ctranslate2", "onnxruntime"}
+    assert not (excluded & server_pins.keys())
+
+
+def test_bundled_hey_hermes_tflite_is_package_data():
+    root = Path(__file__).resolve().parents[1]
+    with (root / "pyproject.toml").open("rb") as handle:
+        package_data = tomllib.load(handle)["tool"]["setuptools"]["package-data"]
+
+    model = "wakewords/hey_hermes.tflite"
+    assert model in package_data["tools"]
+    assert (root / "tools" / model).is_file()

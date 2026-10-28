@@ -243,29 +243,34 @@ def _route_turn_images(agent, prompt: Any, images: list[str]) -> Any:
     return _build_image_ref_message(prompt, images)
 
 
-def _start_turn_voice() -> tuple[Any, bool]:
+def _start_turn_voice(session_id: str, transport) -> tuple[Any, bool]:
     """Arm voice-mode turn audio; ``(tts_queue, thinking_started)``.  ``_tts_stream_begin``
     goes first: cutting a still-speaking previous turn IS this turn's barge-in, so it must
     latch before the caller consumes the latch."""
-    tts_queue = _tts_stream_begin()
-    if not _voice_mode_enabled():
-        return tts_queue, False
-    if _voice_cfg_dict().get("barge_in", True):
-        _arm_full_duplex_listener()
-    try:
-        from tools.voice_mode import is_audio_output_active, start_thinking_sound
+    with _voice_output_start_barrier(session_id, transport) as allowed:
+        if not allowed:
+            return None, False
+        tts_queue = _tts_stream_begin(session_id, transport)
+        if not _voice_mode_enabled():
+            return tts_queue, False
+        if _voice_cfg_dict().get("barge_in", True):
+            _arm_full_duplex_listener(session_id, transport)
+        else:
+            _arm_output_drain_monitor(session_id, transport)
+        try:
+            from tools.voice_mode import is_audio_output_active, start_thinking_sound
 
-        def _thinking_should_play() -> bool:
-            if is_audio_output_active():
-                return False
-            try:
-                from hermes_cli.voice import is_continuous_active
-                return not is_continuous_active()
-            except Exception:
-                return True
-        return tts_queue, start_thinking_sound(should_play=_thinking_should_play)
-    except Exception:
-        return tts_queue, False
+            def _thinking_should_play() -> bool:
+                if is_audio_output_active():
+                    return False
+                try:
+                    from hermes_cli.voice import is_continuous_active
+                    return not is_continuous_active()
+                except Exception:
+                    return True
+            return tts_queue, start_thinking_sound(should_play=_thinking_should_play)
+        except Exception:
+            return tts_queue, False
 
 
 def _commit_turn_history(
@@ -412,7 +417,9 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
     # everything otherwise); barge-aware.
     if st.tts_queue is None and isinstance(raw, str) and raw.strip() and _voice_tts_enabled():
         try:
-            threading.Thread(target=_speak_text_with_barge, args=(raw,), daemon=True).start()
+            threading.Thread(
+                target=_speak_text_with_barge,
+                args=(raw, sid, session.get("transport")), daemon=True).start()
         except ImportError:
             logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
         except Exception as e:
@@ -726,7 +733,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     run_message: Any = _route_turn_images(agent, prompt, images) if images else prompt
     from agent.notification_presentation import event_presentation_muted
     if not event_presentation_muted("message.delta", sid):
-        st.tts_queue, st.thinking_started = _start_turn_voice()
+        st.tts_queue, st.thinking_started = _start_turn_voice(sid, session.get("transport"))
     # Per-turn API-message notes: barge mid-speech, reactions, HUD surface (per-turn state
     # that must not touch the byte-stable system prompt).
     from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted

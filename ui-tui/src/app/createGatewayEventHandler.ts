@@ -1416,6 +1416,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         })
 
         return
+
+      case 'voice.input_error': {
+        const message = String(ev.payload?.message ?? '').trim()
+
+        if (message) {
+          sys(t('session.input.voiceError', message))
+        }
+
+        return
+      }
       case 'wake.detected': {
         // "Hey Hermes": optionally open a fresh session (start_new_session),
         // then arm voice capture so the user can speak hands-free. Mirrors CLI.
