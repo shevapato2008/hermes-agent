@@ -185,6 +185,7 @@ def test_failed_disconnect_cleanup_and_retry_keep_the_voice_owners_profile(
         attempts += 1
         if attempts == 1:
             raise RuntimeError("close failed once")
+        retry_done.set()
         return True
 
     def release_tts(_lease):
@@ -193,11 +194,10 @@ def test_failed_disconnect_cleanup_and_retry_keep_the_voice_owners_profile(
         cleanup_homes.append(Path(get_hermes_home()))
         cleanup_done.set()
 
-    def resume_wake(_owner):
+    def resume_wake(_owner, **_kwargs):
         from hermes_constants import get_hermes_home
 
         wake_homes.append(Path(get_hermes_home()))
-        retry_done.set()
         return True
 
     monkeypatch.setenv("HERMES_VOICE_TTS", "0")
@@ -213,7 +213,7 @@ def test_failed_disconnect_cleanup_and_retry_keep_the_voice_owners_profile(
         "worker", {"action": "on", "session_id": "worker-session", "profile": "worker"}
     )
     assert "error" not in enabled
-    monkeypatch.setattr(server, "_voice_wake_owner", object())
+    monkeypatch.setattr(server, "_voice_wake_owner", transport)
     config_reads.clear()
 
     assert server._release_voice_for_transport(transport) is False
@@ -222,7 +222,8 @@ def test_failed_disconnect_cleanup_and_retry_keep_the_voice_owners_profile(
     assert attempts == 2
     assert config_reads and set(config_reads) == {worker}
     assert cleanup_homes == [worker]
-    assert wake_homes == [worker]
+    assert wake_homes == []
+    assert server._voice_wake_owner is None
     assert launch not in config_reads + cleanup_homes + wake_homes
 
 

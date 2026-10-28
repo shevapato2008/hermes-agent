@@ -65,7 +65,9 @@ def _stop_session_voice_capture(
             return False
         _voice_capture_gen += 1
     released, error = _release_voice_lease(
-        session_id=owner, lease_epoch=epoch, transport=owner_transport, stop_loop=True)
+        session_id=owner, lease_epoch=epoch, transport=owner_transport, stop_loop=True,
+        before_expose=lambda: _resume_voice_wake(
+            expected_transport=owner_transport, expected_epoch=epoch))
     if not released:
         from tools.voice_input import VoiceInputReleaseError
         _voice_terminal_error_epochs.add(epoch)
@@ -75,16 +77,19 @@ def _stop_session_voice_capture(
             session_id=owner, lease_epoch=epoch, transport=owner_transport,
             capture_id=capture_id)
         return False
-    _resume_voice_wake()
     return True
 
 
-def _capture_live() -> bool:
+def _capture_active_state() -> bool | None:
     try:
         from hermes_cli.voice import is_continuous_active
     except ImportError:  # an older voice wrapper without the probe
-        return False
+        return None
     return bool(is_continuous_active())
+
+
+def _capture_live() -> bool:
+    return bool(_capture_active_state())
 
 
 def _voice_capture_callback(fn, *, session_id=None, lease_epoch=None, transport=None):
@@ -459,7 +464,9 @@ def _full_duplex_listener(session_id: str, lease_epoch: int, transport) -> None:
         _voice_terminal_error_epochs.add(lease_epoch)
         released, release_error = _release_voice_lease(
             session_id=session_id, lease_epoch=lease_epoch, transport=transport,
-            stop_loop=False)
+            stop_loop=False,
+            before_expose=lambda: _resume_voice_wake(
+                expected_transport=transport, expected_epoch=lease_epoch))
         _voice_emit(
             "voice.input_error", _input_error_payload(error, released=released),
             session_id=session_id, lease_epoch=lease_epoch, transport=transport)
@@ -468,8 +475,6 @@ def _full_duplex_listener(session_id: str, lease_epoch: int, transport) -> None:
                 "voice.input_error",
                 _input_error_payload(VoiceInputReleaseError(release_error), released=False),
                 session_id=session_id, lease_epoch=lease_epoch, transport=transport)
-        if released:
-            _resume_voice_wake()
 
     from agent.memory_provider import ctx_bound
     on_input_error = ctx_bound(_on_input_error)
@@ -756,40 +761,64 @@ def _release_gateway_wake_owner() -> bool:
 
 _wake_resume_retry_lock = threading.Lock()
 _wake_resume_retry_active = False
+_wake_resume_retry_epoch: int | None = None
 
 
 def _wake_resume_if_owner(owner: Transport, *, retry_seconds: float = 15.0,
-                          retry_interval: float = 1.0) -> bool:
+                          retry_interval: float = 1.0,
+                          expected_voice_epoch: int | None = None) -> bool:
     """Resume the wake detector for ``owner``, self-healing a busy microphone: reopening right after
     a voice turn can fail while the device is still being released (browser WebRTC tracks release
     async), so an exception retries in a background thread until it sticks, the lease changes hands,
     or ``retry_seconds`` elapses. ``False`` (lease gone / other owner) is final — never retried."""
     from tools.wake_word import resume_listening
+    with _voice_sid_lock:
+        resume_epoch = _voice_lease_epoch if expected_voice_epoch is None else expected_voice_epoch
+
+    def resume_if_current() -> bool | None:
+        # The lifecycle barrier serializes detector reopen with a successor's
+        # physical start; the epoch rejects an old same-transport retry.
+        with _voice_lifecycle_lock:
+            with _voice_sid_lock:
+                if _voice_lease_epoch != resume_epoch:
+                    return None
+            return bool(resume_listening(owner=owner))
+
     try:
-        return resume_listening(owner=owner)
+        resumed = resume_if_current()
+        return bool(resumed)
     except Exception as e:
         logger.debug("wake resume failed (will retry): %s", e)
-    global _wake_resume_retry_active
+    global _wake_resume_retry_active, _wake_resume_retry_epoch
     with _wake_resume_retry_lock:
-        if _wake_resume_retry_active:
+        if _wake_resume_retry_active and _wake_resume_retry_epoch == resume_epoch:
             return False
         _wake_resume_retry_active = True
+        _wake_resume_retry_epoch = resume_epoch
 
     def _retry() -> None:
-        global _wake_resume_retry_active
+        global _wake_resume_retry_active, _wake_resume_retry_epoch
         deadline = time.monotonic() + retry_seconds
         try:
             while time.monotonic() < deadline:
                 time.sleep(retry_interval)
+                with _wake_resume_retry_lock:
+                    if _wake_resume_retry_epoch != resume_epoch:
+                        return
                 with contextlib.suppress(Exception):
-                    if resume_listening(owner=owner):
+                    resumed = resume_if_current()
+                    if resumed is None:
+                        return
+                    if resumed:
                         logger.info("wake: detector resumed after retry")
                     return  # False — detector gone or lease moved: stop, don't fight it.
             logger.warning("wake: could not resume detector after voice turn "
                            "(microphone still busy?) — toggle the wake word to re-arm")
         finally:
             with _wake_resume_retry_lock:
-                _wake_resume_retry_active = False
+                if _wake_resume_retry_epoch == resume_epoch:
+                    _wake_resume_retry_active = False
+                    _wake_resume_retry_epoch = None
     _start_voice_thread(_retry, name="wake-resume-retry")
     return False
 
@@ -1181,7 +1210,10 @@ def _voice_toggle_mode(rid, params: dict) -> dict:
         def finish_off() -> None:
             _voice_toggle_off_cleanup()
             _clear_voice_authority(session_id=sid, transport=caller)
-            _resume_voice_wake(expected_transport=transport)
+            _resume_voice_wake(
+                expected_transport=transport,
+                expected_epoch=epoch,
+            )
 
         released, error = _release_voice_lease(
             session_id=owner, lease_epoch=epoch, transport=transport, stop_loop=True,
@@ -1289,7 +1321,9 @@ def _vr_on_input_error(error, scope) -> None:
     sid, epoch, transport, _capture_id = scope
     _voice_terminal_error_epochs.add(epoch)
     released, release_error = _release_voice_lease(
-        session_id=sid, lease_epoch=epoch, transport=transport, stop_loop=True)
+        session_id=sid, lease_epoch=epoch, transport=transport, stop_loop=True,
+        before_expose=lambda: _resume_voice_wake(
+            expected_transport=transport, expected_epoch=epoch))
     _vr_emit("voice.input_error", _input_error_payload(error, released=released), scope)
     if not released and str(getattr(error, "stage", "")) != "close":
         from tools.voice_input import VoiceInputReleaseError
@@ -1297,8 +1331,6 @@ def _vr_on_input_error(error, scope) -> None:
             "voice.input_error",
             _input_error_payload(VoiceInputReleaseError(release_error), released=False),
             scope)
-    if released:
-        _resume_voice_wake()
 
 
 def _vr_on_status(state, scope) -> None:
@@ -1313,7 +1345,9 @@ def _vr_on_status(state, scope) -> None:
         if epoch in _voice_terminal_error_epochs:
             return
         released, error = _release_voice_lease(
-            session_id=sid, lease_epoch=epoch, transport=transport, stop_loop=False)
+            session_id=sid, lease_epoch=epoch, transport=transport, stop_loop=False,
+            before_expose=lambda: _resume_voice_wake(
+                expected_transport=transport, expected_epoch=epoch))
         if not released:
             from tools.voice_input import VoiceInputReleaseError
             _voice_terminal_error_epochs.add(epoch)
@@ -1330,7 +1364,6 @@ def _vr_on_status(state, scope) -> None:
         with _voice_sid_lock:
             if _voice_release_tail_epoch == epoch:
                 _voice_release_tail_epoch = None
-        _resume_voice_wake()
         return
     _voice_emit(
         "voice.status",
@@ -1401,8 +1434,8 @@ def _stop_voice_recording(rid, sid: str, transport) -> dict:
     owner, _epoch, _owner_transport, _capture_id = _voice_scope_snapshot()
     had_owner = bool(owner)
     _authority_sid, authority_transport = _voice_authority_snapshot()
-    capture_live = _capture_live()
-    if not had_owner and not capture_live:
+    capture_state = _capture_active_state()
+    if not had_owner and capture_state is False:
         if not _voice_authority_accepts(sid, transport, allow_unclaimed=True):
             return _err(rid, 4016, "voice capture is owned by another session")
         return _ok(
@@ -1420,7 +1453,7 @@ def _stop_voice_recording(rid, sid: str, transport) -> dict:
         sid,
         transport,
         allow_unclaimed=authority_transport is None,
-        release_all=not had_owner and capture_live,
+        release_all=not had_owner and capture_state is not False,
     )
     if epoch is None:
         return _err(rid, 4016, "voice capture is owned by another session")
@@ -1434,6 +1467,15 @@ def _stop_voice_recording(rid, sid: str, transport) -> dict:
             session_id=owner, transport=owner_transport
         )
     ) if temporary_authority else None
+
+    def finish_stop() -> None:
+        if temporary_cleanup is not None:
+            temporary_cleanup()
+        _resume_voice_wake(
+            expected_transport=owner_transport,
+            expected_epoch=epoch,
+        )
+
     _mark_voice_release_tail(epoch)
     released, error = _release_voice_lease(
         session_id=owner,
@@ -1441,7 +1483,7 @@ def _stop_voice_recording(rid, sid: str, transport) -> dict:
         transport=owner_transport,
         stop_loop=True,
         force_transcribe=True,
-        before_expose=temporary_cleanup,
+        before_expose=finish_stop,
         on_failure=temporary_cleanup,
     )
     if not released:
@@ -1457,7 +1499,6 @@ def _stop_voice_recording(rid, sid: str, transport) -> dict:
             capture_id=capture_id,
         )
         return _err(rid, 5025, error)
-    _resume_voice_wake()
     return _ok(
         rid,
         _voice_result_scope(
@@ -1514,7 +1555,12 @@ def _(rid, params: dict) -> dict:
                 release_failures = []
                 released, release_error = _release_voice_lease(
                     session_id=owner, lease_epoch=epoch, transport=owner_transport,
-                    stop_loop=False, on_failure=release_failures.append)
+                    stop_loop=False,
+                    before_expose=lambda: _resume_voice_wake(
+                        expected_transport=owner_transport,
+                        expected_epoch=epoch,
+                    ),
+                    on_failure=release_failures.append)
                 if not released:
                     if not release_failures:
                         return _err(rid, 4016, release_error)
@@ -1603,7 +1649,11 @@ def _(rid, params: dict) -> dict:
         if started is False:
             released, release_error = _release_voice_lease(
                 session_id=owner, lease_epoch=epoch,
-                transport=owner_transport, stop_loop=True)
+                transport=owner_transport, stop_loop=True,
+                before_expose=(lambda: _resume_voice_wake(
+                    expected_transport=owner_transport,
+                    expected_epoch=epoch,
+                )) if wake_paused else None)
             if not released:
                 from tools.voice_input import VoiceInputReleaseError
                 error = VoiceInputReleaseError(release_error)
@@ -1612,8 +1662,6 @@ def _(rid, params: dict) -> dict:
                     session_id=owner, lease_epoch=epoch, transport=owner_transport,
                     capture_id=capture_id)
                 return _err(rid, 5025, release_error)
-            if wake_paused:
-                _resume_voice_wake()
         return _ok(rid, _voice_result_scope(
             session_id=owner, lease_epoch=epoch, capture_id=capture_id,
             status="busy" if started is False else "recording",
@@ -1623,7 +1671,11 @@ def _(rid, params: dict) -> dict:
         released = False
         if owner and owner_transport is transport:
             released, release_error = _release_voice_lease(
-                session_id=owner, lease_epoch=epoch, transport=owner_transport, stop_loop=True)
+                session_id=owner, lease_epoch=epoch, transport=owner_transport, stop_loop=True,
+                before_expose=(lambda: _resume_voice_wake(
+                    expected_transport=owner_transport,
+                    expected_epoch=epoch,
+                )) if wake_paused else None)
             from tools.voice_input import VoiceInputError, VoiceInputReleaseError
             input_error = e if isinstance(e, VoiceInputError) else VoiceInputError(
                 str(e), stage="open", retryable=True)
@@ -1637,8 +1689,6 @@ def _(rid, params: dict) -> dict:
                     _input_error_payload(VoiceInputReleaseError(release_error), released=False),
                     session_id=owner, lease_epoch=epoch, transport=owner_transport,
                     capture_id=capture_id)
-        if released and wake_paused:
-            _resume_voice_wake()
         if isinstance(e, ImportError):
             return _err(rid, 5025, "voice module not available — install audio dependencies")
         return _err(rid, 5025, str(e))

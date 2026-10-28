@@ -84,6 +84,8 @@ def voice(monkeypatch):
         "_voice_authority_profile_home": None,
         "_voice_terminal_error_epochs": set(),
         "_voice_release_retry_active": False,
+        "_wake_resume_retry_active": False,
+        "_wake_resume_retry_epoch": None,
         "_voice_tts_lease_generation": 0,
         "_voice_tts_lease_desired": {},
         "_fd_listener_active": False,
@@ -159,7 +161,10 @@ def test_voice_toggle_on_claims_session_lease_and_off_acks_empty_owner(
     enabled = voice.rpc(owner, "voice.toggle", action="on", session_id="owner")
     epoch = enabled["result"]["lease_epoch"]
     monkeypatch.setattr(server, "_voice_wake_owner", owner)
-    monkeypatch.setattr(server, "_wake_resume_if_owner", wake_resumes.append)
+    monkeypatch.setattr(
+        server, "_wake_resume_if_owner",
+        lambda owner, **_kwargs: wake_resumes.append(owner),
+    )
 
     assert enabled["result"]["owner_session_id"] == "owner"
     assert epoch > 0
@@ -605,7 +610,10 @@ def test_same_session_new_transport_interrupt_cannot_cut_or_resume_voice_owner(
     monkeypatch.setattr(server, "_interrupt_session_turn", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(server, "_tts_stream_stop", lambda **_kwargs: tts_stops.append(True))
-    monkeypatch.setattr(server, "_wake_resume_if_owner", wake_resumes.append)
+    monkeypatch.setattr(
+        server, "_wake_resume_if_owner",
+        lambda owner, **_kwargs: wake_resumes.append(owner),
+    )
 
     token = bind_transport(replacement)
     try:
@@ -672,6 +680,72 @@ def test_forced_stop_delivers_only_the_captured_epochs_transcript_tail(voice):
     assert [event["payload"]["text"] for event in _events(owner, "voice.transcript")] == [
         "final words"
     ]
+
+
+def test_old_idle_completion_cannot_resume_successor_wake_handoff(
+    voice, monkeypatch
+):
+    owner = _Sink()
+    wake_resumes = []
+    monkeypatch.setattr("tools.wake_word.pause_listening", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        server, "_wake_resume_if_owner",
+        lambda owner, **_kwargs: wake_resumes.append(owner),
+    )
+    started = voice.rpc(owner, "voice.record", action="start", session_id="owner")
+    old_idle = voice.mic.callbacks["on_status"]
+    original_emit = server._voice_emit
+    successor = {}
+
+    def emit(event, *args, **kwargs):
+        if event == "voice.status" and not successor:
+            successor.update(
+                voice.rpc(owner, "voice.record", action="start", session_id="owner")
+            )
+        return original_emit(event, *args, **kwargs)
+
+    monkeypatch.setattr(server, "_voice_emit", emit)
+    voice.mic.active = False
+
+    old_idle("idle")
+
+    assert successor["result"]["status"] == "recording"
+    assert successor["result"]["lease_epoch"] > started["result"]["lease_epoch"]
+    assert wake_resumes == [owner]
+    assert server._voice_wake_owner is owner
+
+
+def test_old_wake_resume_retry_cannot_rearm_successor_capture(voice, monkeypatch):
+    owner = _Sink()
+    retries, resume_calls = [], []
+    monkeypatch.setattr("tools.wake_word.pause_listening", lambda **_kwargs: True)
+
+    def resume_listening(*, owner):
+        resume_calls.append(owner)
+        if len(resume_calls) == 1:
+            raise OSError("device still closing")
+        return True
+
+    monkeypatch.setattr("tools.wake_word.resume_listening", resume_listening)
+    monkeypatch.setattr(
+        server,
+        "_start_voice_thread",
+        lambda target, **_kwargs: retries.append(target),
+    )
+    monkeypatch.setattr(server.time, "sleep", lambda _seconds: None)
+    started = voice.rpc(owner, "voice.record", action="start", session_id="owner")
+    old_idle = voice.mic.callbacks["on_status"]
+    voice.mic.active = False
+
+    old_idle("idle")
+    successor = voice.rpc(owner, "voice.record", action="start", session_id="owner")
+
+    assert len(retries) == 1
+    assert successor["result"]["lease_epoch"] > started["result"]["lease_epoch"]
+    retries[0]()
+    assert resume_calls == [owner]
+    assert server._voice_wake_owner is owner
+    assert voice.mic.active is True
 
 
 def test_forced_stop_defers_idle_completion_until_physical_release(voice, monkeypatch):
@@ -746,7 +820,10 @@ def test_session_teardown_releases_its_physical_voice_lease(voice, monkeypatch):
     stopped, wake_resumes = [], []
     voice.rpc(owner, "voice.record", action="start", session_id="owner")
     monkeypatch.setattr(server, "_voice_wake_owner", owner)
-    monkeypatch.setattr(server, "_wake_resume_if_owner", wake_resumes.append)
+    monkeypatch.setattr(
+        server, "_wake_resume_if_owner",
+        lambda owner, **_kwargs: wake_resumes.append(owner),
+    )
     session = {"_sid": "owner", "_run_thread": None}
     monkeypatch.setattr(server, "_settle_isolated_turn_before_close", lambda _session: None)
     monkeypatch.setattr(server, "_teardown_session", lambda _session, **_kwargs: None)
@@ -777,7 +854,10 @@ def test_ws_session_teardown_clears_wake_handoff_without_rearming(voice, monkeyp
     wake_resumes = []
     voice.rpc(owner, "voice.record", action="start", session_id="owner")
     monkeypatch.setattr(server, "_voice_wake_owner", owner)
-    monkeypatch.setattr(server, "_wake_resume_if_owner", wake_resumes.append)
+    monkeypatch.setattr(
+        server, "_wake_resume_if_owner",
+        lambda owner, **_kwargs: wake_resumes.append(owner),
+    )
     monkeypatch.setattr(server, "_settle_isolated_turn_before_close", lambda _session: None)
     monkeypatch.setattr(server, "_teardown_session", lambda _session, **_kwargs: None)
 
@@ -805,7 +885,10 @@ def test_session_teardown_release_retry_eventually_resumes_wake(voice, monkeypat
 
     monkeypatch.setattr(voice_input, "release_voice_input", release)
     monkeypatch.setattr(server, "_voice_wake_owner", owner)
-    monkeypatch.setattr(server, "_wake_resume_if_owner", wake_resumes.append)
+    monkeypatch.setattr(
+        server, "_wake_resume_if_owner",
+        lambda owner, **_kwargs: wake_resumes.append(owner),
+    )
     monkeypatch.setattr(server, "_VOICE_RELEASE_RETRY_SECONDS", 0.01)
     monkeypatch.setattr(server, "_settle_isolated_turn_before_close", lambda _session: None)
     monkeypatch.setattr(server, "_teardown_session", lambda _session, **_kwargs: None)
@@ -841,7 +924,10 @@ def test_ws_teardown_release_retry_does_not_rearm_dead_wake_owner(
 
     monkeypatch.setattr(voice_input, "release_voice_input", release)
     monkeypatch.setattr(server, "_voice_wake_owner", owner)
-    monkeypatch.setattr(server, "_wake_resume_if_owner", wake_resumes.append)
+    monkeypatch.setattr(
+        server, "_wake_resume_if_owner",
+        lambda owner, **_kwargs: wake_resumes.append(owner),
+    )
     monkeypatch.setattr(server, "_VOICE_RELEASE_RETRY_SECONDS", 0.01)
     monkeypatch.setattr(server, "_settle_isolated_turn_before_close", lambda _session: None)
     monkeypatch.setattr(server, "_teardown_session", lambda _session, **_kwargs: None)
@@ -1147,6 +1233,29 @@ def test_noop_record_stop_does_not_claim_authority_or_block_successor(voice):
     assert enabled["result"]["owner_session_id"] == "successor"
 
 
+def test_probe_unknown_record_stop_preserves_legacy_stop_without_authority_leak(
+    voice, monkeypatch
+):
+    caller, successor = _Sink(), _Sink()
+    stops = []
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(
+            stop_continuous=lambda **kwargs: stops.append(kwargs),
+        ),
+    )
+
+    stopped = voice.rpc(caller, "voice.record", action="stop", session_id="caller")
+
+    assert stopped["result"]["release_complete"] is True
+    assert stops == [{"force_transcribe": True}]
+    assert server._voice_event_sid == "caller"
+    assert server._voice_authority_transport is None
+    enabled = voice.rpc(successor, "voice.toggle", action="on", session_id="successor")
+    assert "error" not in enabled
+
+
 def test_unleased_record_stop_retry_does_not_leave_temporary_authority(
     voice, monkeypatch
 ):
@@ -1285,7 +1394,7 @@ def test_release_failure_emits_scoped_error_without_false_ack_or_wake_resume(voi
     resumes = []
     wake_owner = object()
     monkeypatch.setattr(server, "_voice_wake_owner", wake_owner)
-    monkeypatch.setattr(server, "_resume_voice_wake", lambda: resumes.append(True))
+    monkeypatch.setattr(server, "_resume_voice_wake", lambda **_kwargs: resumes.append(True))
     voice.mic.stop_impl = lambda **_kw: (_ for _ in ()).throw(
         VoiceInputReleaseError("parec process did not release"))
 
@@ -1565,7 +1674,7 @@ def test_async_eof_is_scoped_and_released_before_wake_resume(voice, monkeypatch)
     owner = _Sink()
     started = voice.rpc(owner, "voice.record", action="start", session_id="owner")
     order = []
-    monkeypatch.setattr(server, "_resume_voice_wake", lambda: order.append("wake"))
+    monkeypatch.setattr(server, "_resume_voice_wake", lambda **_kwargs: order.append("wake"))
     voice.mic.callbacks["on_input_error"](VoiceInputEOF("parec ended"))
 
     event = _events(owner, "voice.input_error")[-1]
@@ -1707,7 +1816,7 @@ def test_successor_cannot_acquire_before_prior_retry_worker_exits(voice, monkeyp
             raise VoiceInputReleaseError("initial close failed")
         return True
 
-    def blocking_resume():
+    def blocking_resume(**_kwargs):
         retry_resuming.set()
         allow_retry_exit.wait(timeout=1)
 
@@ -1752,7 +1861,7 @@ def test_disconnect_clears_logical_authority_during_retry_exit_tail(
             raise VoiceInputReleaseError("initial close failed")
         return True
 
-    def blocking_resume():
+    def blocking_resume(**_kwargs):
         retry_resuming.set()
         allow_retry_exit.wait(timeout=1)
 

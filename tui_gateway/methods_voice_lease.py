@@ -653,7 +653,10 @@ def _schedule_voice_release_retry(session_id: str, lease_epoch: int, transport) 
                     stop_loop=True, _retry=True)
                 if released:
                     with _session_profile_runtime_scope({"profile_home": profile_home}):
-                        _resume_voice_wake()
+                        _resume_voice_wake(
+                            expected_transport=transport,
+                            expected_epoch=lease_epoch,
+                        )
                     return
         finally:
             with _voice_sid_lock:
@@ -688,9 +691,15 @@ def _release_voice_for_transport(
 
     def finish_wake_handoff() -> None:
         if resume_wake:
-            _resume_voice_wake(expected_transport=transport)
+            _resume_voice_wake(
+                expected_transport=transport,
+                expected_epoch=lease_epoch,
+            )
         else:
-            _discard_voice_wake(expected_transport=transport)
+            _discard_voice_wake(
+                expected_transport=transport,
+                expected_epoch=lease_epoch,
+            )
 
     with _session_profile_runtime_scope({"profile_home": profile_home}):
         if logical_only:
@@ -713,23 +722,25 @@ def _release_voice_for_transport(
         return False
 
 
-def _take_voice_wake_owner(expected_transport=None):
+def _take_voice_wake_owner(expected_transport=None, expected_epoch: int | None = None):
     global _voice_wake_owner
     with _voice_sid_lock:
         if expected_transport is not None and _voice_wake_owner is not expected_transport:
+            return None
+        if expected_epoch is not None and _voice_lease_epoch != expected_epoch:
             return None
         owner, _voice_wake_owner = _voice_wake_owner, None
     return owner
 
 
-def _discard_voice_wake(*, expected_transport=None) -> bool:
-    return _take_voice_wake_owner(expected_transport) is not None
+def _discard_voice_wake(*, expected_transport=None, expected_epoch: int | None = None) -> bool:
+    return _take_voice_wake_owner(expected_transport, expected_epoch) is not None
 
 
-def _resume_voice_wake(*, expected_transport=None) -> bool:
-    owner = _take_voice_wake_owner(expected_transport)
+def _resume_voice_wake(*, expected_transport=None, expected_epoch: int | None = None) -> bool:
+    owner = _take_voice_wake_owner(expected_transport, expected_epoch)
     if owner is not None:
-        return bool(_wake_resume_if_owner(owner))
+        return bool(_wake_resume_if_owner(owner, expected_voice_epoch=expected_epoch))
     return False
 
 
