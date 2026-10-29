@@ -126,6 +126,18 @@ def test_available_missing_module():
     assert extras.available("no-such-extra-anywhere") is False
 
 
+def test_openwakeword_anchor_matches_linux_arm_runtime():
+    linux_arm = {"sys_platform": "linux", "platform_machine": "aarch64"}
+    linux_x64 = {"sys_platform": "linux", "platform_machine": "x86_64"}
+
+    for extra in ("wake", "wake-openwakeword"):
+        assert extras._anchors(extra, environment=linux_arm) == (
+            "openwakeword",
+            "onnxruntime",
+        )
+        assert extras._anchors(extra, environment=linux_x64) == ("pyopen_wakeword",)
+
+
 @pytest.mark.parametrize(("extra", "module"), [
     ("teams", "microsoft_teams.apps"),
 ])

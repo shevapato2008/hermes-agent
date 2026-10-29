@@ -389,7 +389,58 @@ def test_requirements_deps_present_but_no_audio_hint(monkeypatch):
     assert "audio device" in r["hint"] or "microphone" in r["hint"].lower()
 
 
-# ── openWakeWord engine (pyopen-wakeword; bundled model, no runtime fetch) ──
+# ── openWakeWord engine (TFLite normally, ONNX on Linux ARM64) ─────
+
+
+def test_openwakeword_backend_uses_onnx_on_linux_arm64():
+    from tools.wake_word_engines import _openwakeword_backend_for
+
+    assert _openwakeword_backend_for("linux", "aarch64") == "onnx"
+    assert _openwakeword_backend_for("linux", "arm64") == "tflite"
+    assert _openwakeword_backend_for("linux", "x86_64") == "tflite"
+    assert _openwakeword_backend_for("darwin", "arm64") == "tflite"
+
+
+def test_openwakeword_onnx_backend_uses_bundled_model(monkeypatch):
+    from tools import wake_word_engines as engines
+
+    captured = {}
+
+    class _FakeOnnxModel:
+        def __init__(self, wakeword_models, inference_framework, **kwargs):
+            captured["paths"] = list(wakeword_models)
+            captured["framework"] = inference_framework
+            captured["feature_paths"] = kwargs
+            self.models = {"hey_hermes": object()}
+
+        def predict(self, _frame):
+            return {"hey_hermes": 0.9}
+
+        def reset(self):
+            pass
+
+    package = types.ModuleType("openwakeword")
+    model_module = types.ModuleType("openwakeword.model")
+    model_module.Model = _FakeOnnxModel
+    package.model = model_module
+    monkeypatch.setitem(sys.modules, "openwakeword", package)
+    monkeypatch.setitem(sys.modules, "openwakeword.model", model_module)
+    monkeypatch.setattr(engines, "_openwakeword_backend", lambda: "onnx")
+    monkeypatch.setattr(pm, "ensure_import", lambda *a, **k: None)
+
+    eng = engines._OpenWakeWordEngine(
+        {"provider": "openwakeword", "sensitivity": 0.35, "confirmation_frames": 1}
+    )
+
+    assert captured["paths"] == [ww._bundled_wakeword_path("onnx")]
+    assert captured["framework"] == "onnx"
+    assert captured["feature_paths"] == {
+        "melspec_model_path": ww._bundled_wakeword_feature_path("melspectrogram"),
+        "embedding_model_path": ww._bundled_wakeword_feature_path("embedding_model"),
+    }
+    assert eng._labels == ["hey_hermes"]
+    assert eng.process(object()) is True
+    eng.close()
 
 
 def test_openwakeword_custom_model_path_used(monkeypatch):
@@ -443,11 +494,15 @@ def test_openwakeword_custom_model_path_used(monkeypatch):
 
 
 def test_bundled_hey_hermes_model_ships_on_disk():
-    # The "hey hermes" wake word works out of the box only if the model is
-    # actually bundled. pyopen-wakeword runs TFLite only.
-    path = ww._bundled_wakeword_path()
-    assert os.path.exists(path), path
-    assert os.path.getsize(path) > 1024, path
+    # Both runtimes must work without downloading the product wake model.
+    paths = [ww._bundled_wakeword_path(backend) for backend in ("tflite", "onnx")]
+    paths += [
+        ww._bundled_wakeword_feature_path("melspectrogram"),
+        ww._bundled_wakeword_feature_path("embedding_model"),
+    ]
+    for path in paths:
+        assert os.path.exists(path), path
+        assert os.path.getsize(path) > 1024, path
 
 
 

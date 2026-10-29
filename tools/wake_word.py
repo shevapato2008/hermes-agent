@@ -86,9 +86,19 @@ _BUNDLED_MODEL_NAME = "hey_hermes"
 _BUNDLED_MODEL_ALIASES = frozenset({"", "hey_hermes", "hey hermes", "hermes"})
 
 
-def _bundled_wakeword_path() -> str:
-    """Path to the shipped hey_hermes.tflite — pyopen-wakeword runs TFLite only."""
-    return os.path.join(os.path.dirname(__file__), "wakewords", f"{_BUNDLED_MODEL_NAME}.tflite")
+def _bundled_wakeword_path(backend: str = "tflite") -> str:
+    """Path to the shipped product model for the selected inference backend."""
+    extension = "onnx" if backend == "onnx" else "tflite"
+    return os.path.join(
+        os.path.dirname(__file__), "wakewords", f"{_BUNDLED_MODEL_NAME}.{extension}"
+    )
+
+
+def _bundled_wakeword_feature_path(name: str) -> str:
+    """Path to one of the ONNX feature models shared by every wake phrase."""
+    if name not in {"melspectrogram", "embedding_model"}:
+        raise ValueError(f"unknown wake-word feature model: {name}")
+    return os.path.join(os.path.dirname(__file__), "wakewords", f"{name}.onnx")
 
 
 def load_wake_word_config() -> dict[str, Any]:

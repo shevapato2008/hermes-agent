@@ -30,9 +30,15 @@ def test_wake_dependencies_and_runtime_gate_agree_on_supported_targets():
         environment = {**default_environment(), "sys_platform": system,
                        "platform_system": platform_system, "platform_machine": machine}
         for extra in ("wake", "wake-openwakeword"):
-            requirement = next(req for spec in optional[extra]
-                               if (req := Requirement(spec)).name == "pyopen-wakeword")
-            assert requirement.marker.evaluate(environment) is supported, (extra, system, machine)
+            selected_engines = {
+                req.name for spec in optional[extra]
+                if (req := Requirement(spec)).name in {"openwakeword", "pyopen-wakeword"}
+                and (req.marker is None or req.marker.evaluate(environment))
+            }
+            assert bool(selected_engines) is supported, (extra, system, machine)
+            assert len(selected_engines) <= 1, (extra, system, machine, selected_engines)
+            if system == "linux" and machine == "aarch64":
+                assert selected_engines == {"openwakeword"}
         assert Marker(gates["wake-openwakeword"]).evaluate(environment) is supported
         selected = {req.name for spec in optional["wake"]
                     if (req := Requirement(spec)).marker is None or req.marker.evaluate(environment)}
@@ -192,7 +198,7 @@ def test_dingtalk_extra_includes_qrcode_for_qr_auth():
     assert any(dep.startswith("qrcode") for dep in dingtalk_extra)
 
 
-def test_server_voice_extra_reuses_the_lightweight_current_voice_stack():
+def test_server_voice_extra_selects_a_compatible_wake_runtime():
     optional_dependencies = _load_optional_dependencies()
 
     server_pins = _exact_pins(optional_dependencies["server-voice"])
@@ -202,18 +208,24 @@ def test_server_voice_extra_reuses_the_lightweight_current_voice_stack():
         "pyopen-wakeword": _exact_pins(
             optional_dependencies["wake-openwakeword"]
         )["pyopen-wakeword"],
+        "openwakeword": _exact_pins(
+            optional_dependencies["wake-openwakeword"]
+        )["openwakeword"],
+        "onnxruntime": _exact_pins(
+            optional_dependencies["wake-openwakeword"]
+        )["onnxruntime"],
     }
 
     assert server_pins == expected
-    excluded = {"sounddevice", "faster-whisper", "ctranslate2", "onnxruntime"}
+    excluded = {"sounddevice", "faster-whisper", "ctranslate2"}
     assert not (excluded & server_pins.keys())
 
 
-def test_bundled_hey_hermes_tflite_is_package_data():
+def test_bundled_hey_hermes_models_are_package_data():
     root = Path(__file__).resolve().parents[1]
     with (root / "pyproject.toml").open("rb") as handle:
         package_data = tomllib.load(handle)["tool"]["setuptools"]["package-data"]
 
-    model = "wakewords/hey_hermes.tflite"
-    assert model in package_data["tools"]
-    assert (root / "tools" / model).is_file()
+    for model in ("wakewords/hey_hermes.tflite", "wakewords/hey_hermes.onnx"):
+        assert model in package_data["tools"]
+        assert (root / "tools" / model).is_file()

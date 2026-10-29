@@ -251,7 +251,9 @@ edge-tts = ["edge-tts==7.3.1"]
 server-voice = [
   "edge-tts==7.3.1",
   "numpy==2.4.3",
-  "pyopen-wakeword==1.1.0; (platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_machine != 'x86_64' or sys_platform != 'darwin')",
+  "pyopen-wakeword==1.1.0; (sys_platform != 'linux' or platform_machine != 'aarch64') and (platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_machine != 'x86_64' or sys_platform != 'darwin')",
+  "openwakeword==0.6.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "onnxruntime==1.27.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 # NeuTTS's upstream Python ceiling excludes the managed interpreter.
 # Keep dependency markers and PM gates together: bundles omit them, explicit
@@ -322,9 +324,11 @@ voice = [
 # target. PM installs the selected engine on first use for source installs.
 wake = [
   # pyopen-wakeword includes the TFLite library and shared feature models.
-  # Its universal2 wheel contains an ARM64-only library, so Intel Macs cannot
-  # load it. There is no native Windows ARM64 wheel either.
-  "pyopen-wakeword==1.1.0; (platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_machine != 'x86_64' or sys_platform != 'darwin')",
+  # Its Linux ARM64 wheel requires glibc 2.34 and its sdist carries an x86-64
+  # library, so RK3562/Debian 11 uses the bundled ONNX model instead.
+  "pyopen-wakeword==1.1.0; (sys_platform != 'linux' or platform_machine != 'aarch64') and (platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_machine != 'x86_64' or sys_platform != 'darwin')",
+  "openwakeword==0.6.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "onnxruntime==1.27.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "sherpa-onnx==1.13.8",
   # uv reads sherpa-onnx metadata from its cp311-linux_armv7l wheel, which
   # omits this pin. Every wheel the bundles install requires it. Without the
@@ -355,7 +359,9 @@ silk = ["pilk==0.2.4"]
 # Wake-engine sub-extras — lazy per-engine installs so a user who only wants
 # sherpa-onnx doesn't pull the whole [wake] bundle. Pins match [wake].
 wake-openwakeword = [
-  "pyopen-wakeword==1.1.0; (platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_machine != 'x86_64' or sys_platform != 'darwin')",
+  "pyopen-wakeword==1.1.0; (sys_platform != 'linux' or platform_machine != 'aarch64') and (platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_machine != 'x86_64' or sys_platform != 'darwin')",
+  "openwakeword==0.6.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "onnxruntime==1.27.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 wake-sherpa = [
   "sherpa-onnx==1.13.8",
@@ -653,6 +659,10 @@ override-dependencies = [
   # never builds a misaki G2P. The never-true marker removes it from the lock.
   # Remove this line when misaki drops it or a 3.14-capable release fits.
   "spacy-curated-transformers; sys_platform == 'never'",
+  # openwakeword's ONNX backend never imports tflite-runtime. Its metadata
+  # nevertheless requires that Linux-only package, which has no Python 3.14
+  # wheel and would make the otherwise portable ONNX runtime unresolvable.
+  "tflite-runtime; sys_platform == 'never'",
 ]
 # Release-age check: Hermes's dependencies must be at least 3 days old when Hermes
 # locks them. It runs where uv.lock is resolved (`hermes pm lock`, and CI's lock
@@ -724,7 +734,10 @@ pm = ["lock.json", "artifact-mirror.json", "pyproject.toml", "uv.lock"]
 tools = [
   "bot_desktop/launcher.sh",
   "bot_desktop/wallpaper.png",
+  "wakewords/embedding_model.onnx",
+  "wakewords/hey_hermes.onnx",
   "wakewords/hey_hermes.tflite",
+  "wakewords/melspectrogram.onnx",
 ]
 
 [tool.pytest.ini_options]

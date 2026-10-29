@@ -67,7 +67,23 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
 }
 
 
-def _anchors(extra: str) -> tuple[str, ...]:
+def _anchors(
+    extra: str, *, environment: dict[str, str] | None = None
+) -> tuple[str, ...]:
+    if extra in {"wake", "wake-openwakeword"}:
+        if environment is None:
+            import platform
+            import sys
+
+            environment = {
+                "sys_platform": sys.platform,
+                "platform_machine": platform.machine(),
+            }
+        if (
+            environment.get("sys_platform", "").lower() == "linux"
+            and environment.get("platform_machine", "").lower() == "aarch64"
+        ):
+            return ("openwakeword", "onnxruntime")
     got = ANCHORS.get(extra, extra.replace("-", "_"))
     return got if isinstance(got, tuple) else (got,)
 
@@ -128,7 +144,10 @@ def extra_supported(extra: str, *, environment: dict[str, str] | None = None,
     extra that IS present on this machine (anchors importable) is always
     supported — an installed override beats the table (dev machines,
     hand-synced venvs)."""
-    if all((importable or _importable)(a) for a in _anchors(extra)):
+    if all(
+        (importable or _importable)(a)
+        for a in _anchors(extra, environment=environment)
+    ):
         return True
     marker = _platform_gates().get(extra)
     if marker is None:

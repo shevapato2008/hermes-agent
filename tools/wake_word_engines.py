@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+import platform
+import sys
 import threading
 from contextlib import suppress
 from pathlib import Path
@@ -77,9 +79,19 @@ def _sub(cfg: dict[str, Any], key: str) -> dict[str, Any]:
     return sub if isinstance(sub, dict) else {}
 
 
+def _openwakeword_backend_for(system: str, machine: str) -> str:
+    """Select the loadable product-model runtime for a concrete host."""
+    if system.lower() == "linux" and machine.lower() == "aarch64":
+        return "onnx"
+    return "tflite"
+
+
+def _openwakeword_backend() -> str:
+    return _openwakeword_backend_for(sys.platform, platform.machine())
+
+
 class _OpenWakeWordEngine(_Engine):
-    """pyopen-wakeword — free, local hotword detection (TFLite via a bundled
-    tensorflowlite_c lib; no runtime download, no framework choice). Scores one
+    """Free, local hotword detection using TFLite or the RK-compatible ONNX path. Scores one
     ~80 ms frame at a time; ``sensitivity`` IS the raw 0..1 threshold (higher =
     stricter). A real utterance holds the score high across frames while a stray
     phoneme spikes one, so ``confirmation_frames`` hits are required."""
@@ -87,45 +99,65 @@ class _OpenWakeWordEngine(_Engine):
     feature, section = "wake-openwakeword", "openwakeword"
 
     def _build(self, cfg, sub, ww) -> None:
-        from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
-
         model_ref = str(sub.get("model") or ww._BUNDLED_MODEL_NAME).strip()
-        # Default (or explicit "hey_hermes") → the bundled model; a custom path
-        # is used as-is. pyopen-wakeword bundles the shared feature models
-        # (melspectrogram + embedding — byte-identical to the openWakeWord
-        # v0.5.1 files) inside its wheel, so there is no download_models step.
-        if model_ref.lower() in ww._BUNDLED_MODEL_ALIASES:
-            model_ref = ww._bundled_wakeword_path()
-        # pyopen-wakeword returns a 0..1 score per completed window; sensitivity
-        # IS the raw threshold a score must clear. Higher = stricter (fewer
-        # false fires). Default 0.6 sits above openWakeWord's permissive 0.5
-        # baseline, which let near-misses like "hey hor" through.
         self._threshold = ww._sensitivity(cfg)
         self._confirm_needed = ww._confirmation_frames(cfg)
         self._confirm_streak = 0
         self._score_lock = threading.Lock()
         self._latest_score: float | None = None
         self._peak_score: float | None = None
+        self._features = None
+
+        if _openwakeword_backend() == "onnx":
+            from openwakeword.model import Model
+
+            if model_ref.lower() in ww._BUNDLED_MODEL_ALIASES:
+                model_ref = ww._bundled_wakeword_path("onnx")
+            elif not model_ref.lower().endswith(".onnx"):
+                raise RuntimeError("Linux ARM64 wake-word models must use ONNX")
+            self._model = Model(
+                wakeword_models=[model_ref],
+                inference_framework="onnx",
+                melspec_model_path=ww._bundled_wakeword_feature_path(
+                    "melspectrogram"
+                ),
+                embedding_model_path=ww._bundled_wakeword_feature_path(
+                    "embedding_model"
+                ),
+            )
+            self._labels = list(self._model.models)
+            return
+
+        from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
+
+        # Default (or explicit "hey_hermes") → the bundled model; a custom path
+        # is used as-is. pyopen-wakeword bundles the shared feature models.
+        if model_ref.lower() in ww._BUNDLED_MODEL_ALIASES:
+            model_ref = ww._bundled_wakeword_path()
         self._features = OpenWakeWordFeatures.from_builtin()
         self._model = OpenWakeWord.from_model(model_ref)
         self._labels = [self._model.id]
 
     def process(self, frame) -> bool:
-        # frame is a 1-D int16 ndarray; the features pipeline consumes int16
-        # bytes. process_streaming() yields embeddings as the window fills and
-        # the model yields one 0..1 score per completed window.
         over = False
         latest: float | None = None
-        for emb in self._features.process_streaming(frame.tobytes()):
-            for score in self._model.process_streaming(emb):
-                try:
-                    numeric = float(score)
-                except (TypeError, ValueError):
-                    continue
-                if math.isfinite(numeric):
-                    latest = numeric if latest is None else max(latest, numeric)
-                if score >= self._threshold:
-                    over = True
+        if self._features is None:
+            scores = self._model.predict(frame).values()
+        else:
+            scores = (
+                score
+                for embedding in self._features.process_streaming(frame.tobytes())
+                for score in self._model.process_streaming(embedding)
+            )
+        for score in scores:
+            try:
+                numeric = float(score)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                latest = numeric if latest is None else max(latest, numeric)
+            if numeric >= self._threshold:
+                over = True
         # Require N consecutive over-threshold frames: a real phrase holds the
         # score high across frames, a stray ambient phoneme spikes just one.
         with self._score_lock:
@@ -162,14 +194,18 @@ class _OpenWakeWordEngine(_Engine):
         with self._score_lock:
             self._confirm_streak = 0
         with suppress(Exception):
-            self._features.reset()
+            if self._features is not None:
+                self._features.reset()
             self._model.reset()
 
     def close(self) -> None:
         self.reset()
         with suppress(Exception):
-            self._features.close()
-            self._model.close()
+            if self._features is not None:
+                self._features.close()
+            close = getattr(self._model, "close", None)
+            if close is not None:
+                close()
 
 
 # sherpa-onnx open-vocabulary KWS model: small streaming zipformer transducer (English,
