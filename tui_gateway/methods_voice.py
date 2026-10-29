@@ -235,6 +235,27 @@ def _any_session_running() -> bool:
         return False
 
 
+def _voice_output_bound_transport(transport):
+    """Resolve a session fanout to its installed exact voice owner.
+
+    ``FanoutTransport`` is only the session's event router.  Membership may
+    preserve an existing physical/logical owner, but the router itself never
+    becomes voice authority.
+    """
+    _owner, _epoch, lease_transport, _capture_id = _voice_scope_snapshot()
+    _authority_sid, authority_transport = _voice_authority_snapshot()
+    expected = lease_transport or authority_transport
+    if expected is None:
+        return transport
+    if bool(getattr(expected, "_closed", False)):
+        return None
+    if transport is expected:
+        return expected
+    if isinstance(transport, FanoutTransport) and transport.contains(expected):
+        return expected
+    return None
+
+
 def _voice_output_scope_allowed(
     session_id: str | None, transport, *, require_voice_scope: bool = False,
 ) -> bool:
@@ -243,15 +264,20 @@ def _voice_output_scope_allowed(
         return False
     _owner, epoch, owner_transport, _capture_id = _voice_scope_snapshot()
     if owner_transport is not None:
-        if not session_id or transport is None:
+        requested_transport = _voice_output_bound_transport(transport)
+        if not session_id or requested_transport is None:
             return False
-        acquired = _acquire_voice_lease(str(session_id), transport)
+        acquired = _acquire_voice_lease(str(session_id), requested_transport)
         return acquired == epoch and _voice_scope_matches(
-            str(session_id), epoch, transport)
+            str(session_id), epoch, requested_transport)
     authority_sid, authority_transport = _voice_authority_snapshot()
     if authority_transport is not None:
         sid = str(session_id or authority_sid)
-        requested_transport = transport or authority_transport
+        requested_transport = _voice_output_bound_transport(
+            transport or authority_transport
+        )
+        if requested_transport is None:
+            return False
         return _voice_authority_accepts(
             sid, requested_transport, allow_unclaimed=False
         )
@@ -737,6 +763,7 @@ def _speak_text_with_barge(
     ) as allowed:
         if not allowed:
             return
+        transport = _voice_output_bound_transport(transport)
         stop, done = threading.Event(), threading.Event()
         with _fd_listener_lock:
             _fd_speak_pipelines.add((stop, done))

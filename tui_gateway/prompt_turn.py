@@ -250,6 +250,7 @@ def _start_turn_voice(session_id: str, transport) -> tuple[Any, bool]:
     with _voice_output_start_barrier(session_id, transport) as allowed:
         if not allowed:
             return None, False
+        transport = _voice_output_bound_transport(transport)
         tts_queue = _tts_stream_begin(session_id, transport)
         if not _voice_mode_enabled():
             return tts_queue, False

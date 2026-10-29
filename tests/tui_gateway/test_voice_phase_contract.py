@@ -624,6 +624,127 @@ def test_reattach_accepts_the_exact_owner_inside_a_live_session_fanout(
     ]
 
 
+def test_turn_voice_keeps_the_exact_owner_when_the_session_slot_becomes_a_fanout(
+    phase_voice, monkeypatch
+):
+    owner, viewer = _Sink(), _Sink()
+    enabled = phase_voice.rpc(
+        owner, "voice.toggle", action="on", session_id="runtime"
+    )
+    lease_epoch = enabled["result"]["lease_epoch"]
+    tts_queue = object()
+    stream_transports = []
+    listener_transports = []
+    monkeypatch.setattr(
+        server,
+        "_tts_stream_begin",
+        lambda _sid, transport: stream_transports.append(transport) or tts_queue,
+    )
+    monkeypatch.setattr(
+        server,
+        "_arm_full_duplex_listener",
+        lambda _sid, transport: listener_transports.append(transport) or True,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.voice_mode",
+        types.SimpleNamespace(
+            is_audio_output_active=lambda: False,
+            start_thinking_sound=lambda **_kwargs: True,
+        ),
+    )
+
+    assert server._start_turn_voice("runtime", owner) == (tts_queue, True)
+    session = {"transport": owner}
+    assert server._attach_session_transport(session, viewer) is True
+    fanout = session["transport"]
+    assert isinstance(fanout, FanoutTransport)
+    assert server._start_turn_voice("runtime", fanout) == (tts_queue, True)
+    assert server._detach_session_transport(session, viewer) is True
+    assert session["transport"] is fanout
+    assert server._start_turn_voice("runtime", fanout) == (tts_queue, True)
+
+    assert stream_transports == [owner, owner, owner]
+    assert listener_transports == [owner, owner, owner]
+    assert server._voice_lease_owner_transport is owner
+    assert server._voice_authority_transport is owner
+    assert server._voice_lease_epoch == lease_epoch
+
+
+def test_turn_voice_rejects_fanout_without_a_live_exact_owner(
+    phase_voice, monkeypatch
+):
+    owner, viewer, unrelated = _Sink(), _Sink(), _Sink()
+    enabled = phase_voice.rpc(
+        owner, "voice.toggle", action="on", session_id="runtime"
+    )
+    lease_epoch = enabled["result"]["lease_epoch"]
+    downstream = []
+    monkeypatch.setattr(
+        server,
+        "_tts_stream_begin",
+        lambda *_args: downstream.append("tts"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_arm_full_duplex_listener",
+        lambda *_args: downstream.append("listener") or True,
+    )
+
+    assert server._start_turn_voice("runtime", viewer) == (None, False)
+    assert server._start_turn_voice(
+        "runtime", FanoutTransport(viewer, unrelated)
+    ) == (None, False)
+    stale = FanoutTransport(owner, viewer)
+    assert stale.detach(owner) is True
+    assert server._start_turn_voice("runtime", stale) == (None, False)
+    closed = FanoutTransport(owner, viewer)
+    owner._closed = True
+    assert server._start_turn_voice("runtime", closed) == (None, False)
+
+    assert downstream == []
+    assert server._voice_lease_owner_transport is owner
+    assert server._voice_authority_transport is owner
+    assert server._voice_lease_epoch == lease_epoch
+
+
+def test_fallback_speech_arms_barge_in_with_the_exact_owner_from_a_fanout(
+    phase_voice, monkeypatch
+):
+    owner, viewer = _Sink(), _Sink()
+    enabled = phase_voice.rpc(
+        owner, "voice.toggle", action="on", session_id="runtime"
+    )
+    lease_epoch = enabled["result"]["lease_epoch"]
+    started = []
+    armed = []
+    monkeypatch.setattr(
+        phase_voice.mic, "speak_text", lambda *_args: None, raising=False
+    )
+    monkeypatch.setattr(
+        server,
+        "_start_voice_thread",
+        lambda target, *, name, args=(): started.append((target, name, args))
+        or types.SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        server,
+        "_arm_barge_listener_if_enabled",
+        lambda sid, transport: armed.append((sid, transport)),
+    )
+
+    server._speak_text_with_barge(
+        "reply", "runtime", FanoutTransport(owner, viewer), True
+    )
+
+    assert len(started) == 1
+    assert started[0][1:] == ("voice-speak", ())
+    assert armed == [("runtime", owner)]
+    assert server._voice_lease_owner_transport is owner
+    assert server._voice_authority_transport is owner
+    assert server._voice_lease_epoch == lease_epoch
+
+
 def test_tts_enabled_parameter_is_an_idempotent_set(phase_voice, monkeypatch):
     owner = _Sink()
     phase_voice.rpc(owner, "voice.toggle", action="on", session_id="runtime")
