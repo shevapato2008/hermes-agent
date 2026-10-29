@@ -364,6 +364,7 @@ def _tts_stream_stop(user_barge: bool = True) -> None:
 _fd_listener_lock = threading.Lock()
 _fd_listener_active = False
 _fd_listener_epoch = 0
+_fd_listener_generation = 0
 _fd_speak_pipelines: set[tuple[threading.Event, threading.Event]] = set()
 _output_drain_lock = threading.Lock()
 _output_drain_stop: threading.Event | None = None
@@ -433,7 +434,7 @@ def _arm_full_duplex_listener(session_id: str | None = None, transport=None) -> 
             return False
         _cancel_output_drain_monitor()
         sid, epoch, owner_transport, previous_epoch = scope
-        global _fd_listener_active, _fd_listener_epoch
+        global _fd_listener_active, _fd_listener_epoch, _fd_listener_generation
         with _fd_listener_lock:
             if _fd_listener_active:
                 if _fd_listener_epoch == epoch:
@@ -447,11 +448,19 @@ def _arm_full_duplex_listener(session_id: str | None = None, transport=None) -> 
             else:
                 _fd_listener_active = True
                 _fd_listener_epoch = epoch
+            _fd_listener_generation += 1
+            listener_generation = _fd_listener_generation
         _emit_voice_lease_changed(
             sid, epoch, owner_transport, previous_epoch, "full_duplex"
         )
+
+        def _run_listener(listener_sid, listener_epoch, listener_transport):
+            _full_duplex_listener(
+                listener_sid, listener_epoch, listener_transport, listener_generation
+            )
+
         _start_voice_thread(
-            _full_duplex_listener,
+            _run_listener,
             name="voice-full-duplex",
             args=(sid, epoch, owner_transport),
         )
@@ -553,9 +562,27 @@ def _output_drain_monitor(
                 _output_drain_epoch = 0
 
 
-def _full_duplex_listener(session_id: str, lease_epoch: int, transport) -> None:
-    """Mic live from utterance-submit to turn-complete; a trip transcribes -> ``voice.transcript``."""
+def _retire_full_duplex_listener(
+    lease_epoch: int, listener_generation: int | None,
+) -> None:
+    """Retire only this listener instance; a same-epoch successor owns its slot."""
     global _fd_listener_active, _fd_listener_epoch
+    with _fd_listener_lock:
+        if _fd_listener_epoch == lease_epoch and (
+            listener_generation is None
+            or _fd_listener_generation == listener_generation
+        ):
+            _fd_listener_active = False
+            _fd_listener_epoch = 0
+
+
+def _full_duplex_listener(
+    session_id: str,
+    lease_epoch: int,
+    transport,
+    listener_generation: int | None = None,
+) -> None:
+    """Mic live from utterance-submit to turn-complete; a trip transcribes -> ``voice.transcript``."""
     input_failed = threading.Event()
 
     def _on_input_error(error) -> None:
@@ -637,6 +664,7 @@ def _full_duplex_listener(session_id: str, lease_epoch: int, transport) -> None:
                     f"voice transcription failed: {exc}", stage="stt", retryable=True))
                 return
             if result.get("success") and (result.get("transcript") or "").strip():
+                _retire_full_duplex_listener(lease_epoch, listener_generation)
                 _deliver_fd_transcript(
                     result["transcript"].strip(), session_id, lease_epoch, transport)
             elif result.get("success") and _voice_scope_matches(
@@ -660,10 +688,7 @@ def _full_duplex_listener(session_id: str, lease_epoch: int, transport) -> None:
         logger.debug("full-duplex listener failed: %s", e)
         on_input_error(e)
     finally:
-        with _fd_listener_lock:
-            if _fd_listener_epoch == lease_epoch:
-                _fd_listener_active = False
-                _fd_listener_epoch = 0
+        _retire_full_duplex_listener(lease_epoch, listener_generation)
 
 
 def _fd_barge_params(cfg: dict) -> tuple[float, int]:

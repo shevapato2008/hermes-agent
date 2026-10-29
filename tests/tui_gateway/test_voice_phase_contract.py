@@ -85,6 +85,7 @@ def phase_voice(monkeypatch):
         "_voice_tts_lease_desired": {},
         "_fd_listener_active": False,
         "_fd_listener_epoch": 0,
+        "_fd_listener_generation": 0,
         "_output_drain_stop": None,
         "_output_drain_epoch": 0,
         "_sessions": {},
@@ -269,6 +270,97 @@ def test_transcript_releases_before_turn_claims_a_successor_epoch(
         ("voice-full-duplex", ("runtime", payload["lease_epoch"], owner))
     ]
     assert len(turn_results) == 1
+
+
+def test_full_duplex_transcript_rearms_before_old_listener_cleanup(
+    phase_voice, monkeypatch, tmp_path
+):
+    owner = _Sink()
+    wav = tmp_path / "barge.wav"
+    wav.write_bytes(b"wav")
+    allow_successor_exit = threading.Event()
+    threads = []
+    listens = []
+    replacement_results = []
+
+    def listen(_should_stop, *, on_trigger, start_barrier, **_kwargs):
+        with start_barrier() as allowed:
+            assert allowed is True
+        listens.append(threading.current_thread())
+        if len(listens) == 1:
+            on_trigger("generation")
+            return str(wav)
+        assert allow_successor_exit.wait(2)
+        return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.voice_mode",
+        types.SimpleNamespace(
+            full_duplex_listen=listen,
+            is_audio_output_active=lambda: False,
+            start_thinking_sound=lambda **_kwargs: False,
+            transcribe_recording=lambda _path: {
+                "success": True,
+                "transcript": "replacement",
+            },
+        ),
+    )
+    monkeypatch.setattr(server, "_fd_trip", lambda *_args: True)
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda *_args: None)
+
+    def start_thread(target, *, name, args=()):
+        thread = threading.Thread(
+            target=target,
+            args=args,
+            name=f"{name}-{len(threads) + 1}",
+            daemon=True,
+        )
+        threads.append(thread)
+        thread.start()
+        return thread
+
+    monkeypatch.setattr(server, "_start_voice_thread", start_thread)
+    original_write = owner.write
+
+    def write(frame):
+        written = original_write(frame)
+        if frame.get("params", {}).get("type") == "voice.transcript":
+            replacement_results.append(
+                server._start_turn_voice("runtime", owner)
+            )
+        return written
+
+    monkeypatch.setattr(owner, "write", write)
+    monkeypatch.setattr(server, "_sessions", {"runtime": {"running": True}})
+    assert server._install_voice_authority(
+        "runtime", owner, allow_unclaimed=True
+    )
+
+    assert server._arm_full_duplex_listener("runtime", owner) is True
+    threads[0].join(2)
+    assert not threads[0].is_alive()
+
+    assert len(replacement_results) == 1
+    assert len(threads) == 2
+    assert threads[1].is_alive()
+    assert server._fd_listener_active is True
+    assert server._fd_listener_epoch == server._voice_lease_epoch
+
+    epoch = server._voice_lease_epoch
+    released, error = server._release_voice_lease(
+        session_id="runtime",
+        lease_epoch=epoch,
+        transport=owner,
+        stop_loop=False,
+    )
+    assert released is True and error == ""
+    allow_successor_exit.set()
+    threads[1].join(2)
+
+    assert not threads[1].is_alive()
+    assert server._fd_listener_active is False
+    assert server._fd_listener_epoch == 0
 
 
 def test_forced_stop_transcript_waits_for_inflight_physical_release(

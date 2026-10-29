@@ -90,6 +90,7 @@ def voice(monkeypatch):
         "_voice_tts_lease_desired": {},
         "_fd_listener_active": False,
         "_fd_listener_epoch": 0,
+        "_fd_listener_generation": 0,
         "_output_drain_stop": None,
     }.items():
         monkeypatch.setattr(server, name, value, raising=False)
