@@ -15,6 +15,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
+import shutil
+import tempfile
 import threading
 
 import pytest
@@ -23,6 +26,16 @@ from unittest.mock import AsyncMock
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, SendResult
 from gateway.stream_events import ApprovalRequired
+
+
+@pytest.fixture
+def tmp_path():
+    """Short temp directory for AF_UNIX socket paths (macOS sun_path is 104 bytes)."""
+    path = Path(tempfile.mkdtemp(prefix="sbva-", dir="/tmp"))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def _make_adapter(tmp_path, extra=None):
@@ -130,7 +143,7 @@ class TestSend:
         result = await adapter.send("chat-1", "hello there")
         assert result.success is True
 
-        lines = open(adapter.jsonl_path, encoding="utf-8").read().splitlines()
+        lines = Path(adapter.jsonl_path).read_text(encoding="utf-8").splitlines()
         assert len(lines) == 1
         record = json.loads(lines[0])
         assert record["type"] == "message"
@@ -157,7 +170,7 @@ class TestSend:
         assert result.success is True
 
         record = json.loads(
-            open(adapter.jsonl_path, encoding="utf-8").read().splitlines()[0]
+            Path(adapter.jsonl_path).read_text(encoding="utf-8").splitlines()[0]
         )
         assert record["reply_to"] == "turn-123"
         assert record["draft_id"] == 7
@@ -168,7 +181,7 @@ class TestSend:
         adapter = _make_adapter(tmp_path)
         await adapter.send("chat-1", "one")
         await adapter.send("chat-1", "two")
-        lines = open(adapter.jsonl_path, encoding="utf-8").read().splitlines()
+        lines = Path(adapter.jsonl_path).read_text(encoding="utf-8").splitlines()
         seqs = [json.loads(l)["seq"] for l in lines]
         assert seqs == [0, 1]
 
@@ -200,7 +213,7 @@ class TestDraftSend:
         assert second.success is True
         records = [
             json.loads(line)
-            for line in open(adapter.jsonl_path, encoding="utf-8").read().splitlines()
+            for line in Path(adapter.jsonl_path).read_text(encoding="utf-8").splitlines()
         ]
         assert [record["type"] for record in records] == [
             "message_draft", "message_draft",
@@ -239,7 +252,7 @@ class TestSendExecApprovalEvent:
         )
         assert result.success is True
 
-        lines = open(adapter.jsonl_path, encoding="utf-8").read().splitlines()
+        lines = Path(adapter.jsonl_path).read_text(encoding="utf-8").splitlines()
         assert len(lines) == 1
         record = json.loads(lines[0])
         assert record["type"] == "approval_required"
@@ -275,7 +288,7 @@ class TestSendExecApprovalEvent:
         await adapter.send_exec_approval_event(
             chat_id="chat-1", approval=approval, session_key="sess-1",
         )
-        lines = open(adapter.jsonl_path, encoding="utf-8").read().splitlines()
+        lines = Path(adapter.jsonl_path).read_text(encoding="utf-8").splitlines()
         assert len(lines) == 2
         assert json.loads(lines[0])["type"] == "message"
         assert json.loads(lines[1])["type"] == "approval_required"
@@ -518,7 +531,7 @@ class TestDispatchExecApprovalCapability:
             thread.join(timeout=5)
 
         assert len(adapter.sent) == 1
-        chat_id, content, metadata = adapter.sent[0]
+        chat_id, content, _metadata = adapter.sent[0]
         assert chat_id == "chat-1"
         assert "rm -rf /tmp/x" in content
         assert "/approve" in content
@@ -644,3 +657,49 @@ def test_nonstring_denial_reason_leaves_challenge_pending(tmp_path, monkeypatch)
     assert result is False
     assert entry.result is None
     assert entry.challenge_id in adapter._pending_challenges["session"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_smartbox_constructs_consumer_with_adapter_settings(
+    monkeypatch, tmp_path
+):
+    from gateway.platforms.smartbox_voice import SmartBoxVoiceAdapter
+    from gateway.stream_consumer import GatewayStreamConsumer
+    from tests.gateway.test_run_progress_topics import StreamingRefineAgent, _run_with_agent
+
+    smartbox_adapter = SmartBoxVoiceAdapter(PlatformConfig(
+        enabled=True,
+        extra={
+            "socket_path": str(tmp_path / "smartbox.sock"),
+            "jsonl_path": str(tmp_path / "smartbox.jsonl"),
+        },
+    ))
+    captured_configs = []
+    original_init = GatewayStreamConsumer.__init__
+
+    def _capture_init(consumer, *args, **kwargs):
+        captured_configs.append(kwargs["config"])
+        original_init(consumer, *args, **kwargs)
+
+    monkeypatch.setattr(GatewayStreamConsumer, "__init__", _capture_init)
+    _, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamingRefineAgent,
+        session_id="sess-smartbox-streaming-default",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": False},
+        },
+        platform=Platform.SMARTBOX_VOICE,
+        chat_id="smartbox-voice",
+        chat_type="dm",
+        thread_id=None,
+        adapter=smartbox_adapter,
+    )
+
+    assert result.get("already_sent") is True
+    assert len(captured_configs) == 1
+    config = captured_configs[0]
+    assert (config.transport, config.cursor) == ("draft", "")
+    assert (config.buffer_threshold, config.edit_interval) == (1, 0.05)

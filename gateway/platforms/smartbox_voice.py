@@ -21,11 +21,12 @@ path — see ``_dispatch_exec_approval`` in ``gateway/run.py``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, Set
+from typing import Any, Optional
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -64,6 +65,7 @@ SMARTBOX_VOICE_CHANNEL_PROMPT = (
 )
 
 # Overridable via PlatformConfig.extra["socket_path"] / SMARTBOX_VOICE_SOCKET_PATH.
+# no-tmp: ok — explicit local-appliance IPC socket default shared between the SmartBox voice app and gateway.
 DEFAULT_SOCKET_PATH = "/tmp/hermes-smartbox-voice.sock"
 
 
@@ -90,7 +92,7 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
         # session_key -> set of challenge_ids this adapter has sent to the
         # client and not yet resolved. Used to deny-on-disconnect: the
         # SAME gateway approval registry, no second conversation database.
-        self._pending_challenges: Dict[str, Set[str]] = {}
+        self._pending_challenges: dict[str, set[str]] = {}
         self._chat_id = "smartbox-voice"
 
     @property
@@ -125,7 +127,7 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
             self._sock = bind_unix_socket(self.socket_path)
             assert_uds_permissions(self.socket_path)
         except Exception as e:
-            logger.error("SmartBox voice: failed to bind UDS %s: %s", self.socket_path, e)
+            logger.error("SmartBox voice: failed to bind UDS %s: %s", self.socket_path, e, exc_info=True)
             return False
 
         try:
@@ -133,7 +135,7 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
                 self._handle_connection, sock=self._sock
             )
         except Exception as e:
-            logger.error("SmartBox voice: failed to start UDS server: %s", e)
+            logger.error("SmartBox voice: failed to start UDS server: %s", e, exc_info=True)
             return False
 
         self._running = True
@@ -147,14 +149,10 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
             try:
                 await self._server.wait_closed()
             except Exception:
-                pass
+                logger.debug("SmartBox voice: error waiting for UDS server close", exc_info=True)
             self._server = None
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(self.socket_path)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
 
         # The UDS transport is gone -- any challenge still outstanding can
         # never be answered by this client. Deny them all rather than leave
@@ -168,12 +166,55 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
                     logger.debug(
                         "SmartBox voice: failed to deny outstanding challenge %s on disconnect",
                         challenge_id,
+                        exc_info=True,
                     )
         self._pending_challenges.clear()
 
     # ------------------------------------------------------------------
     # Connection / frame handling
     # ------------------------------------------------------------------
+
+    async def _dispatch_frame(
+        self,
+        frame_type: Any,
+        frame: dict,
+        writer: asyncio.StreamWriter,
+        session_key: Optional[str],
+    ) -> tuple[bool, Optional[str]]:
+        if frame_type == "hello":
+            try:
+                assert_protocol_version(int(frame.get("protocol_version", -1)))
+            except (ProtocolVersionError, TypeError, ValueError) as e:
+                await self._write_frame(writer, {"type": "error", "message": str(e)})
+                return False, session_key
+            return True, session_key
+        handlers = {
+            "user_message": self._on_user_message_frame,
+            "cancel": self._on_cancel_frame,
+            "resolve_approval": self._on_resolve_approval_frame,
+        }
+        handler = handlers.get(frame_type)
+        if handler is not None:
+            session_key = await handler(frame, writer, session_key)
+        return True, session_key
+
+    async def _on_user_message_frame(
+        self, frame: dict, writer: asyncio.StreamWriter, session_key: Optional[str]
+    ) -> Optional[str]:
+        new_session_key = await self._handle_user_message_frame(frame, writer)
+        return new_session_key or session_key
+
+    async def _on_cancel_frame(
+        self, frame: dict, _writer: asyncio.StreamWriter, session_key: Optional[str]
+    ) -> Optional[str]:
+        await self._handle_cancel_frame(frame, session_key)
+        return session_key
+
+    async def _on_resolve_approval_frame(
+        self, frame: dict, _writer: asyncio.StreamWriter, session_key: Optional[str]
+    ) -> Optional[str]:
+        self._handle_resolve_approval_frame(frame, session_key)
+        return session_key
 
     async def _handle_connection(self, reader: asyncio.StreamReader,
                                   writer: asyncio.StreamWriter) -> None:
@@ -188,27 +229,17 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
 
-                frame_type = frame.get("type")
-                if frame_type == "hello":
-                    try:
-                        assert_protocol_version(int(frame.get("protocol_version", -1)))
-                    except (ProtocolVersionError, TypeError, ValueError) as e:
-                        await self._write_frame(writer, {"type": "error", "message": str(e)})
-                        break
-                elif frame_type == "user_message":
-                    new_session_key = await self._handle_user_message_frame(frame, writer)
-                    if new_session_key:
-                        session_key = new_session_key
-                elif frame_type == "cancel":
-                    await self._handle_cancel_frame(frame, session_key)
-                elif frame_type == "resolve_approval":
-                    self._handle_resolve_approval_frame(frame, session_key)
+                keep_reading, session_key = await self._dispatch_frame(
+                    frame.get("type"), frame, writer, session_key
+                )
+                if not keep_reading:
+                    break
         finally:
             try:
                 if writer is not None and not writer.is_closing():
                     writer.close()
             except Exception:
-                pass
+                logger.debug("SmartBox voice: error closing UDS writer", exc_info=True)
             # Connection lost mid-approval -- deny anything still
             # outstanding for this session. Drives the SAME registry;
             # never a second approval channel.
@@ -221,6 +252,7 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
                         logger.debug(
                             "SmartBox voice: failed to deny challenge %s on connection close",
                             challenge_id,
+                            exc_info=True,
                         )
                 self._pending_challenges.pop(session_key, None)
 
@@ -306,7 +338,7 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
         self,
         *,
         chat_type: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> bool:
         return True
 
@@ -325,7 +357,7 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
         chat_id: str,
         draft_id: int,
         content: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         stream_context = (metadata or {}).get("_gateway_stream")
         if not isinstance(stream_context, dict):
@@ -347,7 +379,7 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         stream_context = (metadata or {}).get("_gateway_stream")
         if not isinstance(stream_context, dict):
@@ -380,12 +412,12 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
         image_url: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         text = f"{caption}\n{image_url}" if caption else image_url
         return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
-    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         return {"name": "SmartBox", "type": "dm", "chat_id": chat_id}
 
     # ------------------------------------------------------------------

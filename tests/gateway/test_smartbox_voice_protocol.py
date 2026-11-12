@@ -13,11 +13,24 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+import shutil
 import socket
 import stat
+import tempfile
 import threading
 
 import pytest
+
+
+@pytest.fixture
+def tmp_path():
+    """Short temp directory for AF_UNIX socket paths (macOS sun_path is 104 bytes)."""
+    path = Path(tempfile.mkdtemp(prefix="sbv-", dir="/tmp"))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 from gateway.session import session_revision
 from gateway.smartbox_voice_protocol import (

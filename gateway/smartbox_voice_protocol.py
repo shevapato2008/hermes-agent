@@ -145,7 +145,7 @@ class IdempotencyTracker:
     """
 
     def __init__(self) -> None:
-        self._states: Dict[str, MessageState] = {}
+        self._states: dict[str, MessageState] = {}
 
     def submit(self, idempotency_key: str) -> MessageState:
         if not idempotency_key:
@@ -187,7 +187,7 @@ class DeltaSequencer:
     """
 
     def __init__(self) -> None:
-        self._last: Dict[str, int] = {}
+        self._last: dict[str, int] = {}
 
     def next(self, turn_id: str) -> int:
         n = self._last.get(turn_id, -1) + 1
@@ -233,7 +233,7 @@ class OrderedJSONLWriter:
     channel or database.
     """
 
-    def __init__(self, path: "str | Path") -> None:
+    def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
