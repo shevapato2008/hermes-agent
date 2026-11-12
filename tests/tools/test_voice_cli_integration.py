@@ -233,6 +233,39 @@ class TestMaxRecordingSecondsConfigReal:
 
         assert recorder._max_recording_seconds == DEFAULT_CONFIG["voice"]["max_recording_seconds"]
 
+
+class TestVoiceInputFailureReal:
+    @patch("cli._cprint")
+    @patch("cli.threading.Thread")
+    @patch("tools.voice_mode.play_beep")
+    @patch("tools.voice_mode.create_audio_recorder")
+    @patch(
+        "tools.voice_mode.check_voice_requirements",
+        return_value={
+            "available": True,
+            "audio_available": True,
+            "stt_available": True,
+            "details": "OK",
+            "missing_packages": [],
+        },
+    )
+    @patch("hermes_cli.config.load_config", return_value={"voice": {}})
+    def test_async_provider_failure_clears_classic_capture_state(
+        self, _cfg, _req, mock_create, _beep, mock_thread, cprint
+    ):
+        recorder = MagicMock()
+        recorder.supports_silence_autostop = True
+        mock_create.return_value = recorder
+        mock_thread.return_value = MagicMock(start=MagicMock())
+        cli = _make_voice_cli(_voice_mode=True, _voice_continuous=True)
+        cli._voice_start_recording()
+
+        recorder.on_input_error(RuntimeError("parec EOF"))
+
+        assert cli._voice_recording is False
+        assert cli._voice_continuous is False
+        assert any("parec EOF" in str(call) for call in cprint.call_args_list)
+
 class TestDisableVoiceModeReal:
     """Tests _disable_voice_mode with real CLI instance."""
 

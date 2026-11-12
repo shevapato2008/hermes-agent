@@ -314,7 +314,7 @@ describe('submissionCore.submitPrompt — typed voice stop on the shared gateway
 
     await vi.waitFor(() => expect(settle).toHaveBeenCalledWith(true))
     expect(publishLocalEvent).toHaveBeenCalledWith({
-      payload: { stop_phrase: true, typed: true },
+      payload: { lease_epoch: 0, owner_session_id: 'sess-1', stop_phrase: true, typed: true },
       session_id: 'sess-1',
       type: 'voice.transcript'
     })
@@ -352,7 +352,7 @@ describe('submissionCore.submitPrompt — typed voice stop on the shared gateway
 
       await vi.waitFor(() => expect(settle).toHaveBeenCalledWith(true))
       expect(publishLocalEvent).toHaveBeenCalledWith({
-        payload: { stop_phrase: true, typed: true },
+        payload: { lease_epoch: 0, owner_session_id: 'sess-1', stop_phrase: true, typed: true },
         session_id: 'sess-1',
         type: 'voice.transcript'
       })

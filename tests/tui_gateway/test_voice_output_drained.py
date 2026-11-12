@@ -11,6 +11,31 @@ from tui_gateway import server
 from tests.tui_gateway.test_tui_gateway_server import _fake_tts_modules
 
 
+@pytest.fixture(autouse=True)
+def _reset_voice_lease_state():
+    def reset():
+        if stop := getattr(server, "_output_drain_stop", None):
+            stop.set()
+        server._output_drain_stop = None
+        server._voice_lease_owner_sid = ""
+        server._voice_lease_owner_transport = None
+        server._voice_authority_sid = ""
+        server._voice_authority_transport = None
+        server._voice_lease_epoch = 0
+        server._voice_lease_releasing = False
+        server._voice_lease_capture_id = None
+        server._voice_release_tail_epoch = None
+        server._voice_pending_idle_scope = None
+        server._voice_terminal_error_epochs = set()
+        server._voice_release_retry_active = False
+        server._fd_listener_active = False
+        server._fd_listener_epoch = 0
+
+    reset()
+    yield
+    reset()
+
+
 @pytest.mark.parametrize("triggered", [False, True], ids=["natural-idle", "triggered"])
 def test_full_duplex_output_drained_uses_armed_session_after_natural_idle_return(
     monkeypatch, triggered
@@ -19,18 +44,18 @@ def test_full_duplex_output_drained_uses_armed_session_after_natural_idle_return
     a VAD-triggered return must not report drain even if it is idle by then."""
     import tools.tts_streaming as ts
 
+    owner = types.SimpleNamespace(_closed=False, send_line=lambda _line: None)
+    epoch = server._acquire_voice_lease("sid-prompt", owner)
+
     monkeypatch.setenv("HERMES_VOICE", "1")
     monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"barge_in": True}})
     monkeypatch.setattr(ts, "mark_speech_interrupted", lambda: None)
     monkeypatch.setattr(server, "_voice_event_sid", "sid-global-drift")
-    monkeypatch.setattr(server, "_sessions", {})
+    runtime = {"running": triggered, "inside_listen": False}
+    session_state = {"running": triggered}
+    monkeypatch.setattr(server, "_sessions", {"sid-prompt": session_state})
     monkeypatch.setattr(server, "_tts_stream_state", None)
     monkeypatch.setattr(server, "_fd_speak_pipelines", set())
-
-    runtime = {"running": triggered, "inside_listen": False}
-    monkeypatch.setattr(
-        server, "_any_session_running", lambda: runtime["running"]
-    )
     monkeypatch.setattr(server, "_fd_tts_pending", lambda: False)
 
     events: list = []
@@ -38,7 +63,7 @@ def test_full_duplex_output_drained_uses_armed_session_after_natural_idle_return
         server,
         "_emit",
         lambda event, sid, payload=None: events.append(
-            (event, sid, payload, runtime["inside_listen"])
+            (server.current_transport(), event, sid, payload, runtime["inside_listen"])
         ),
     )
 
@@ -49,6 +74,7 @@ def test_full_duplex_output_drained_uses_armed_session_after_natural_idle_return
             if triggered:
                 on_trigger("generation")
                 runtime["running"] = False
+                session_state["running"] = False
         finally:
             runtime["inside_listen"] = False
 
@@ -63,13 +89,21 @@ def test_full_duplex_output_drained_uses_armed_session_after_natural_idle_return
             self.target(*self.args)
 
     monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
-    server._arm_full_duplex_listener("sid-prompt")
+    server._arm_full_duplex_listener("sid-prompt", owner)
 
-    drained = [event for event in events if event[0] == "voice.output_drained"]
+    drained = [event for event in events if event[1] == "voice.output_drained"]
     if triggered:
         assert drained == []
     else:
-        assert drained == [("voice.output_drained", "sid-prompt", {}, False)]
+        assert drained == [
+            (
+                owner,
+                "voice.output_drained",
+                "sid-prompt",
+                {"owner_session_id": "sid-prompt", "lease_epoch": epoch},
+                False,
+            )
+        ]
 
 
 @pytest.mark.parametrize(
@@ -83,6 +117,9 @@ def test_full_duplex_output_drained_uses_armed_session_after_natural_idle_return
 def test_full_duplex_retryable_empty_fence_uses_frozen_session_after_listen_closes(
     monkeypatch, tmp_path, transcript, configured_wake
 ):
+    owner = types.SimpleNamespace(_closed=False, send_line=lambda _line: None)
+    epoch = server._acquire_voice_lease("sid-frozen", owner)
+
     monkeypatch.setenv("HERMES_VOICE", "1")
     monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"barge_in": True}})
     monkeypatch.setattr(server, "_voice_event_sid", "sid-before-listen")
@@ -119,25 +156,27 @@ def test_full_duplex_retryable_empty_fence_uses_frozen_session_after_listen_clos
     emitted = []
 
     def fake_emit(event, sid, payload=None):
-        assert lifecycle == {"inside_listen": False, "transcribed": True}
-        emitted.append((event, sid, payload))
+        if event == "voice.transcript":
+            assert lifecycle == {"inside_listen": False, "transcribed": True}
+        emitted.append((server.current_transport(), event, sid, payload))
 
-    voice_events = []
     monkeypatch.setattr(server, "_emit", fake_emit)
-    monkeypatch.setattr(
-        server,
-        "_voice_emit",
-        lambda event, payload=None: voice_events.append((event, payload)),
-    )
 
-    server._full_duplex_listener("sid-frozen")
+    server._full_duplex_listener("sid-frozen", epoch, owner)
 
-    assert emitted == [
+    transcript_events = [e for e in emitted if e[1] == "voice.transcript"]
+    assert transcript_events == [
         (
+            owner,
             "voice.transcript",
             "sid-frozen",
-            {"text": "", "retryable_empty": True},
+            {
+                "text": "",
+                "retryable_empty": True,
+                "outcome": "empty",
+                "owner_session_id": "sid-frozen",
+                "lease_epoch": epoch,
+            },
         )
     ]
-    assert [event for event in voice_events if event[0] == "voice.transcript"] == []
     assert not wav.exists()

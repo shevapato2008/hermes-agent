@@ -75,6 +75,22 @@ def test_resume_materializes_row_for_minted_key(real_db):
         server.profile_name_for_home(None) or server._current_profile_name())
 
 
+def test_resume_missing_smartbox_voice_key_does_not_materialize_empty_row(real_db):
+    """SmartBox voice keys are ephemeral handles, not empty durable chats after restart."""
+    resp = _resume(session_id=MINTED_KEY, source="smartbox_voice")
+
+    assert resp["error"]["code"] == 4007
+    assert real_db.get_session(MINTED_KEY) is None
+
+
+def test_resume_missing_desktop_key_keeps_native_materialization(real_db):
+    """The upstream Desktop recovery contract for server-minted draft keys is unchanged."""
+    resp = _resume(session_id=MINTED_KEY, source="desktop")
+
+    _assert_resumed_ok(resp, MINTED_KEY)
+    assert real_db.get_session(MINTED_KEY)["source"] == "desktop"
+
+
 def test_resume_existing_row_unaffected(real_db):
     """A persisted session resumes normally and its row is not duplicated."""
     real_db.create_session(EXISTING_KEY, source="tui", model="test-model")

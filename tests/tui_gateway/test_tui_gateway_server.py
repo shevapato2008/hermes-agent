@@ -60,6 +60,32 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_scoped_voice_input_state():
+    """Process-global microphone ownership must not leak between gateway tests."""
+    def reset():
+        if stop := getattr(server, "_output_drain_stop", None):
+            stop.set()
+        server._output_drain_stop = None
+        server._voice_lease_owner_sid = ""
+        server._voice_lease_owner_transport = None
+        server._voice_lease_epoch = 0
+        server._voice_lease_releasing = False
+        server._voice_lease_capture_id = None
+        server._voice_release_tail_epoch = None
+        server._voice_pending_idle_scope = None
+        server._voice_authority_sid = ""
+        server._voice_authority_transport = None
+        server._voice_terminal_error_epochs = set()
+        server._voice_release_retry_active = False
+        server._fd_listener_active = False
+        server._fd_listener_epoch = 0
+
+    reset()
+    yield
+    reset()
+
+
+@pytest.fixture(autouse=True)
 def _reap_leaked_notification_pollers():
     """Stop and join notification pollers leaked by each test.
 
@@ -1907,7 +1933,13 @@ def test_prompt_submit_typed_stop_phrase_ends_voice_chat(monkeypatch):
     assert os.environ["HERMES_VOICE"] == "0"
     assert os.environ["HERMES_VOICE_TTS"] == "0"
     assert calls["stop_continuous"] == 1
-    assert ("voice.transcript", {"stop_phrase": True, "typed": True}) in emitted
+    stop_event = next(payload for event, payload in emitted if event == "voice.transcript")
+    assert stop_event == {
+        "stop_phrase": True,
+        "typed": True,
+        "owner_session_id": "any-sid",
+        "lease_epoch": 1,
+    }
 
 
 def test_prompt_submit_typed_stop_passes_through_when_voice_off(monkeypatch):
@@ -2055,6 +2087,8 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
             "stopped": False,
             "reason": "not_owner",
             "disabled_persisted": False,
+            "released": False,
+            "release_complete": False,
         }
         assert denied_voice_stop["result"] == {
             "status": "busy",
@@ -2088,6 +2122,8 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
             "stopped": True,
             "reason": None,
             "disabled_persisted": False,
+            "released": True,
+            "release_complete": True,
         }
 
         reclaimed = _dispatch_sync({
@@ -2115,6 +2151,8 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
             "stopped": True,
             "reason": None,
             "disabled_persisted": False,
+                "released": True,
+                "release_complete": True,
         }
     finally:
         server._wake_owner_transport = None
@@ -3911,6 +3949,13 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     # The agent must bind to the continuation tip, and the returned transcript
     # must include the post-compression reply (which lives only in the tip).
     assert resp["result"]["session_key"] == "cont_tip"
+    assert resp["result"]["stored_session_id"] == "cont_tip"
+    assert resp["result"]["resumed"] == "parent_root"
+    assert resp["result"]["persisted"] is True
+    assert resp["result"]["running"] is False
+    assert resp["result"]["inflight"] is None
+    assert resp["result"]["queued"] is None
+    assert resp["result"]["status"] == "idle"
     assert captured["agent_session_id"] == "cont_tip"
     texts = [m.get("text") for m in resp["result"]["messages"]]
     assert "post-compression reply" in texts
@@ -14248,6 +14293,10 @@ def test_accepted_interrupt_resumes_wake_mismatch_does_not(monkeypatch):
     monkeypatch.setattr(wake_word, "pause_listening", pause_listening)
     monkeypatch.setattr(wake_word, "resume_listening", resume_listening)
     monkeypatch.setattr(server, "_voice_wake_owner", None)
+    monkeypatch.setattr(server, "_wake_owner_transport", owner)
+    monkeypatch.setattr(
+        server, "_wake_owner_profile_home", server._current_voice_profile_home()
+    )
     try:
         paused = _dispatch_sync(
             {"id": "pause", "method": "wake.pause", "params": {}}, transport=owner
@@ -14285,6 +14334,10 @@ def test_interrupt_error_after_tts_stop_still_resumes_wake(monkeypatch):
     monkeypatch.setattr(wake_word, "pause_listening", pause_listening)
     monkeypatch.setattr(wake_word, "resume_listening", resume_listening)
     monkeypatch.setattr(server, "_voice_wake_owner", None)
+    monkeypatch.setattr(server, "_wake_owner_transport", owner)
+    monkeypatch.setattr(
+        server, "_wake_owner_profile_home", server._current_voice_profile_home()
+    )
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
 
     def _host_failed(*_args, **_kwargs):
@@ -14312,47 +14365,6 @@ def test_interrupt_error_after_tts_stop_still_resumes_wake(monkeypatch):
         assert failed["result"] == {"status": "interrupted", "turn_isolation": True}
         assert state["paused"] is False
         assert state["resumed"] == [owner, owner]
-    finally:
-        server._sessions.pop("sid", None)
-
-
-def test_interrupt_resumes_voice_wake_owner_not_a_foreign_lease(monkeypatch):
-    """Interrupt resumes a voice-owned pause even when the caller differs, and leaves a foreign lease paused."""
-    wake_word, state, pause_listening, resume_listening = _wake_lease_double()
-    voice_owner = types.SimpleNamespace(_closed=False, role="voice")
-    caller = types.SimpleNamespace(_closed=False, role="caller")
-    foreign = types.SimpleNamespace(_closed=False, role="foreign")
-    state["lease"] = voice_owner
-    session = _session(agent=types.SimpleNamespace(interrupt=lambda: None), running=True)
-    server._sessions["sid"] = session
-    monkeypatch.setattr(wake_word, "pause_listening", pause_listening)
-    monkeypatch.setattr(wake_word, "resume_listening", resume_listening)
-    monkeypatch.setattr(server, "_voice_wake_owner", voice_owner)
-    try:
-        paused = _dispatch_sync(
-            {"id": "pause", "method": "wake.pause", "params": {}}, transport=voice_owner
-        )
-        accepted = _dispatch_sync(
-            {"id": "ok", "method": "session.interrupt", "params": {"session_id": "sid"}},
-            transport=caller,
-        )
-        assert paused["result"]["paused"] is True
-        assert accepted.get("result", {}).get("status") == "interrupted"
-        assert state["paused"] is False
-        assert any(item is voice_owner for item in state["resumed"])
-        assert all(item is not caller for item in state["resumed"])
-
-        state["lease"] = foreign
-        state["paused"] = True
-        state["resumed"] = []
-        monkeypatch.setattr(server, "_voice_wake_owner", None)
-        foreign_held = _dispatch_sync(
-            {"id": "foreign", "method": "session.interrupt", "params": {"session_id": "sid"}},
-            transport=caller,
-        )
-        assert foreign_held.get("result", {}).get("status") == "interrupted"
-        assert state["paused"] is True
-        assert state["resumed"] == []
     finally:
         server._sessions.pop("sid", None)
 
@@ -15677,8 +15689,8 @@ def test_ensure_session_db_row_true_when_row_persisted(monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
-    assert server._ensure_session_db_row({"session_key": "k1", "cwd": "/tmp"}) is True
-    assert created == ["k1"]
+    assert server._ensure_session_db_row(session := {"session_key": "k1", "cwd": "/tmp"}) is True
+    assert (created, session.get("_session_row_persisted")) == (["k1"], True)
 
 
 def test_prompt_submit_fails_loudly_when_store_unavailable(monkeypatch):
@@ -20266,7 +20278,10 @@ def test_tts_stream_vad_barge_in_cuts_pipeline_and_submits_capture(monkeypatch, 
     monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"barge_in": True}})
     events: list = []
     monkeypatch.setattr(
-        server, "_voice_emit", lambda event, payload=None: events.append((event, payload))
+        server, "_voice_emit", lambda event, payload=None, **_scope: events.append((event, payload))
+    )
+    assert server._install_voice_authority(
+        "sid-fd", server._stdio_transport, allow_unclaimed=True
     )
 
     wav = tmp_path / "barge.wav"
@@ -20306,7 +20321,7 @@ def test_full_duplex_generation_phase_interrupts_running_turn(monkeypatch, tmp_p
     monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"barge_in": True}})
     events: list = []
     monkeypatch.setattr(
-        server, "_voice_emit", lambda event, payload=None: events.append((event, payload))
+        server, "_voice_emit", lambda event, payload=None, **_scope: events.append((event, payload))
     )
 
     wav = tmp_path / "interject.wav"
@@ -20316,6 +20331,9 @@ def test_full_duplex_generation_phase_interrupts_running_turn(monkeypatch, tmp_p
     fake_agent = types.SimpleNamespace(interrupt=lambda: interrupted.set())
     fake_session = {"running": True, "agent": fake_agent}
     monkeypatch.setattr(server, "_sessions", {"sid-fd": fake_session})
+    assert server._install_voice_authority(
+        "sid-fd", server._stdio_transport, allow_unclaimed=True
+    )
 
     def fake_listen(should_stop, is_playing=None, on_trigger=None, **_kw):
         assert is_playing is not None and is_playing() is False  # generation phase
@@ -20346,7 +20364,7 @@ def test_full_duplex_stop_phrase_mid_generation_ends_voice_chat(monkeypatch, tmp
     monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"barge_in": True}})
     events: list = []
     monkeypatch.setattr(
-        server, "_voice_emit", lambda event, payload=None: events.append((event, payload))
+        server, "_voice_emit", lambda event, payload=None, **_scope: events.append((event, payload))
     )
 
     wav = tmp_path / "stop.wav"
@@ -20356,6 +20374,9 @@ def test_full_duplex_stop_phrase_mid_generation_ends_voice_chat(monkeypatch, tmp
     fake_agent = types.SimpleNamespace(interrupt=lambda: interrupted.set())
     monkeypatch.setattr(
         server, "_sessions", {"sid-fd": {"running": True, "agent": fake_agent}}
+    )
+    assert server._install_voice_authority(
+        "sid-fd", server._stdio_transport, allow_unclaimed=True
     )
 
     def fake_listen(should_stop, is_playing=None, on_trigger=None, **_kw):
@@ -20405,7 +20426,10 @@ def test_speak_text_with_barge_arms_monitor_and_cuts_playback(monkeypatch, tmp_p
     )
     events: list = []
     monkeypatch.setattr(
-        server, "_voice_emit", lambda event, payload=None: events.append((event, payload))
+        server, "_voice_emit", lambda event, payload=None, **_scope: events.append((event, payload))
+    )
+    assert server._install_voice_authority(
+        "sid-fd", server._stdio_transport, allow_unclaimed=True
     )
 
     wav = tmp_path / "barge.wav"

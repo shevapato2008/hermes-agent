@@ -354,10 +354,18 @@ class VoiceToggleAction(WireEnum):
     on = "on"
     off = "off"
     tts = "tts"
+    reattach = "reattach"
+
+
+class VoiceTogglePhase(WireEnum):
+    full_duplex = "full_duplex"
+    output_drain = "output_drain"
 
 
 class VoiceToggleParams(Params):
     action: VoiceToggleAction = VoiceToggleAction.status
+    session_id: str | None = None
+    enabled: bool | None = None  # action=tts: idempotent set; omitted preserves toggle behavior
     profile: str | None = None
 
 
@@ -373,10 +381,17 @@ class VoiceToggleResult(Result):
     audio_available: bool | None = None
     stt_available: bool | None = None
     details: str | None = None
+    owner_session_id: str = ""
+    lease_epoch: int = 0
+    capture_id: str | None = None
+    released: bool | None = None
+    release_complete: bool | None = None
+    reattached: bool | None = None
+    phase: VoiceTogglePhase | None = None
 
 
 method("voice.toggle", params=VoiceToggleParams, result=VoiceToggleResult,
-       doc="/voice parity: report, flip voice mode on/off, or toggle speech output.")
+       doc="/voice parity plus SmartBox live-turn reattach after a resumed transport handoff.")
 
 
 class VoiceRecordAction(WireEnum):
@@ -399,6 +414,12 @@ class VoiceRecordStatus(WireEnum):
 class VoiceRecordResult(Result):
     status: VoiceRecordStatus
     reason: str | None = None  # "wake_owned" when another surface holds the mic
+    owner_session_id: str = ""
+    lease_epoch: int = 0
+    previous_lease_epoch: int | None = None
+    capture_id: str | None = None
+    released: bool | None = None
+    release_complete: bool | None = None
 
 
 method("voice.record", params=VoiceRecordParams, result=VoiceRecordResult,
@@ -407,11 +428,15 @@ method("voice.record", params=VoiceRecordParams, result=VoiceRecordResult,
 
 class VoiceTtsParams(Params):
     text: str
+    session_id: str | None = None
     profile: str | None = None
 
 
 class VoiceTtsResult(Result):
     status: str  # "speaking"
+    owner_session_id: str = ""
+    lease_epoch: int = 0
+    capture_id: str | None = None
 
 
 method("voice.tts", params=VoiceTtsParams, result=VoiceTtsResult,
@@ -467,6 +492,8 @@ class WakeOwnerResult(Result):
 class WakeStopResult(WakeOwnerResult):
     stopped: bool
     disabled_persisted: bool
+    released: bool
+    release_complete: bool
 
 
 method("wake.stop", params=WakeStopParams, result=WakeStopResult,
@@ -479,6 +506,8 @@ class WakeControlParams(Params):
 
 class WakePauseResult(WakeOwnerResult):
     paused: bool
+    released: bool
+    release_complete: bool
 
 
 method("wake.pause", params=WakeControlParams, result=WakePauseResult,
@@ -487,6 +516,8 @@ method("wake.pause", params=WakeControlParams, result=WakePauseResult,
 
 class WakeResumeResult(WakeOwnerResult):
     resumed: bool
+    released: bool
+    release_complete: bool
 
 
 method("wake.resume", params=WakeControlParams, result=WakeResumeResult,
@@ -534,6 +565,29 @@ class WakeStatusResult(Result):
 
 method("wake.status", params=WakeStatusParams, result=WakeStatusResult,
        doc="Everything a client needs to draw the wake-word state and decide whether to (re)arm.")
+
+
+class WakeDiagnosticsParams(Params):
+    reset: bool = False
+    profile: str | None = None
+
+
+class WakeDiagnosticsResult(Result):
+    """Owner-only, bounded measurements; no captured audio is retained."""
+
+    armed: bool
+    owned_by_caller: bool
+    reason: str | None = None
+    capture: str | None = None
+    external_audio: bool | None = None
+    processed_frames: int | None = None
+    pcm_peak: dict[str, int | None] | None = None
+    client_queue: dict[str, int] | None = None
+    score: dict[str, JsonValue] | None = None
+
+
+method("wake.diagnostics", params=WakeDiagnosticsParams, result=WakeDiagnosticsResult,
+       doc="Read or reset owner-scoped wake measurements without exposing audio.")
 
 
 class WakeFeedParams(Params):
