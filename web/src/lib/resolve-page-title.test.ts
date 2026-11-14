@@ -43,4 +43,11 @@ describe("resolvePageTitle", () => {
     expect(resolvePageTitle("/", t, [])).toBe("Sessions");
     expect(resolvePageTitle("/mcp/", t, [])).toBe("MCP");
   });
+
+  it("falls back to English literals when optional nav keys are absent", () => {
+    expect(resolvePageTitle("/files", t, [])).toBe("Files");
+    expect(resolvePageTitle("/system", t, [])).toBe("System");
+    expect(resolvePageTitle("/channels", t, [])).toBe("Channels");
+    expect(resolvePageTitle("/mcp", t, [])).toBe("MCP");
+  });
 });

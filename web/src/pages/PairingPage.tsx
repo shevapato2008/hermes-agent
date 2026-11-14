@@ -13,6 +13,7 @@ import { Toast } from "@nous-research/ui/ui/components/toast";
 import { Card, CardContent } from "@nous-research/ui/ui/components/card";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { errorMessage } from "@/lib/api-error";
+import { usePageStrings } from "@/i18n/page-strings";
 
 function getUserKey(user: PairingUser): string {
   return `${user.platform}:${user.user_id}`;
@@ -29,6 +30,7 @@ function getUserLabel(user: PairingUser): string {
 }
 
 export default function PairingPage() {
+  const s = usePageStrings("pairingPage");
   const [pending, setPending] = useState<PairingUser[]>([]);
   const [approved, setApproved] = useState<PairingUser[]>([]);
   const [loading, setLoading] = useState(true);
@@ -115,14 +117,14 @@ export default function PairingPage() {
         disabled={clearing}
         prefix={clearing ? <Spinner /> : <Trash2 className="h-4 w-4" />}
       >
-        Clear pending
+        {s.clearPending}
       </Button>,
     );
     return () => {
       setEnd(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [setEnd, clearing]);
+  }, [setEnd, clearing, s.clearPending]);
 
   if (loading) {
     return (
@@ -144,13 +146,13 @@ export default function PairingPage() {
         open={userRevoke.isOpen}
         onCancel={userRevoke.cancel}
         onConfirm={userRevoke.confirm}
-        title="Revoke access"
+        title={s.revokeAccessTitle}
         description={
           pendingRevokeUser
-            ? `"${getUserLabel(pendingRevokeUser)}" will lose access. This cannot be undone.`
-            : "This user will lose access. This cannot be undone."
+            ? s.revokeNamedDesc.replace("{name}", getUserLabel(pendingRevokeUser))
+            : s.revokeGenericDesc
         }
-        confirmLabel="Revoke"
+        confirmLabel={s.revoke}
         loading={userRevoke.isDeleting}
       />
 
@@ -161,13 +163,13 @@ export default function PairingPage() {
           className="flex items-center gap-2 text-muted-foreground"
         >
           <Users className="h-4 w-4" />
-          Pending requests ({pending.length})
+          {s.pendingRequests.replace("{count}", String(pending.length))}
         </H2>
 
         {pending.length === 0 && (
           <Card>
             <CardContent className="py-8 text-center text-sm text-muted-foreground">
-              No pending pairing requests
+              {s.noPendingRequests}
             </CardContent>
           </Card>
         )}
@@ -206,7 +208,7 @@ export default function PairingPage() {
                       )
                     }
                   >
-                    Approve
+                    {s.approve}
                   </Button>
                 </div>
               </CardContent>
@@ -222,13 +224,13 @@ export default function PairingPage() {
           className="flex items-center gap-2 text-muted-foreground"
         >
           <ShieldCheck className="h-4 w-4" />
-          Approved users ({approved.length})
+          {s.approvedUsers.replace("{count}", String(approved.length))}
         </H2>
 
         {approved.length === 0 && (
           <Card>
             <CardContent className="py-8 text-center text-sm text-muted-foreground">
-              No approved users
+              {s.noApprovedUsers}
             </CardContent>
           </Card>
         )}
@@ -256,8 +258,8 @@ export default function PairingPage() {
                   <Button
                     ghost
                     size="icon"
-                    title="Revoke"
-                    aria-label="Revoke"
+                    title={s.revoke}
+                    aria-label={s.revoke}
                     className="text-destructive"
                     onClick={() => userRevoke.requestDelete(key)}
                   >

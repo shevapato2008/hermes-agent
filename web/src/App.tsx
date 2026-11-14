@@ -193,7 +193,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
     label: "Sessions",
     icon: MessageSquare,
   },
-  { path: "/files", label: "Files", icon: FolderOpen },
+  { path: "/files", labelKey: "files", label: "Files", icon: FolderOpen },
   {
     path: "/analytics",
     labelKey: "analytics",
@@ -210,14 +210,14 @@ const BUILTIN_NAV_REST: NavItem[] = [
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
   { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
   { path: "/plugins", labelKey: "plugins", label: "Plugins", icon: Puzzle },
-  { path: "/mcp", label: "MCP", icon: Plug },
-  { path: "/channels", label: "Channels", icon: Radio },
-  { path: "/webhooks", label: "Webhooks", icon: Webhook },
-  { path: "/pairing", label: "Pairing", icon: ShieldCheck },
+  { path: "/mcp", labelKey: "mcp", label: "MCP", icon: Plug },
+  { path: "/channels", labelKey: "channels", label: "Channels", icon: Radio },
+  { path: "/webhooks", labelKey: "webhooks", label: "Webhooks", icon: Webhook },
+  { path: "/pairing", labelKey: "pairing", label: "Pairing", icon: ShieldCheck },
   { path: "/profiles", labelKey: "profiles", label: "Profiles", icon: Users },
   { path: "/config", labelKey: "config", label: "Config", icon: Settings },
   { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },
-  { path: "/system", label: "System", icon: Wrench },
+  { path: "/system", labelKey: "system", label: "System", icon: Wrench },
   {
     path: "/docs",
     labelKey: "documentation",
@@ -269,6 +269,7 @@ function buildNavItems(
     const pluginItem: NavItem = {
       path: manifest.tab.path,
       label: manifest.label,
+      pluginName: manifest.name,
       icon: resolveIcon(manifest.icon),
     };
 
@@ -481,10 +482,7 @@ export default function App() {
     () =>
       manifests
         .filter((m) => !m.tab.hidden)
-        .map((m) => ({
-          path: m.tab.override ?? m.tab.path,
-          label: m.label,
-        })),
+        .map((m) => ({ path: m.tab.override ?? m.tab.path, label: m.label, name: m.name })),
     [manifests],
   );
 
@@ -828,6 +826,18 @@ function ProfileKeyedRoutes({ children }: { children: ReactNode }) {
   return <div key={profile || "__own__"} className="contents">{children}</div>;
 }
 
+function resolveNavItemLabel(item: NavItem, t: Translations): string {
+  if (item.pluginName) {
+    const pluginLabel = t.app.pluginLabels?.[item.pluginName];
+    if (pluginLabel) return pluginLabel;
+  }
+  if (item.labelKey) {
+    const navLabel = (t.app.nav as Record<string, string | undefined>)[item.labelKey];
+    if (navLabel) return navLabel;
+  }
+  return item.label;
+}
+
 function SidebarNavLink({
   closeMobile,
   collapsed,
@@ -835,13 +845,11 @@ function SidebarNavLink({
   tooltipWarmRef,
   t,
 }: SidebarNavLinkProps) {
-  const { path, label, labelKey, icon: Icon } = item;
+  const { path, icon: Icon } = item;
   const [hovered, setHovered] = useState(false);
   const [tooltipAnchor, setTooltipAnchor] = useState<HTMLElement | null>(null);
 
-  const navLabel = labelKey
-    ? ((t.app.nav as Record<string, string>)[labelKey] ?? label)
-    : label;
+  const navLabel = resolveNavItemLabel(item, t);
   const showTooltip = (event: MouseEvent<HTMLElement> | FocusEvent<HTMLElement>) => {
     setHovered(true);
     setTooltipAnchor(event.currentTarget);
@@ -1368,6 +1376,7 @@ interface NavItem {
   label: string;
   labelKey?: string;
   path: string;
+  pluginName?: string;
 }
 
 interface SidebarIconWithTooltipProps {

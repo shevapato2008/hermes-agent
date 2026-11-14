@@ -32,10 +32,8 @@ import {
 import { api } from "@/lib/api";
 import { formatSessionPruneResult } from "@/lib/session-prune";
 import { shouldRefreshSessions } from "@/lib/session-refresh";
-import {
-  importSummary,
-  parseImportSessions,
-} from "@/lib/session-import";
+import { importSummary, parseImportSessions } from "@/lib/session-import";
+import { pageStrings } from "@/i18n/page-strings";
 import type {
   SessionInfo,
   SessionMessage,
@@ -796,6 +794,7 @@ export default function SessionsPage() {
   const [importingSessions, setImportingSessions] = useState(false);
   const { toast, showToast } = useToast();
   const { t } = useI18n();
+  const s = pageStrings(t, "sessionsExtra");
   const { setAfterTitle, setEnd } = usePageHeader();
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
   const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
@@ -934,19 +933,14 @@ export default function SessionsPage() {
 
   useLayoutEffect(() => {
     setEnd(
-      <Button
-        outlined
-        size="sm"
-        onClick={() => setPruneOpen(true)}
-        prefix={<Archive />}
-      >
-        Prune old sessions
+      <Button outlined size="sm" onClick={() => setPruneOpen(true)} prefix={<Archive />}>
+        {s.pruneOldSessions}
       </Button>,
     );
     return () => {
       setEnd(null);
     };
-  }, [setEnd]);
+  }, [setEnd, s.pruneOldSessions]);
 
   useEffect(() => {
     if (!sourceMenuOpen) return;
@@ -1591,18 +1585,12 @@ export default function SessionsPage() {
       >
         <DialogContent className="max-w-sm">
           <DialogHeader>
-            <DialogTitle>Prune old sessions</DialogTitle>
-            <DialogDescription>
-              Permanently remove archived sessions whose last activity is older
-              than the given number of days. Active sessions are never pruned.
-            </DialogDescription>
+            <DialogTitle>{s.pruneOldSessions}</DialogTitle>
+            <DialogDescription>{s.pruneDescription}</DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="prune-days"
-              className="text-xs font-medium text-muted-foreground"
-            >
-              Older than (days)
+            <label htmlFor="prune-days" className="text-xs font-medium text-muted-foreground">
+              {s.olderThanDays}
             </label>
             <Input
               id="prune-days"
@@ -1631,7 +1619,7 @@ export default function SessionsPage() {
               className="gap-1.5"
             >
               {pruning && <Spinner className="text-sm" />}
-              Prune
+              {s.pruneAction}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1643,32 +1631,32 @@ export default function SessionsPage() {
             <span className="text-lg font-semibold tabular-nums leading-none">
               {stats.total}
             </span>
-            <span className="text-xs text-muted-foreground">Total</span>
+            <span className="text-xs text-muted-foreground">{s.statTotal}</span>
           </div>
           <div className="flex flex-col">
             <span className="text-lg font-semibold tabular-nums leading-none text-success">
               {stats.active_store}
             </span>
-            <span className="text-xs text-muted-foreground">Active in store</span>
+            <span className="text-xs text-muted-foreground">{s.statActiveInStore}</span>
           </div>
           <div className="flex flex-col">
             <span className="text-lg font-semibold tabular-nums leading-none">
               {stats.archived}
             </span>
-            <span className="text-xs text-muted-foreground">Archived</span>
+            <span className="text-xs text-muted-foreground">{s.statArchived}</span>
           </div>
           <div className="flex flex-col">
             <span className="text-lg font-semibold tabular-nums leading-none">
               {stats.messages}
             </span>
-            <span className="text-xs text-muted-foreground">Messages</span>
+            <span className="text-xs text-muted-foreground">{s.statMessages}</span>
           </div>
           {Object.keys(stats.by_source).length > 0 && (
             <div className="flex flex-col">
               <span className="text-lg font-semibold tabular-nums leading-none">
                 {Object.keys(stats.by_source).length}
               </span>
-              <span className="text-xs text-muted-foreground">Sources</span>
+              <span className="text-xs text-muted-foreground">{s.statSources}</span>
             </div>
           )}
         </div>
@@ -1928,7 +1916,7 @@ export default function SessionsPage() {
                 prefix={importingSessions ? <Spinner /> : <Upload />}
               >
                 <span className="font-mondwest normal-case text-xs">
-                  Import sessions
+                  {s.importSessions}
                 </span>
               </Button>
             )}
