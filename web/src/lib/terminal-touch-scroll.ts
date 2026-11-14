@@ -6,10 +6,22 @@ interface ScrollableTerminal {
     };
   };
   scrollLines: (amount: number) => void;
+  textarea?: HTMLTextAreaElement | null;
+  focus?: () => void;
+}
+
+interface TouchGestureState {
+  startX: number | null;
+  startY: number | null;
+  lastY: number | null;
+  residualPx: number;
+  didScroll: boolean;
+  multiTouch: boolean;
 }
 
 const TOUCH_SCROLL_PX_PER_LINE = 18;
 const TOUCH_SCROLL_MIN_PX = 2;
+const TOUCH_TAP_MAX_MOVE_PX = 10;
 const CAPTURE = { capture: true } as const;
 const PASSIVE_CAPTURE = { capture: true, passive: true } as const;
 const ACTIVE_CAPTURE = { capture: true, passive: false } as const;
@@ -18,6 +30,10 @@ function firstTouchY(ev: TouchEvent): number | null {
   const touch = ev.touches[0] ?? ev.changedTouches[0];
 
   return touch ? touch.clientY : null;
+}
+
+function activeElement(): Element | null {
+  return typeof document === "undefined" ? null : document.activeElement;
 }
 
 function canScrollTerminal(term: ScrollableTerminal, amount: number): boolean {
@@ -34,6 +50,26 @@ function canScrollTerminal(term: ScrollableTerminal, amount: number): boolean {
   return false;
 }
 
+function maybeFocusTerminalOnTap(
+  term: ScrollableTerminal,
+  state: TouchGestureState,
+  ev: TouchEvent,
+): void {
+  if (state.multiTouch || state.didScroll || state.startX === null || state.startY === null) {
+    return;
+  }
+  const endTouch = ev.changedTouches[0];
+  if (!endTouch) {
+    return;
+  }
+  if (Math.hypot(endTouch.clientX - state.startX, endTouch.clientY - state.startY) >= TOUCH_TAP_MAX_MOVE_PX) {
+    return;
+  }
+  if (typeof term.focus === "function" && (!term.textarea || activeElement() !== term.textarea)) {
+    term.focus();
+  }
+}
+
 /**
  * Add touch-drag scrollback support for dashboard xterm panes.
  *
@@ -43,28 +79,53 @@ function canScrollTerminal(term: ScrollableTerminal, amount: number): boolean {
  * touch movement into `scrollLines()` while there is xterm scrollback available;
  * at the top/bottom boundary we leave the event alone so the outer dashboard
  * page can still move above the software keyboard.
+ *
+ * Also focuses `term` on a clean single-finger tap (`< 10px` movement without
+ * scrolling) so slight finger wiggle on capacitive touchscreens still focuses
+ * `term.textarea` and opens the on-screen keyboard.
  */
 export function installTerminalTouchScroll(host: HTMLElement, term: ScrollableTerminal): () => void {
-  let lastY: number | null = null;
-  let residualPx = 0;
+  const state: TouchGestureState = {
+    startX: null,
+    startY: null,
+    lastY: null,
+    residualPx: 0,
+    didScroll: false,
+    multiTouch: false,
+  };
 
   const reset = () => {
-    lastY = null;
-    residualPx = 0;
+    state.startX = null;
+    state.startY = null;
+    state.lastY = null;
+    state.residualPx = 0;
+    state.didScroll = false;
+    state.multiTouch = false;
   };
 
   const onTouchStart = (ev: TouchEvent) => {
     if (ev.touches.length !== 1) {
       reset();
+      state.multiTouch = true;
       return;
     }
 
-    lastY = firstTouchY(ev);
-    residualPx = 0;
+    const touch = ev.touches[0];
+    state.startX = touch.clientX;
+    state.startY = touch.clientY;
+    state.lastY = touch.clientY;
+    state.residualPx = 0;
+    state.didScroll = false;
+    state.multiTouch = false;
   };
 
   const onTouchMove = (ev: TouchEvent) => {
-    if (ev.touches.length !== 1 || lastY === null) {
+    if (ev.touches.length !== 1) {
+      reset();
+      state.multiTouch = true;
+      return;
+    }
+    if (state.lastY === null) {
       reset();
       return;
     }
@@ -75,40 +136,44 @@ export function installTerminalTouchScroll(host: HTMLElement, term: ScrollableTe
       return;
     }
 
-    const deltaPx = lastY - nextY;
-    lastY = nextY;
+    const deltaPx = state.lastY - nextY;
+    state.lastY = nextY;
 
     if (Math.abs(deltaPx) < TOUCH_SCROLL_MIN_PX) {
       return;
     }
 
-    residualPx += deltaPx;
-    const lines = residualPx / TOUCH_SCROLL_PX_PER_LINE;
+    state.residualPx += deltaPx;
+    const lines = state.residualPx / TOUCH_SCROLL_PX_PER_LINE;
     const wholeLines = lines < 0 ? Math.ceil(lines) : Math.floor(lines);
 
-    if (wholeLines === 0) {
+    if (wholeLines === 0 || !canScrollTerminal(term, wholeLines)) {
       return;
     }
 
-    if (!canScrollTerminal(term, wholeLines)) {
-      return;
-    }
-
-    residualPx -= wholeLines * TOUCH_SCROLL_PX_PER_LINE;
+    state.residualPx -= wholeLines * TOUCH_SCROLL_PX_PER_LINE;
+    state.didScroll = true;
     term.scrollLines(wholeLines);
     ev.preventDefault();
     ev.stopPropagation();
   };
 
+  const onTouchEnd = (ev: TouchEvent) => {
+    maybeFocusTerminalOnTap(term, state, ev);
+    if (ev.touches.length === 0) {
+      reset();
+    }
+  };
+
   host.addEventListener("touchstart", onTouchStart, PASSIVE_CAPTURE);
   host.addEventListener("touchmove", onTouchMove, ACTIVE_CAPTURE);
   host.addEventListener("touchcancel", reset, CAPTURE);
-  host.addEventListener("touchend", reset, CAPTURE);
+  host.addEventListener("touchend", onTouchEnd, CAPTURE);
 
   return () => {
     host.removeEventListener("touchstart", onTouchStart, PASSIVE_CAPTURE);
     host.removeEventListener("touchmove", onTouchMove, ACTIVE_CAPTURE);
     host.removeEventListener("touchcancel", reset, CAPTURE);
-    host.removeEventListener("touchend", reset, CAPTURE);
+    host.removeEventListener("touchend", onTouchEnd, CAPTURE);
   };
 }
