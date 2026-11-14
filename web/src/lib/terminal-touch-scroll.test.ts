@@ -116,6 +116,15 @@ describe("installTerminalTouchScroll", () => {
     host.dispatchEvent(touchEvent("touchend", 100, 112));
     expect(boundaryTerminal.focus).not.toHaveBeenCalled();
 
+    // 3. Out-and-back drag (>= 10px away then back within 10px of start) on empty terminal.
+    const emptyTerminal = term(0, 0, textarea);
+    const cleanupEmpty = installTerminalTouchScroll(host, emptyTerminal);
+    host.dispatchEvent(touchEvent("touchstart", 100, 100));
+    host.dispatchEvent(touchEvent("touchmove", 150, 100));
+    host.dispatchEvent(touchEvent("touchend", 102, 101));
+    expect(emptyTerminal.focus).not.toHaveBeenCalled();
+
+    cleanupEmpty();
     cleanupBoundary();
     cleanup();
     textarea.remove();

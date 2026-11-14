@@ -16,6 +16,7 @@ interface TouchGestureState {
   lastY: number | null;
   residualPx: number;
   didScroll: boolean;
+  movedTooFar: boolean;
   multiTouch: boolean;
 }
 
@@ -25,12 +26,6 @@ const TOUCH_TAP_MAX_MOVE_PX = 10;
 const CAPTURE = { capture: true } as const;
 const PASSIVE_CAPTURE = { capture: true, passive: true } as const;
 const ACTIVE_CAPTURE = { capture: true, passive: false } as const;
-
-function firstTouchY(ev: TouchEvent): number | null {
-  const touch = ev.touches[0] ?? ev.changedTouches[0];
-
-  return touch ? touch.clientY : null;
-}
 
 function activeElement(): Element | null {
   return typeof document === "undefined" ? null : document.activeElement;
@@ -50,19 +45,23 @@ function canScrollTerminal(term: ScrollableTerminal, amount: number): boolean {
   return false;
 }
 
+function exceedsTapDistance(state: TouchGestureState, x: number, y: number): boolean {
+  if (state.startX === null || state.startY === null) {
+    return true;
+  }
+  return Math.hypot(x - state.startX, y - state.startY) >= TOUCH_TAP_MAX_MOVE_PX;
+}
+
 function maybeFocusTerminalOnTap(
   term: ScrollableTerminal,
   state: TouchGestureState,
   ev: TouchEvent,
 ): void {
-  if (state.multiTouch || state.didScroll || state.startX === null || state.startY === null) {
+  if (state.multiTouch || state.didScroll || state.movedTooFar) {
     return;
   }
   const endTouch = ev.changedTouches[0];
-  if (!endTouch) {
-    return;
-  }
-  if (Math.hypot(endTouch.clientX - state.startX, endTouch.clientY - state.startY) >= TOUCH_TAP_MAX_MOVE_PX) {
+  if (!endTouch || exceedsTapDistance(state, endTouch.clientX, endTouch.clientY)) {
     return;
   }
   if (typeof term.focus === "function" && (!term.textarea || activeElement() !== term.textarea)) {
@@ -91,6 +90,7 @@ export function installTerminalTouchScroll(host: HTMLElement, term: ScrollableTe
     lastY: null,
     residualPx: 0,
     didScroll: false,
+    movedTooFar: false,
     multiTouch: false,
   };
 
@@ -100,6 +100,7 @@ export function installTerminalTouchScroll(host: HTMLElement, term: ScrollableTe
     state.lastY = null;
     state.residualPx = 0;
     state.didScroll = false;
+    state.movedTooFar = false;
     state.multiTouch = false;
   };
 
@@ -116,6 +117,7 @@ export function installTerminalTouchScroll(host: HTMLElement, term: ScrollableTe
     state.lastY = touch.clientY;
     state.residualPx = 0;
     state.didScroll = false;
+    state.movedTooFar = false;
     state.multiTouch = false;
   };
 
@@ -125,16 +127,16 @@ export function installTerminalTouchScroll(host: HTMLElement, term: ScrollableTe
       state.multiTouch = true;
       return;
     }
-    if (state.lastY === null) {
+    const touch = ev.touches[0];
+    if (state.lastY === null || !touch) {
       reset();
       return;
+    }
+    if (!state.movedTooFar && exceedsTapDistance(state, touch.clientX, touch.clientY)) {
+      state.movedTooFar = true;
     }
 
-    const nextY = firstTouchY(ev);
-    if (nextY === null) {
-      reset();
-      return;
-    }
+    const nextY = touch.clientY;
 
     const deltaPx = state.lastY - nextY;
     state.lastY = nextY;

@@ -981,7 +981,7 @@ DEFAULT_CONFIG = {
     },
     "webapp": {"enabled": False, "host": "127.0.0.1", "port": 9120, "public_url": ""},  # gateway/webapp_listener.py
     "dashboard": {
-        # Visual theme: "smartbox-7inch" | "default" | "midnight" | "ember" | "mono" | "cyberpunk" | "rose"
+        # Visual theme: "smartbox-7inch" | "default" | "default-large" | "nous-blue" | "midnight" | "ember" | "mono" | "cyberpunk" | "rose"
         "theme": "smartbox-7inch",
         # Process-isolation rollout controls. Read via the raw config loader, so tui_gateway.server
         # also owns explicit defaults.

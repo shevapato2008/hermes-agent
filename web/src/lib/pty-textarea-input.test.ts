@@ -196,7 +196,9 @@ describe("installPtyTextareaInput", () => {
     textarea.dispatchEvent(
       new CompositionEvent("compositionend", { data: "你", bubbles: true }),
     );
-    // Same-turn trailing input emitted by some browser IMEs right after compositionend.
+    textarea.value = "你";
+    // Blink/V8 drains microtasks before dispatching a trailing native insertText InputEvent.
+    await Promise.resolve();
     textarea.dispatchEvent(
       new InputEvent("input", {
         data: "你",
@@ -205,12 +207,46 @@ describe("installPtyTextareaInput", () => {
       }),
     );
 
-    // Flush the queueMicrotask that clears `composing`.
-    await Promise.resolve();
+    // textarea.value must remain intact for xterm CompositionHelper's 0ms finalize timer.
+    expect(textarea.value).toBe("你");
     vi.runAllTimers();
 
     expect(send).toHaveBeenCalledExactlyOnceWith("你");
     expect(onMobileReplacementInput).toHaveBeenCalled();
+    cleanup();
+  });
+
+  it("leaves non-composing keyCode 229 / Process keystrokes to xterm without wiping leftover textarea.value", () => {
+    const textarea = makeTextarea();
+    textarea.value = "你好";
+    const send = vi.fn();
+    const compositionForwarder = createPtyCompositionForwarder(send);
+
+    const cleanup = installPtyTextareaInput({
+      textarea,
+      compositionForwarder,
+      onMobileReplacementInput: vi.fn(),
+      screenReaderMode: true,
+    });
+
+    textarea.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Process",
+        keyCode: 229,
+        bubbles: true,
+      }),
+    );
+    textarea.value = "你好，";
+    textarea.dispatchEvent(
+      new InputEvent("input", {
+        data: "，",
+        inputType: "insertText",
+        bubbles: true,
+      }),
+    );
+
+    expect(textarea.value).toBe("你好，");
+    expect(send).not.toHaveBeenCalled();
     cleanup();
   });
 

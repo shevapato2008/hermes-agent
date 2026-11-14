@@ -23,16 +23,10 @@ function detectMobileLike(): boolean {
   );
 }
 
-function isPrintablePhysicalKey(ev: KeyboardEvent): boolean {
-  return (
-    !ev.isComposing &&
-    ev.keyCode !== 229 &&
-    ev.key !== "Process" &&
-    ev.key.length === 1 &&
-    !ev.ctrlKey &&
-    !ev.altKey &&
-    !ev.metaKey
-  );
+function isHandledByXtermKeyDown(ev: KeyboardEvent): boolean {
+  if (ev.isComposing) return false;
+  if (ev.keyCode === 229 || ev.key === "Process") return true;
+  return ev.key.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey;
 }
 
 function extractSmartKeyboardText(ev: Event): string | null {
@@ -75,7 +69,7 @@ export function installPtyTextareaInput(options: PtyTextareaInputOptions): () =>
   let keyDownSeen = false;
   let keyDownTimer: ReturnType<typeof setTimeout> | null = null;
   let composing = false;
-  let compositionSeq = 0;
+  let compositionTimer: ReturnType<typeof setTimeout> | null = null;
 
   const clearKeyDownTimer = () => {
     if (keyDownTimer !== null) {
@@ -84,8 +78,15 @@ export function installPtyTextareaInput(options: PtyTextareaInputOptions): () =>
     }
   };
 
+  const clearCompositionTimer = () => {
+    if (compositionTimer !== null) {
+      clearTimeout(compositionTimer);
+      compositionTimer = null;
+    }
+  };
+
   const onKeyDown = (ev: KeyboardEvent) => {
-    if (!isPrintablePhysicalKey(ev)) return;
+    if (!isHandledByXtermKeyDown(ev)) return;
     clearKeyDownTimer();
     keyDownSeen = true;
     keyDownTimer = setTimeout(() => {
@@ -100,20 +101,19 @@ export function installPtyTextareaInput(options: PtyTextareaInputOptions): () =>
   };
 
   const onCompositionStart = () => {
-    compositionSeq += 1;
+    clearCompositionTimer();
     composing = true;
   };
 
   const onCompositionEnd = (ev: CompositionEvent) => {
+    clearCompositionTimer();
     composing = true;
     onMobileReplacementInput();
     compositionForwarder.onCompositionEnd(ev.data);
-    const seq = compositionSeq;
-    queueMicrotask(() => {
-      if (compositionSeq === seq) {
-        composing = false;
-      }
-    });
+    compositionTimer = setTimeout(() => {
+      compositionTimer = null;
+      composing = false;
+    }, 0);
   };
 
   const onBeforeInput = (ev: Event) => {
@@ -146,6 +146,7 @@ export function installPtyTextareaInput(options: PtyTextareaInputOptions): () =>
 
   return () => {
     clearKeyDownTimer();
+    clearCompositionTimer();
     textarea.removeEventListener("keydown", onKeyDown, true);
     textarea.removeEventListener("keyup", onKeyUp, true);
     textarea.removeEventListener("compositionstart", onCompositionStart, true);
