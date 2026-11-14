@@ -59,7 +59,9 @@ async function render(ui: ReactNode) {
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
-  await act(async () => root.render(<I18nProvider>{ui}</I18nProvider>));
+  await act(async () =>
+    root.render(<I18nProvider initialLocale="en">{ui}</I18nProvider>),
+  );
 }
 
 /** Fast-forward the countdown (1s ticks) until it lapses. */
