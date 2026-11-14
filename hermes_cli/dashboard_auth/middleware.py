@@ -47,7 +47,7 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/api/auth/providers", "/api/mcp/oauth/callback/",
     # A saved gateway's sign-in redirect: its one-use state is the credential (gateway_connections_oauth).
     "/webapp/gateway-connections/oauth/callback",
-    "/assets/", "/dashboard-plugins/", "/favicon.ico", "/ds-assets/", "/fonts/", "/fonts-terminal/")
+    "/assets/", "/dashboard-plugins/", "/favicon.ico", "/ds-assets/", "/fonts/", "/fonts-terminal/", "/fonts-kai/")
 
 # Page icons, matched exactly. Browsers fetch them without cookies (the Webapp's page icon and
 # home-screen icon are ``/apple-touch-icon.png``), so behind the gate they hit the sign-in redirect

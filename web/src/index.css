@@ -7,6 +7,7 @@
    stack (Tabs, Segmented, Typography, Buttons, etc. all look unstyled). */
 @import '@nous-research/ui/styles/fonts.css';
 @import '@nous-research/ui/styles/globals.css';
+@import './styles/kaiti-fonts.css';
 
 /* Scan the published design-system bundle so its utility classes survive
    Tailwind's JIT purge. */
@@ -62,15 +63,24 @@
   --background-alpha: 1;
 
   /* Typography tokens — rewritten by ThemeProvider. Defaults match the
-     system stack so themes that don't override look native. */
-  --theme-font-sans: system-ui, -apple-system, "Segoe UI", Roboto,
-    "Helvetica Neue", Arial, sans-serif;
+     smartbox-7inch KaiTi stack so first paint has zero layout or font jump. */
+  --theme-font-sans: "SmartBox Sans", "SmartBox Kai", "LXGW WenKai", "Kaiti SC",
+    "STKaiti", "KaiTi", "AR PL UKai CN", "TW-Kai", system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, serif;
   --theme-font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo,
-    Consolas, monospace;
+    Consolas, "SmartBox Kai", "LXGW WenKai", "Kaiti SC", "STKaiti", "KaiTi",
+    "AR PL UKai CN", "TW-Kai", monospace;
   --theme-font-display: var(--theme-font-sans);
-  --theme-base-size: 15px;
-  --theme-line-height: 1.55;
+  --theme-base-size: 18px;
+  --theme-line-height: 1.58;
   --theme-letter-spacing: 0;
+
+  /* Override @nous-research/ui display & mono vars so Chinese glyphs fall
+     through to the KaiTi-backed theme stacks instead of system sans-serif. */
+  --font-mondwest: 'Mondwest', var(--theme-font-display, var(--theme-font-sans));
+  --font-rules-compressed: 'Rules Compressed', var(--theme-font-display, var(--theme-font-sans));
+  --font-rules-expanded: 'Rules Expanded', var(--theme-font-display, var(--theme-font-sans));
+  --font-mono: 'Courier Prime', var(--theme-font-mono);
 
   /* Layout tokens. */
   --radius: 0.5rem;

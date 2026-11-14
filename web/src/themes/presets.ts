@@ -1,4 +1,5 @@
 import { parseColor, THEME_PRESET_PALETTES, type ThemePresetPalette } from "@hermes/shared";
+import { KAITI_CJK_STACK, SMARTBOX_KAITI_UI_STACK } from "./fonts";
 import type { DashboardTheme, ThemePalette, ThemeTypography, ThemeLayout } from "./types";
 
 /**
@@ -20,11 +21,10 @@ import type { DashboardTheme, ThemePalette, ThemeTypography, ThemeLayout } from 
 // Shared typography / layout presets
 // ---------------------------------------------------------------------------
 
-/** Default system stack — neutral, safe fallback for every platform. */
-const SYSTEM_SANS =
-  'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+/** Default UI stack — Latin SmartBox Sans + self-hosted SmartBox Kai for CJK. */
+const SYSTEM_SANS = SMARTBOX_KAITI_UI_STACK;
 const SYSTEM_MONO =
-  'ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace';
+  `ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, ${KAITI_CJK_STACK}, monospace`;
 
 const DEFAULT_TYPOGRAPHY: ThemeTypography = {
   fontSans: SYSTEM_SANS,
@@ -113,7 +113,7 @@ export const emberTheme: DashboardTheme = {
   },
   typography: {
     ...DEFAULT_TYPOGRAPHY,
-    fontSans: `"Spectral", Georgia, "Times New Roman", serif`,
+    fontSans: `"Spectral", Georgia, "Times New Roman", ${KAITI_CJK_STACK}, serif`,
     fontMono: `"IBM Plex Mono", ${SYSTEM_MONO}`,
     fontUrl:
       "https://fonts.googleapis.com/css2?family=Spectral:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;700&display=swap",
@@ -188,7 +188,7 @@ export const roseTheme: DashboardTheme = {
   },
   typography: {
     ...DEFAULT_TYPOGRAPHY,
-    fontSans: `"Fraunces", Georgia, serif`,
+    fontSans: `"Fraunces", Georgia, ${KAITI_CJK_STACK}, serif`,
     fontMono: `"DM Mono", ${SYSTEM_MONO}`,
     fontUrl:
       "https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=DM+Mono:wght@400;500&display=swap",
@@ -243,7 +243,63 @@ export const defaultLargeTheme: DashboardTheme = {
   },
 };
 
+const SMARTBOX_7INCH_CUSTOM_CSS = `
+:root {
+  --text-secondary: color-mix(in srgb, var(--midground-base) 88%, transparent);
+  --text-tertiary: color-mix(in srgb, var(--midground-base) 74%, transparent);
+  --text-xs: max(0.75rem, 14px);
+}
+html, body {
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+}
+[class*="text-[0.6"], [class*="text-[0.7"], [class*="text-[10px]"], [class*="text-[11px]"] {
+  font-size: 14px !important;
+}
+@media (min-width: 1024px) {
+  #app-sidebar:not(.lg\\:w-14) {
+    width: 15rem;
+  }
+}
+#app-sidebar > nav a {
+  min-height: 42px;
+  padding-top: 0.45rem;
+  padding-bottom: 0.45rem;
+}
+html[lang^="zh"] #app-sidebar > nav a,
+html[lang^="zh"] .uppercase {
+  letter-spacing: 0.03em;
+}
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+select {
+  min-height: 40px;
+}
+`.trim();
+
+export const smartbox7InchTheme: DashboardTheme = {
+  name: "smartbox-7inch",
+  label: "智星盒 7″ 楷体",
+  description: "7-inch 1024×600 high-contrast KaiTi touch layout",
+  palette: defaultTheme.palette,
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans: SMARTBOX_KAITI_UI_STACK,
+    baseSize: "18px",
+    lineHeight: "1.58",
+  },
+  layout: {
+    radius: "0.5rem",
+    density: "comfortable",
+  },
+  terminalBackground: "#021010",
+  terminalForeground: "#fff2df",
+  terminalFontSize: 16,
+  terminalLineHeight: 1.18,
+  customCSS: SMARTBOX_7INCH_CUSTOM_CSS,
+};
+
 export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
+  "smartbox-7inch": smartbox7InchTheme,
   default: defaultTheme,
   "default-large": defaultLargeTheme,
   "nous-blue": nousBlueTheme,

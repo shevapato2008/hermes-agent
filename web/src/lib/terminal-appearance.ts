@@ -22,6 +22,30 @@ export function buildTerminalTheme(background: string, foreground: string) {
   };
 }
 
+function readRootNumberVar(varName: string): number | null {
+  if (typeof document === "undefined") return null;
+  const root = document.documentElement;
+  if (!root) return null;
+  const inlineVal = root.style.getPropertyValue(varName).trim();
+  const raw =
+    inlineVal ||
+    (typeof window !== "undefined" && typeof window.getComputedStyle === "function"
+      ? window.getComputedStyle(root).getPropertyValue(varName).trim()
+      : "");
+  if (!raw) return null;
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function configuredFontSizeForWidth(layoutWidthPx: number, configured: number): number {
+  if (layoutWidthPx < 300) return 9;
+  if (layoutWidthPx < 360) return 10;
+  if (layoutWidthPx < 440) return 12;
+  if (layoutWidthPx < 640) return Math.max(13, configured - 2);
+  if (layoutWidthPx < 780) return Math.max(14, configured - 1);
+  return configured;
+}
+
 /**
  * CSS width for xterm font tiers.
  *
@@ -42,6 +66,10 @@ export function terminalTierWidthPx(host: HTMLElement | null): number {
 }
 
 export function terminalFontSizeForWidth(layoutWidthPx: number): number {
+  const configured = readRootNumberVar("--theme-terminal-font-size");
+  if (configured !== null) {
+    return configuredFontSizeForWidth(layoutWidthPx, configured);
+  }
   if (layoutWidthPx < 300) return 7;
   if (layoutWidthPx < 360) return 8;
   if (layoutWidthPx < 420) return 9;
@@ -52,5 +80,11 @@ export function terminalFontSizeForWidth(layoutWidthPx: number): number {
 }
 
 export function terminalLineHeightForWidth(layoutWidthPx: number): number {
+  const configuredLh = readRootNumberVar("--theme-terminal-line-height");
+  if (configuredLh !== null) {
+    return layoutWidthPx < 640
+      ? Math.max(1.08, Number((configuredLh - 0.08).toFixed(2)))
+      : configuredLh;
+  }
   return layoutWidthPx < 1024 ? 1.02 : 1.15;
 }

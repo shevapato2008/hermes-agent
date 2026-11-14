@@ -183,6 +183,10 @@ export interface DashboardTheme {
   /** Default text/cursor color for the embedded terminal pane (xterm.js).
    *  Hex string. Defaults to `"#f0e6d2"` when absent. */
   terminalForeground?: string;
+  /** Preferred terminal font size (px) on full-width panes; scales down on narrow panes. */
+  terminalFontSize?: number;
+  /** Preferred terminal line-height multiplier on full-width panes. */
+  terminalLineHeight?: number;
 }
 
 /**

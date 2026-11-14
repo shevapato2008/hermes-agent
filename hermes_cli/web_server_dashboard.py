@@ -2,8 +2,9 @@
 """
 
 import asyncio
-import logging
 import json
+import logging
+import math
 import os
 import threading
 import time
@@ -57,11 +58,17 @@ def _render_active_theme_bootstrap_css() -> str:
     """
     from hermes_cli.config import load_config
     try:
-        active = cfg_get(load_config(), "dashboard", "theme", default="default")
-        if not active or not isinstance(active, str):
+        active = cfg_get(load_config(), "dashboard", "theme", default="smartbox-7inch")
+        if not active or not isinstance(active, str) or active == "smartbox-7inch":
             return ""
         if any(b["name"] == active for b in _BUILTIN_DASHBOARD_THEMES):
-            return ""
+            if active == "default-large":
+                return ""
+            return (
+                '<style id="hermes-theme-bootstrap">'
+                ":root{--theme-base-size:15px;--theme-line-height:1.55;}"
+                "</style>"
+            )
         for theme in _discover_user_themes():
             if theme.get("name") != active:
                 continue
@@ -218,7 +225,7 @@ def mount_spa(application: FastAPI):
         if prefix:
             # Rewrite absolute asset URLs baked into the Vite build to go through the proxy.
             for attr in ('href="/assets/', 'src="/assets/', 'href="/favicon.ico"', 'href="/fonts/',
-                         'href="/ds-assets/', 'src="/ds-assets/'):
+                         'href="/fonts-kai/', 'href="/ds-assets/', 'src="/ds-assets/'):
                 html = html.replace(attr, attr.replace('"/', f'"{prefix}/', 1))
         theme_bootstrap = _render_active_theme_bootstrap_css()
         if theme_bootstrap:
@@ -239,7 +246,7 @@ def mount_spa(application: FastAPI):
         prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
         css = css_path.read_text(encoding="utf-8-sig")
         if prefix:
-            for asset_dir in ("/fonts/", "/fonts-terminal/", "/ds-assets/", "/assets/"):
+            for asset_dir in ("/fonts/", "/fonts-terminal/", "/fonts-kai/", "/ds-assets/", "/assets/"):
                 for quote in ("", '"', "'"):
                     css = css.replace(f"url({quote}{asset_dir}", f"url({quote}{prefix}{asset_dir}")
         return Response(
@@ -304,6 +311,7 @@ def mount_spa(application: FastAPI):
 
 # Built-in themes — label + description only; colors live in web/src/themes/presets.ts.
 _BUILTIN_DASHBOARD_THEMES = [
+    {"name": "smartbox-7inch", "label": "智星盒 7″ 楷体", "description": "7-inch 1024×600 high-contrast KaiTi touch layout"},
     {"name": "default",       "label": "Hermes Teal",         "description": "Classic dark teal — the canonical Hermes look"},
     {"name": "default-large", "label": "Hermes Teal (Large)", "description": "Hermes Teal with bigger fonts and roomier spacing"},
     {"name": "nous-blue",     "label": "Nous Blue",           "description": "Light mode — vivid Nous-blue accents on cream canvas"},
@@ -335,8 +343,14 @@ def _parse_theme_layer(value: Any, default_hex: str, default_alpha: float = 1.0)
 
 
 _THEME_DEFAULT_TYPOGRAPHY: dict[str, str] = {
-    "fontSans": 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
-    "fontMono": 'ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace',
+    "fontSans": (
+        '"SmartBox Sans", "SmartBox Kai", "LXGW WenKai", "Kaiti SC", "STKaiti", "KaiTi", '
+        '"AR PL UKai CN", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, serif'
+    ),
+    "fontMono": (
+        'ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, '
+        '"SmartBox Kai", "LXGW WenKai", "Kaiti SC", "STKaiti", "KaiTi", monospace'
+    ),
     "baseSize": "15px",
     "lineHeight": "1.55",
     "letterSpacing": "0",
@@ -377,6 +391,21 @@ def _nonempty_str(value: Any) -> bool:
 
 def _css_ident(key: Any) -> bool:
     return isinstance(key, str) and key.replace("-", "").replace("_", "").isalnum()
+
+
+_TERMINAL_METRIC_BOUNDS: tuple[tuple[str, int | float, int | float], ...] = (
+    ("terminalFontSize", 8, 32),
+    ("terminalLineHeight", 1.0, 2.0),
+)
+
+
+def _normalise_terminal_metrics(data: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, lo, hi in _TERMINAL_METRIC_BOUNDS:
+        val = data.get(key)
+        if type(val) in (int, float) and math.isfinite(val):
+            out[key] = max(lo, min(hi, val))
+    return out
 
 
 def _normalise_theme_definition(data: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -427,10 +456,8 @@ def _normalise_theme_definition(data: dict[str, Any]) -> Optional[dict[str, Any]
     if isinstance(density, str) and density in {"compact", "comfortable", "spacious"}:
         layout["density"] = density
 
-    color_overrides = {
-        k: v for k, v in _dict_field(data, "colorOverrides").items()
-        if k in _THEME_OVERRIDE_KEYS and _nonempty_str(v)
-    }
+    color_overrides = {k: v for k, v in _dict_field(data, "colorOverrides").items()
+                       if k in _THEME_OVERRIDE_KEYS and _nonempty_str(v)}
 
     assets_src = _dict_field(data, "assets")
     assets_out: dict[str, Any] = {k: assets_src[k] for k in _THEME_NAMED_ASSET_KEYS if _nonempty_str(assets_src.get(k))}
@@ -473,6 +500,7 @@ def _normalise_theme_definition(data: dict[str, Any]) -> Optional[dict[str, Any]
         result["customCSS"] = custom_css
     if component_styles:
         result["componentStyles"] = component_styles
+    result.update(_normalise_terminal_metrics(data))
     return result
 
 

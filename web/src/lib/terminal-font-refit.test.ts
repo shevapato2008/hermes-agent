@@ -110,4 +110,47 @@ describe("refitWhenTerminalFontLoads", () => {
     expect(() => refitWhenTerminalFontLoads(fakeTerminal(), fit, undefined)()).not.toThrow();
     expect(fit).not.toHaveBeenCalled();
   });
+
+  it("refreshes the texture atlas on loadingdone even when bundled faces were warm-cached, and cleans up", () => {
+    const term = fakeTerminal();
+    const fit = vi.fn();
+    const listeners = new Map<string, () => void>();
+    const fontSet = {
+      check: vi.fn(() => true),
+      load: vi.fn(async () => [] as FontFace[]),
+      addEventListener: vi.fn((type: string, cb: () => void) => {
+        listeners.set(type, cb);
+      }),
+      removeEventListener: vi.fn((type: string, cb: () => void) => {
+        if (listeners.get(type) === cb) listeners.delete(type);
+      }),
+    };
+
+    const cleanup = refitWhenTerminalFontLoads(term, fit, fontSet);
+    expect(fontSet.addEventListener).toHaveBeenCalledWith("loadingdone", expect.any(Function));
+
+    listeners.get("loadingdone")?.();
+    expect(term.clearTextureAtlas).toHaveBeenCalledTimes(1);
+    expect(term.refresh).toHaveBeenCalledWith(0, 23);
+
+    cleanup();
+    expect(fontSet.removeEventListener).toHaveBeenCalledWith("loadingdone", expect.any(Function));
+    listeners.get("loadingdone")?.();
+    expect(term.clearTextureAtlas).toHaveBeenCalledTimes(1);
+  });
+
+  it("prewarms SmartBox Kai CJK sample glyphs when not yet loaded", async () => {
+    const term = fakeTerminal();
+    const fit = vi.fn();
+    const { fontSet, release } = deferredFontSet();
+
+    refitWhenTerminalFontLoads(term, fit, fontSet);
+    release();
+    await settle();
+
+    expect(fontSet.load).toHaveBeenCalledWith(
+      '16px "SmartBox Kai"',
+      "中文对话会话智星盒系统文件",
+    );
+  });
 });

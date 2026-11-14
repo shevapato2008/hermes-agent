@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { BUILTIN_THEMES, defaultTheme } from "./presets";
+import { BUILTIN_THEMES, smartbox7InchTheme } from "./presets";
 import {
   FONT_CHOICES,
   THEME_DEFAULT_FONT_ID,
@@ -344,7 +344,35 @@ function applyFontOverride(fontId: string | undefined) {
 // Apply a full theme to :root
 // ---------------------------------------------------------------------------
 
-function applyTheme(theme: DashboardTheme) {
+function syncTerminalMetricVar(
+  style: CSSStyleDeclaration,
+  varName: string,
+  value: number | undefined,
+): boolean {
+  const prev = style.getPropertyValue(varName);
+  const next = typeof value === "number" && Number.isFinite(value) ? String(value) : "";
+  if (next) style.setProperty(varName, next);
+  else style.removeProperty(varName);
+  return prev !== next;
+}
+
+function applyTerminalMetrics(root: HTMLElement, theme: DashboardTheme): void {
+  const sizeChanged = syncTerminalMetricVar(
+    root.style,
+    "--theme-terminal-font-size",
+    theme.terminalFontSize,
+  );
+  const lhChanged = syncTerminalMetricVar(
+    root.style,
+    "--theme-terminal-line-height",
+    theme.terminalLineHeight,
+  );
+  if ((sizeChanged || lhChanged) && typeof window !== "undefined") {
+    window.dispatchEvent(new Event("resize"));
+  }
+}
+
+export function applyTheme(theme: DashboardTheme): void {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
 
@@ -398,6 +426,7 @@ function applyTheme(theme: DashboardTheme) {
     "--theme-terminal-foreground",
     theme.terminalForeground ?? "#f0e6d2",
   );
+  applyTerminalMetrics(root, theme);
 
   // Re-assert the font override last: theme application just rewrote
   // --theme-font-sans/-display, so an active override has to win again.
@@ -411,8 +440,8 @@ function applyTheme(theme: DashboardTheme) {
 export function ThemeProvider({ children }: { children: ReactNode }) {
   /** Name of the currently active theme (built-in id or user YAML name). */
   const [themeName, setThemeName] = useState<string>(() => {
-    if (typeof window === "undefined") return "default";
-    const stored = window.localStorage.getItem(STORAGE_KEY) ?? "default";
+    if (typeof window === "undefined") return "smartbox-7inch";
+    const stored = window.localStorage.getItem(STORAGE_KEY) ?? "smartbox-7inch";
     const migrated = migrateThemeName(stored);
     // Write the migrated name back so future reads converge on the new
     // key and we eventually retire the alias entry.
@@ -455,7 +484,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       return (
         BUILTIN_THEMES[name] ??
         userThemeDefs[name] ??
-        defaultTheme
+        smartbox7InchTheme
       );
     },
     [userThemeDefs],
@@ -548,7 +577,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
         ...availableThemes.map((t) => t.name),
         ...Object.keys(userThemeDefs),
       ]);
-      const next = knownNames.has(name) ? name : "default";
+      const next = knownNames.has(name) ? name : "smartbox-7inch";
       setThemeName(next);
       if (typeof window !== "undefined") {
         window.localStorage.setItem(STORAGE_KEY, next);
@@ -588,8 +617,8 @@ export function useTheme(): ThemeContextValue {
 }
 
 const ThemeContext = createContext<ThemeContextValue>({
-  theme: defaultTheme,
-  themeName: "default",
+  theme: smartbox7InchTheme,
+  themeName: "smartbox-7inch",
   availableThemes: Object.values(BUILTIN_THEMES).map((t) => ({
     name: t.name,
     label: t.label,

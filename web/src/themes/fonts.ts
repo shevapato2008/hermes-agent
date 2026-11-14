@@ -19,13 +19,20 @@
  * `hermes_cli/web_server.py` — the ids must match exactly.
  */
 
-/** System stacks reused from presets so "System" choices need no webfont. */
-const SYSTEM_SANS =
-  'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+/** Self-hosted KaiTi (`SmartBox Kai` = LXGW WenKai) + OS KaiTi fallbacks for CJK glyphs. */
+export const KAITI_CJK_STACK =
+  '"SmartBox Kai", "LXGW WenKai", "Kaiti SC", "STKaiti", "KaiTi", "AR PL UKai CN", "TW-Kai"';
+
+/** Crisp Latin (`SmartBox Sans` = Geist Sans with Latin unicode-range) + KaiTi CJK fallback. */
+export const SMARTBOX_KAITI_UI_STACK =
+  `"SmartBox Sans", ${KAITI_CJK_STACK}, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, serif`;
+
+/** System stacks reused from presets so "System" choices need no external webfont fetch. */
+const SYSTEM_SANS = SMARTBOX_KAITI_UI_STACK;
 const SYSTEM_MONO =
-  'ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace';
+  `ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, ${KAITI_CJK_STACK}, monospace`;
 const SYSTEM_SERIF =
-  'Georgia, Cambria, "Times New Roman", Times, serif';
+  `Georgia, Cambria, "Times New Roman", Times, ${KAITI_CJK_STACK}, serif`;
 
 export type FontCategory = "sans" | "serif" | "mono";
 
@@ -55,6 +62,7 @@ const GF = (family: string): string =>
  */
 export const FONT_CHOICES: FontChoice[] = [
   // ── System (no webfont fetch) ──────────────────────────────────────────
+  { id: "kaiti", label: "楷体 (SmartBox Kai)", category: "serif", stack: SMARTBOX_KAITI_UI_STACK },
   { id: "system-sans", label: "System Sans", category: "sans", stack: SYSTEM_SANS },
   { id: "system-serif", label: "System Serif", category: "serif", stack: SYSTEM_SERIF },
   { id: "system-mono", label: "System Mono", category: "mono", stack: SYSTEM_MONO },

@@ -57,7 +57,7 @@ async def get_dashboard_themes(profile: Optional[str] = None):
     from `~/.hermes/dashboard-themes/*.yaml` ship their normalised `definition`."""
     def _run():
         config = load_config()
-        active = cfg_get(config, "dashboard", "theme", default="default")
+        active = cfg_get(config, "dashboard", "theme", default="smartbox-7inch")
         themes = list(_BUILTIN_DASHBOARD_THEMES)
         seen = {t["name"] for t in themes}
         for t in _discover_user_themes():
@@ -82,7 +82,7 @@ async def set_dashboard_theme(body: ThemeSetBody, profile: Optional[str] = None)
 # anything unvetted (the webfont URL is injected as a <link>, so never accept arbitrary ids/URLs).
 _FONT_DEFAULT_ID = "theme"
 _FONT_CHOICES = frozenset({
-    "system-sans", "system-serif", "system-mono",
+    "system-sans", "system-serif", "system-mono", "kaiti",
     "inter", "ibm-plex-sans", "work-sans", "atkinson-hyperlegible", "dm-sans",
     "spectral", "fraunces", "source-serif",
     "jetbrains-mono", "ibm-plex-mono", "space-mono",
