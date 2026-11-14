@@ -188,3 +188,71 @@ describe("mobile IME double-send dedup (#115505)", () => {
     expect(forwarder.filterTerminalData("xyz")).toBe("xyz");
   });
 });
+
+describe("sendDirect (virtual keyboard / OSK synchronous path)", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("forwards text synchronously without waiting for timers and strips late echoes", () => {
+    vi.useFakeTimers();
+    const send = vi.fn();
+    const forwarder = createPtyCompositionForwarder(send);
+
+    forwarder.sendDirect("");
+    expect(send).not.toHaveBeenCalled();
+
+    forwarder.sendDirect("hello");
+    expect(send).toHaveBeenCalledExactlyOnceWith("hello");
+    expect(forwarder.filterTerminalData("hello")).toBe("");
+  });
+
+  it("forwards rapid identical single characters twice (e.g. 'hello' or '100')", () => {
+    vi.useFakeTimers();
+    const send = vi.fn();
+    const forwarder = createPtyCompositionForwarder(send);
+
+    forwarder.sendDirect("l");
+    forwarder.sendDirect("l");
+
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenNthCalledWith(1, "l");
+    expect(send).toHaveBeenNthCalledWith(2, "l");
+  });
+
+  it("flushes an earlier pending composition in order before sending direct text", () => {
+    vi.useFakeTimers();
+    const send = vi.fn();
+    const forwarder = createPtyCompositionForwarder(send);
+
+    forwarder.onCompositionEnd("你");
+    forwarder.sendDirect("好");
+    vi.runAllTimers();
+
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenNthCalledWith(1, "你");
+    expect(send).toHaveBeenNthCalledWith(2, "好");
+  });
+
+  it("delivers once when pending composition matches direct text", () => {
+    vi.useFakeTimers();
+    const send = vi.fn();
+    const forwarder = createPtyCompositionForwarder(send);
+
+    forwarder.onCompositionEnd("你");
+    forwarder.sendDirect("你");
+    vi.runAllTimers();
+
+    expect(send).toHaveBeenCalledExactlyOnceWith("你");
+  });
+
+  it("skips direct send when xterm onData already delivered the same text within the echo window", () => {
+    vi.useFakeTimers();
+    const send = vi.fn();
+    const forwarder = createPtyCompositionForwarder(send);
+
+    forwarder.noteTerminalData("a");
+    forwarder.sendDirect("a");
+
+    expect(send).not.toHaveBeenCalled();
+  });
+});
+

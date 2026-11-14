@@ -65,8 +65,8 @@ import {
 import {
   MOBILE_REPLACEMENT_WINDOW_MS,
   normalizePtyMobileInput,
-  shouldTreatInputAsMobileReplacement,
 } from "@/lib/pty-mobile-input";
+import { installPtyTextareaInput } from "@/lib/pty-textarea-input";
 import { computeKeyboardInset, keyboardRevealScrollDelta } from "@/lib/keyboard-inset";
 import {
   resolvePtyKeyboardShortcut,
@@ -821,39 +821,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     };
     host.addEventListener("keydown", _imeCompositionGuard, true);
 
-    const textarea = term.textarea;
-    if (textarea) {
-      textarea.setAttribute("autocomplete", "off");
-      textarea.setAttribute("autocorrect", "off");
-      textarea.setAttribute("autocapitalize", "off");
-      textarea.setAttribute("spellcheck", "false");
-
-      const isMobileLike =
-        typeof navigator !== "undefined" &&
-        /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
-      const markReplacementInput = (ev: Event) => {
-        const input = ev as InputEvent;
-        if (
-          shouldTreatInputAsMobileReplacement(
-            input.inputType,
-            input.data,
-            isMobileLike,
-          )
-        ) {
-          mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
-        }
-      };
-      const markCompositionEnd = (ev: CompositionEvent) => {
-        mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
-        compositionForwarder.onCompositionEnd(ev.data);
-      };
-
-      textarea.addEventListener("beforeinput", markReplacementInput, true);
-      textarea.addEventListener("compositionend", markCompositionEnd, true);
-      mobileInputCleanup = () => {
-        textarea.removeEventListener("beforeinput", markReplacementInput, true);
-        textarea.removeEventListener("compositionend", markCompositionEnd, true);
-      };
+    if (term.textarea) {
+      mobileInputCleanup = installPtyTextareaInput({
+        textarea: term.textarea,
+        compositionForwarder,
+        onMobileReplacementInput: () => {
+          mobileReplacementInputUntilRef.current =
+            Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
+        },
+        screenReaderMode: Boolean(term.options.screenReaderMode),
+      });
     }
 
     // WebGL draws from a texture atlas sized with device pixels. On phones and

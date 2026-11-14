@@ -79,6 +79,20 @@ export function createPtyCompositionForwarder(send: (data: string) => void) {
         if (committed) sendCommitted(committed);
       }, 16);
     },
+    sendDirect(data: string) {
+      if (!data) return;
+      if (pending !== null) {
+        const previous = pending;
+        clearPending();
+        if (previous !== data) {
+          sendCommitted(previous);
+        }
+      }
+      if (withinEchoWindow(lastTerminalData) && lastTerminalData.text.endsWith(data)) {
+        return;
+      }
+      sendCommitted(data);
+    },
     noteTerminalData(data: string) {
       if (!data.startsWith("\x1b")) {
         const now = Date.now();
