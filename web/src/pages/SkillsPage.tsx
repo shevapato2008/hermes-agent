@@ -61,7 +61,7 @@ import {
 import { cn } from "@/lib/utils";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { useI18n } from "@/i18n";
-import { en } from "@/i18n/en";
+import { pageStrings } from "@/i18n/page-strings";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { errorMessage } from "@/lib/api-error";
@@ -147,6 +147,7 @@ export default function SkillsPage() {
   const [editorSkill, setEditorSkill] = useState<string | null>(null);
   const { toast, showToast } = useToast();
   const { t } = useI18n();
+  const sk = pageStrings(t, "skills");
   const { setAfterTitle, setEnd } = usePageHeader();
 
   // ── Profile scoping ──
@@ -156,9 +157,7 @@ export default function SkillsPage() {
   // appends the param automatically; we still pass it explicitly where the
   // call signature supports it (clearer, and robust if a caller bypasses
   // the auto-injection).
-  const {
-    profile: selectedProfile,
-  } = useProfileScope();
+  const { profile: selectedProfile } = useProfileScope();
 
   useEffect(() => {
     // Promise-chain shape: setState fires only inside async callbacks so the
@@ -393,7 +392,7 @@ export default function SkillsPage() {
 
       {loadError && (
         <LoadErrorNotice
-          what={t.skills.loadWhat ?? en.skills.loadWhat!}
+          what={sk.loadWhat}
           detail={loadError}
           onRetry={() => {
             setLoading(true);
@@ -435,7 +434,7 @@ export default function SkillsPage() {
                 />
                 <PanelItem
                   icon={Search}
-                  label="Browse hub"
+                  label={sk.browseHub}
                   active={view === "hub"}
                   onClick={() => {
                     setView("hub");
@@ -574,10 +573,10 @@ export default function SkillsPage() {
                     {skills.length === 0 && (
                       <div className="flex flex-wrap justify-center gap-2">
                         <Button size="sm" onClick={() => setView("hub")}>
-                          {t.skills.browseHub ?? en.skills.browseHub}
+                          {sk.browseHub}
                         </Button>
                         <Button size="sm" outlined onClick={openCreateEditor}>
-                          {t.skills.createSkill ?? en.skills.createSkill}
+                          {sk.createSkill}
                         </Button>
                       </div>
                     )}

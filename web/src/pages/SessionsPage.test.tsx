@@ -3,6 +3,7 @@ import { act, useLayoutEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { zh } from "@/i18n/zh";
 
 const apiMocks = vi.hoisted(() => ({
   getSessions: vi.fn(),
@@ -91,7 +92,7 @@ async function renderSessionsPage(rows: Record<string, unknown>[]) {
       </I18nProvider>,
     ),
   );
-  await waitFor(() => Boolean(button("Delete session")));
+  await waitFor(() => Boolean(button(zh.sessions.deleteSession)));
 }
 
 beforeEach(() => {
@@ -130,7 +131,7 @@ describe("SessionsPage per-row profile routing (#99387)", () => {
     ]);
 
     // expand → transcript read
-    await act(async () => click(button("Delete session")!.closest("div.cursor-pointer")));
+    await act(async () => click(button(zh.sessions.deleteSession)!.closest("div.cursor-pointer")));
     await waitFor(() => apiMocks.getSessionMessages.mock.calls.length > 0);
     expect(apiMocks.getSessionMessages).toHaveBeenCalledWith("sid-guanli", "guanli");
 
@@ -147,10 +148,10 @@ describe("SessionsPage per-row profile routing (#99387)", () => {
     await act(async () => click(button("Save title")));
     expect(apiMocks.renameSession).toHaveBeenCalledWith("sid-guanli", "Renamed", "guanli");
 
-    await act(async () => click(button("Delete session")));
+    await act(async () => click(button(zh.sessions.deleteSession)));
     await waitFor(() => Boolean(document.querySelector('[role="alertdialog"]')));
     const confirm = Array.from(document.querySelectorAll('[role="alertdialog"] button')).find(
-      (b) => b.textContent?.trim() === "Delete",
+      (b) => b.textContent?.trim() === zh.common.delete,
     );
     await act(async () => click(confirm ?? null));
     expect(apiMocks.deleteSession).toHaveBeenCalledWith("sid-guanli", "guanli");
@@ -179,10 +180,10 @@ describe("SessionsPage per-row profile routing (#99387)", () => {
     });
     await waitFor(() => document.body.textContent?.includes("Search hit") === true);
 
-    await act(async () => click(button("Delete session")));
+    await act(async () => click(button(zh.sessions.deleteSession)));
     await waitFor(() => Boolean(document.querySelector('[role="alertdialog"]')));
     const confirm = Array.from(document.querySelectorAll('[role="alertdialog"] button')).find(
-      (b) => b.textContent?.trim() === "Delete",
+      (b) => b.textContent?.trim() === zh.common.delete,
     );
     await act(async () => click(confirm ?? null));
 
@@ -211,7 +212,7 @@ describe("structured reasoning rendering (#59957)", () => {
   };
 
   async function expandFirstSession() {
-    await act(async () => click(button("Delete session")!.closest("div.cursor-pointer")));
+    await act(async () => click(button(zh.sessions.deleteSession)!.closest("div.cursor-pointer")));
   }
 
   it("renders assistant reasoning as prose plus labeled code blocks, not raw wrapper tags", async () => {
@@ -307,12 +308,12 @@ describe("SessionsPage header slots across navigation", () => {
       ),
     );
     const header = () => container.querySelector("header")?.textContent ?? "";
-    await waitFor(() => header().includes("Prune old sessions"));
+    await waitFor(() => header().includes(zh.sessionsExtra!.pruneOldSessions));
 
     const goNext = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Go next");
     await act(async () => click(goNext ?? null));
 
     expect(header()).toContain("Next action");
-    expect(header()).not.toContain("Prune old sessions");
+    expect(header()).not.toContain(zh.sessionsExtra!.pruneOldSessions);
   });
 });

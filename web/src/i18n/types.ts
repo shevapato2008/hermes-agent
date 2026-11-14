@@ -94,18 +94,25 @@ export interface Translations {
     };
     nav: {
       analytics: string;
+      channels?: string;
       chat: string;
       config: string;
       cron: string;
       documentation: string;
+      files?: string;
       keys: string;
       logs: string;
+      mcp?: string;
       models: string;
+      pairing?: string;
       profiles: string;
       plugins: string;
       sessions: string;
       skills: string;
+      system?: string;
+      webhooks?: string;
     };
+    pluginLabels?: Record<string, string>;
     modelToolsSheetSubtitle: string;
     modelToolsSheetTitle: string;
     navigation: string;
@@ -935,5 +942,150 @@ export interface Translations {
       confirmTitle?: string;
       confirmManyTitle?: string;
     };
+  };
+
+  // ── Page chrome sections (optional on Translations so non-en/zh locales fall back to English via pageStrings) ──
+  sessionsExtra?: {
+    pruneOldSessions: string;
+    pruneDescription: string;
+    olderThanDays: string;
+    pruneAction: string;
+    importSessions: string;
+    statTotal: string;
+    statActiveInStore: string;
+    statArchived: string;
+    statMessages: string;
+    statSources: string;
+  };
+
+  filesPage?: {
+    refreshFiles: string;
+    pathPlaceholder: string;
+    go: string;
+    upload: string;
+    create: string;
+    uploading: string;
+    releaseToUpload: string;
+    dropFilesHere: string;
+    loading: string;
+    chooseFiles: string;
+    colName: string;
+    colSize: string;
+    colModified: string;
+    colActions: string;
+    loadingFiles: string;
+    noFiles: string;
+    brokenLink: string;
+    createFolder: string;
+    targetLabel: string;
+    folderNamePlaceholder: string;
+    cancel: string;
+    deleteItemTitle: string;
+    deleteNamedTitle: string;
+    deleteFolderDesc: string;
+    deleteFileDesc: string;
+  };
+
+  channelsPage?: {
+    restartGateway: string;
+    restarting: string;
+    restartNow: string;
+    changesSavedRestartBanner: string;
+    gatewayStoppedPrefix: string;
+    gatewayStoppedSuffix: string;
+    configuredSummaryPrefix: string;
+    configuredSummarySuffix: string;
+    test: string;
+    configure: string;
+    cancel: string;
+    saving: string;
+    saveAndEnable: string;
+  };
+
+  pairingPage?: {
+    clearPending: string;
+    revokeAccessTitle: string;
+    revokeNamedDesc: string;
+    revokeGenericDesc: string;
+    revoke: string;
+    pendingRequests: string;
+    noPendingRequests: string;
+    approve: string;
+    approvedUsers: string;
+    noApprovedUsers: string;
+  };
+
+  webhooksPage?: {
+    copy: string;
+    newSubscription: string;
+    deleteWebhookTitle: string;
+    deleteNamedDesc: string;
+    deleteGenericDesc: string;
+    createdSecretNotice: string;
+    webhookUrl: string;
+    secretShownOnce: string;
+    done: string;
+    nameLabel: string;
+    descriptionLabel: string;
+    eventsLabel: string;
+    deliverToLabel: string;
+    deliverOnlyLabel: string;
+    deliverOnlyHint: string;
+    promptLabel: string;
+    creating: string;
+    create: string;
+    receiverDisabledTitle: string;
+    receiverDisabledDesc: string;
+    enabling: string;
+    enableWebhooks: string;
+    restartGateway: string;
+    restarting: string;
+    subscriptionsHeading: string;
+    subscriptionsHint: string;
+    noSubscriptions: string;
+    disable: string;
+    enable: string;
+    delete: string;
+  };
+
+  mcpPage?: {
+    addServer: string;
+    addMcpServerTitle: string;
+    removeMcpServerTitle: string;
+    yourServers: string;
+    noServersDesc: string;
+    browseCatalog: string;
+    catalogHeading: string;
+    catalogSubtitle: string;
+    noCatalogEntries: string;
+    installing: string;
+    install: string;
+    installed: string;
+  };
+
+  systemPage?: {
+    hostHeading: string;
+    nousPortalHeading: string;
+    skillCuratorHeading: string;
+    gatewayHeading: string;
+    memoryHeading: string;
+    credentialPoolHeading: string;
+    operationsHeading: string;
+    checkpointsHeading: string;
+    shellHooksHeading: string;
+    checkForUpdates: string;
+    start: string;
+    restart: string;
+    stop: string;
+    addKey: string;
+    openConsole: string;
+    runDoctor: string;
+    securityAudit: string;
+    updateSkills: string;
+    promptSize: string;
+    supportDump: string;
+    migrateConfig: string;
+    prune: string;
+    newHook: string;
   };
 }

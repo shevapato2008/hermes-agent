@@ -29,6 +29,7 @@ import {
 } from "@/lib/mcp-server-create";
 import { completeMcpDashboardOAuth } from "@/lib/mcp-dashboard-oauth";
 import { errorMessage } from "@/lib/api-error";
+import { usePageStrings } from "@/i18n/page-strings";
 
 function isHttpUrl(value: string): boolean {
   return /^https?:\/\//i.test(value.trim());
@@ -45,6 +46,7 @@ const TRANSPORT_TONE: Record<string, "success" | "warning" | "secondary"> = {
 };
 
 export default function McpPage() {
+  const s = usePageStrings("mcpPage");
   const [servers, setServers] = useState<McpServer[]>([]);
   const [catalog, setCatalog] = useState<McpCatalogEntry[]>([]);
   const [diagnostics, setDiagnostics] = useState<McpCatalogDiagnostic[]>([]);
@@ -297,18 +299,12 @@ export default function McpPage() {
   // Put "Add Server" button in page header
   useLayoutEffect(() => {
     setEnd(
-      <Button
-        className="uppercase"
-        size="sm"
-        onClick={() => setCreateModalOpen(true)}
-      >
-        Add Server
+      <Button className="uppercase" size="sm" onClick={() => setCreateModalOpen(true)}>
+        {s.addServer}
       </Button>,
     );
-    return () => {
-      setEnd(null);
-    };
-  }, [setEnd, loading]);
+    return () => setEnd(null);
+  }, [setEnd, loading, s.addServer]);
 
   if (loading) {
     return (
@@ -331,7 +327,7 @@ export default function McpPage() {
         open={serverDelete.isOpen}
         onCancel={serverDelete.cancel}
         onConfirm={serverDelete.confirm}
-        title="Remove MCP server"
+        title={s.removeMcpServerTitle}
         description={
           serverDelete.pendingId
             ? `"${truncateText(serverDelete.pendingId, 40)}" — this will remove the server.`
@@ -350,12 +346,7 @@ export default function McpPage() {
           aria-modal="true"
           aria-labelledby="create-mcp-title"
         >
-          <div
-            className={cn(
-              themedBody,
-              "relative w-full max-w-lg border border-border bg-card shadow-2xl flex flex-col",
-            )}
-          >
+          <div className={cn(themedBody, "relative w-full max-w-lg border border-border bg-card shadow-2xl flex flex-col")}>
             <Button
               ghost
               size="icon"
@@ -367,11 +358,8 @@ export default function McpPage() {
             </Button>
 
             <header className="p-5 pb-3 border-b border-border">
-              <h2
-                id="create-mcp-title"
-                className="font-mondwest text-display text-base tracking-wider"
-              >
-                Add MCP server
+              <h2 id="create-mcp-title" className="font-mondwest text-display text-base tracking-wider">
+                {s.addMcpServerTitle}
               </h2>
             </header>
 
@@ -591,12 +579,9 @@ export default function McpPage() {
       {/* ── Your MCP servers ── */}
       <div className="flex flex-col gap-3">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-          <H2
-            variant="sm"
-            className="flex items-center gap-2 text-muted-foreground"
-          >
+          <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
             <Server className="h-4 w-4" />
-            Your MCP servers ({servers.length})
+            {s.yourServers.replace("{count}", String(servers.length))}
           </H2>
         </div>
 
@@ -605,10 +590,7 @@ export default function McpPage() {
         {servers.length === 0 && (
           <Card>
             <CardContent className="flex flex-col items-center gap-3 py-8 text-center text-sm text-muted-foreground">
-              <p>
-                No MCP servers yet. MCP servers give the agent extra tools (GitHub, databases,
-                browsers…). Pick one from the catalog below, or click Add Server at the top of the page.
-              </p>
+              <p>{s.noServersDesc}</p>
               <Button
                 size="sm"
                 onClick={() =>
@@ -618,7 +600,7 @@ export default function McpPage() {
                 }
                 prefix={<Package className="h-3.5 w-3.5" />}
               >
-                Browse catalog
+                {s.browseCatalog}
               </Button>
             </CardContent>
           </Card>
@@ -757,23 +739,18 @@ export default function McpPage() {
       {/* ── Catalog ── */}
       <div className="flex flex-col gap-3">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-          <H2
-            variant="sm"
-            className="flex items-center gap-2 text-muted-foreground"
-          >
+          <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
             <Package className="h-4 w-4" />
-            <span id="mcp-catalog">Catalog ({catalog.length})</span>
+            <span id="mcp-catalog">{s.catalogHeading.replace("{count}", String(catalog.length))}</span>
           </H2>
         </div>
 
-        <p className="text-xs text-muted-foreground">
-          Browse Nous-approved MCP servers and install them with one click.
-        </p>
+        <p className="text-xs text-muted-foreground">{s.catalogSubtitle}</p>
 
         {catalog.length === 0 && (
           <Card>
             <CardContent className="py-8 text-center text-sm text-muted-foreground">
-              No catalog entries available.
+              {s.noCatalogEntries}
             </CardContent>
           </Card>
         )}

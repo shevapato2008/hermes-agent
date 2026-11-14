@@ -39,6 +39,7 @@ import { api } from "@/lib/api";
 import type { ManagedFileEntry, ManagedFilesResponse } from "@/lib/api";
 import { PluginSlot } from "@/plugins";
 import { errorMessage } from "@/lib/api-error";
+import { usePageStrings } from "@/i18n/page-strings";
 
 const DATE_FORMAT = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
@@ -79,6 +80,7 @@ function transferHasFiles(event: ReactDragEvent<HTMLElement>): boolean {
 }
 
 export default function FilesPage() {
+  const s = usePageStrings("filesPage");
   const { toast, showToast } = useToast();
   const { setAfterTitle, setEnd } = usePageHeader();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -134,14 +136,7 @@ export default function FilesPage() {
     );
     setEnd(
       <div className="flex items-center gap-2">
-        <Button
-          ghost
-          size="icon"
-          type="button"
-          onClick={() => void load()}
-          disabled={loading}
-          aria-label="Refresh files"
-        >
+        <Button ghost size="icon" type="button" onClick={() => void load()} disabled={loading} aria-label={s.refreshFiles}>
           {loading ? <Spinner /> : <RefreshCw />}
         </Button>
       </div>,
@@ -150,7 +145,7 @@ export default function FilesPage() {
       setAfterTitle(null);
       setEnd(null);
     };
-  }, [headerPath, load, loading, setAfterTitle, setEnd]);
+  }, [headerPath, load, loading, s.refreshFiles, setAfterTitle, setEnd]);
 
   const openDirectory = (entry: ManagedFileEntry) => {
     if (entry.is_directory) {
@@ -287,12 +282,12 @@ export default function FilesPage() {
             <Input
               value={pathInput}
               onChange={(event) => setPathInput(event.target.value)}
-              aria-label="Path"
-              placeholder="Path"
+              aria-label={s.pathPlaceholder}
+              placeholder={s.pathPlaceholder}
               className="h-9 min-w-0 flex-1 font-mono"
             />
             <Button type="submit" size="sm" outlined className="uppercase">
-              Go
+              {s.go}
             </Button>
           </form>
         ) : (
@@ -310,7 +305,7 @@ export default function FilesPage() {
             className="uppercase"
             prefix={uploading ? <Spinner /> : <Upload />}
           >
-            Upload
+            {s.upload}
           </Button>
           <Button
             type="button"
@@ -321,7 +316,7 @@ export default function FilesPage() {
             className="uppercase"
             prefix={<FolderPlus />}
           >
-            Create
+            {s.create}
           </Button>
         </div>
       </div>
@@ -347,15 +342,15 @@ export default function FilesPage() {
           </span>
           <span className="min-w-0">
             <span className="block text-sm font-semibold uppercase tracking-[0.08em] text-foreground">
-              {uploading ? "Uploading" : draggingFiles ? "Release to upload" : "Drop files here"}
+              {uploading ? s.uploading : draggingFiles ? s.releaseToUpload : s.dropFilesHere}
             </span>
             <span className="block truncate font-mono text-xs text-text-secondary" title={activePath}>
-              {activePath || "Loading"}
+              {activePath || s.loading}
             </span>
           </span>
         </span>
         <span className="hidden shrink-0 text-xs font-semibold uppercase tracking-[0.08em] text-text-tertiary sm:block">
-          Choose files
+          {s.chooseFiles}
         </span>
       </button>
 
@@ -368,10 +363,10 @@ export default function FilesPage() {
           )}
 
           <div className="grid min-w-[42rem] grid-cols-[minmax(12rem,1fr)_7rem_10rem_5.5rem] items-center gap-3 border-b border-border px-4 py-2 text-xs font-semibold uppercase tracking-[0.08em] text-text-tertiary">
-            <span>Name</span>
-            <span>Size</span>
-            <span>Modified</span>
-            <span className="text-right">Actions</span>
+            <span>{s.colName}</span>
+            <span>{s.colSize}</span>
+            <span>{s.colModified}</span>
+            <span className="text-right">{s.colActions}</span>
           </div>
 
           {listing?.parent && (
@@ -393,10 +388,10 @@ export default function FilesPage() {
           {loading && !listing ? (
             <div className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
               <Spinner />
-              Loading files...
+              {s.loadingFiles}
             </div>
           ) : listing && listing.entries.length === 0 ? (
-            <div className="py-12 text-center text-sm text-muted-foreground">No files</div>
+            <div className="py-12 text-center text-sm text-muted-foreground">{s.noFiles}</div>
           ) : (
             listing?.entries.map((entry) => (
               <div
@@ -420,7 +415,7 @@ export default function FilesPage() {
                   <span className="truncate">{entry.name}</span>
                   {entry.broken_link && (
                     <Badge tone="destructive" className="shrink-0 text-xs">
-                      Broken link
+                      {s.brokenLink}
                     </Badge>
                   )}
                 </button>
@@ -482,9 +477,9 @@ export default function FilesPage() {
       >
         <DialogContent className="max-w-sm">
           <DialogHeader>
-            <DialogTitle>Create folder</DialogTitle>
+            <DialogTitle>{s.createFolder}</DialogTitle>
             <DialogDescription>
-              Target: {activePath || "Loading"}
+              {s.targetLabel} {activePath || s.loading}
             </DialogDescription>
           </DialogHeader>
           <div className="p-4">
@@ -495,7 +490,7 @@ export default function FilesPage() {
               onKeyDown={(event) => {
                 if (event.key === "Enter") void createDirectory();
               }}
-              placeholder="Folder name"
+              placeholder={s.folderNamePlaceholder}
               disabled={creating}
             />
           </div>
@@ -509,7 +504,7 @@ export default function FilesPage() {
               }}
               disabled={creating}
             >
-              Cancel
+              {s.cancel}
             </Button>
             <Button
               type="button"
@@ -517,7 +512,7 @@ export default function FilesPage() {
               disabled={creating}
               prefix={creating ? <Spinner /> : <FolderPlus />}
             >
-              Create
+              {s.create}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -528,12 +523,8 @@ export default function FilesPage() {
         loading={deleting}
         onCancel={() => setPendingDelete(null)}
         onConfirm={() => void confirmDelete()}
-        title={pendingDelete ? `Delete ${pendingDelete.name}?` : "Delete item?"}
-        description={
-          pendingDelete?.is_directory
-            ? "This removes the folder and everything inside it."
-            : "This removes the file."
-        }
+        title={pendingDelete ? s.deleteNamedTitle.replace("{name}", pendingDelete.name) : s.deleteItemTitle}
+        description={pendingDelete?.is_directory ? s.deleteFolderDesc : s.deleteFileDesc}
       />
     </div>
   );

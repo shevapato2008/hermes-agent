@@ -45,6 +45,7 @@ import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import { HermesConsoleModal } from "@/components/HermesConsoleModal";
 import { cn, themedBody } from "@/lib/utils";
 import { useI18n } from "@/i18n";
+import { pageStrings, usePageStrings } from "@/i18n/page-strings";
 import { api } from "@/lib/api";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import {
@@ -217,6 +218,7 @@ const MEMORY_STATUS_TONE: Record<
 
 export default function SystemPage() {
   const { toast, showToast } = useToast();
+  const s = usePageStrings("systemPage");
 
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [stats, setStats] = useState<SystemStats | null>(null);
@@ -907,7 +909,7 @@ export default function SystemPage() {
       {/* ── Host / system stats ───────────────────────────────────── */}
       <section className="flex flex-col gap-3">
         <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
-          <Server className="h-4 w-4" /> Host
+          <Server className="h-4 w-4" /> {s.hostHeading}
         </H2>
         <Card>
           <CardContent className="py-4">
@@ -993,20 +995,8 @@ export default function SystemPage() {
             )}
             {canUpdateHermes && (
               <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-border pt-4">
-                <Button
-                  size="sm"
-                  ghost
-                  disabled={checkingUpdate}
-                  prefix={
-                    checkingUpdate ? (
-                      <Spinner className="h-3.5 w-3.5" />
-                    ) : (
-                      <RotateCw className="h-3.5 w-3.5" />
-                    )
-                  }
-                  onClick={() => void checkForUpdate(true)}
-                >
-                  Check for updates
+                <Button size="sm" ghost disabled={checkingUpdate} prefix={checkingUpdate ? <Spinner className="h-3.5 w-3.5" /> : <RotateCw className="h-3.5 w-3.5" />} onClick={() => void checkForUpdate(true)}>
+                  {s.checkForUpdates}
                 </Button>
                 {updateInfo?.update_available && updateInfo.can_apply && (
                   <Button
@@ -1039,7 +1029,7 @@ export default function SystemPage() {
       {/* ── Portal ────────────────────────────────────────────────── */}
       <section className="flex flex-col gap-3">
         <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
-          <Globe className="h-4 w-4" /> Nous Portal
+          <Globe className="h-4 w-4" /> {s.nousPortalHeading}
         </H2>
         <Card>
           <CardContent className="flex flex-col gap-3 py-4">
@@ -1086,7 +1076,7 @@ export default function SystemPage() {
       {/* ── Curator ───────────────────────────────────────────────── */}
       <section className="flex flex-col gap-3">
         <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
-          <Sparkles className="h-4 w-4" /> Skill curator
+          <Sparkles className="h-4 w-4" /> {s.skillCuratorHeading}
         </H2>
         <Card>
           <CardContent className="flex items-center justify-between py-4">
@@ -1119,7 +1109,7 @@ export default function SystemPage() {
       {/* ── Gateway ───────────────────────────────────────────────── */}
       <section className="flex flex-col gap-3">
         <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
-          <Power className="h-4 w-4" /> Gateway
+          <Power className="h-4 w-4" /> {s.gatewayHeading}
         </H2>
         <Card>
           <CardContent className="flex items-center justify-between py-4">
@@ -1137,33 +1127,9 @@ export default function SystemPage() {
               )}
             </div>
             <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                className="uppercase"
-                onClick={() => runGateway("start")}
-                disabled={gatewayRunning}
-                prefix={<Play className="h-3.5 w-3.5" />}
-              >
-                Start
-              </Button>
-              <Button
-                size="sm"
-                className="uppercase"
-                onClick={requestRestart}
-                prefix={<RotateCw className="h-3.5 w-3.5" />}
-              >
-                Restart
-              </Button>
-              <Button
-                size="sm"
-                className="uppercase text-warning"
-                ghost
-                onClick={() => runGateway("stop")}
-                disabled={!gatewayRunning}
-                prefix={<Power className="h-3.5 w-3.5" />}
-              >
-                Stop
-              </Button>
+              <Button size="sm" className="uppercase" onClick={() => runGateway("start")} disabled={gatewayRunning} prefix={<Play className="h-3.5 w-3.5" />}>{s.start}</Button>
+              <Button size="sm" className="uppercase" onClick={requestRestart} prefix={<RotateCw className="h-3.5 w-3.5" />}>{s.restart}</Button>
+              <Button size="sm" className="uppercase text-warning" ghost onClick={() => runGateway("stop")} disabled={!gatewayRunning} prefix={<Power className="h-3.5 w-3.5" />}>{s.stop}</Button>
             </div>
           </CardContent>
           {(sharedGateway || servedNotice) && (
@@ -1203,7 +1169,7 @@ export default function SystemPage() {
       {/* ── Credential pool ───────────────────────────────────────── */}
       <section className="flex flex-col gap-3">
         <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
-          <KeyRound className="h-4 w-4" /> Credential pool
+          <KeyRound className="h-4 w-4" /> {s.credentialPoolHeading}
         </H2>
         <Card>
           <CardContent className="flex flex-col gap-4 py-4">
@@ -1223,7 +1189,7 @@ export default function SystemPage() {
             </div>
             <div className="flex justify-end">
               <Button size="sm" className="uppercase" onClick={addCredential} disabled={addingCred} prefix={addingCred ? <Spinner /> : undefined}>
-                Add key
+                {s.addKey}
               </Button>
             </div>
             {pool.length === 0 && (
@@ -1256,30 +1222,30 @@ export default function SystemPage() {
       {/* ── Operations ────────────────────────────────────────────── */}
       <section className="flex flex-col gap-3">
         <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
-          <Activity className="h-4 w-4" /> Operations
+          <Activity className="h-4 w-4" /> {s.operationsHeading}
         </H2>
         <Card>
           <CardContent className="flex flex-wrap gap-2 py-4">
             <Button size="sm" ghost prefix={<Terminal className="h-3.5 w-3.5" />} onClick={() => setConsoleOpen(true)}>
-              Open console
+              {s.openConsole}
             </Button>
             <Button size="sm" ghost prefix={<Stethoscope className="h-3.5 w-3.5" />} onClick={() => runOp(api.runDoctor, "Doctor")}>
-              Run doctor
+              {s.runDoctor}
             </Button>
             <Button size="sm" ghost prefix={<ShieldCheck className="h-3.5 w-3.5" />} onClick={() => runOp(api.runSecurityAudit, "Security audit")}>
-              Security audit
+              {s.securityAudit}
             </Button>
             <Button size="sm" ghost prefix={<RotateCw className="h-3.5 w-3.5" />} onClick={() => runOp(api.updateSkillsFromHub, "Skills update")}>
-              Update skills
+              {s.updateSkills}
             </Button>
             <Button size="sm" ghost prefix={<Activity className="h-3.5 w-3.5" />} onClick={() => runOp(api.runPromptSize, "Prompt size")}>
-              Prompt size
+              {s.promptSize}
             </Button>
             <Button size="sm" ghost prefix={<Database className="h-3.5 w-3.5" />} onClick={() => runOp(api.runDump, "Support dump")}>
-              Support dump
+              {s.supportDump}
             </Button>
             <Button size="sm" ghost prefix={<RotateCw className="h-3.5 w-3.5" />} onClick={() => runOp(api.runConfigMigrate, "Config migrate")}>
-              Migrate config
+              {s.migrateConfig}
             </Button>
           </CardContent>
         </Card>
@@ -1532,7 +1498,7 @@ export default function SystemPage() {
       {/* ── Checkpoints ───────────────────────────────────────────── */}
       <section className="flex flex-col gap-3">
         <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
-          <Database className="h-4 w-4" /> Checkpoints
+          <Database className="h-4 w-4" /> {s.checkpointsHeading}
         </H2>
         <Card>
           <CardContent className="flex items-center justify-between py-4">
@@ -1541,7 +1507,7 @@ export default function SystemPage() {
               {formatBytes(checkpoints?.total_bytes ?? 0)}
             </span>
             <Button size="sm" ghost className="text-destructive" disabled={!checkpoints?.sessions.length} prefix={<Trash2 className="h-3.5 w-3.5" />} onClick={() => checkpointsPrune.requestDelete("all")}>
-              Prune
+              {s.prune}
             </Button>
           </CardContent>
         </Card>
@@ -1551,10 +1517,10 @@ export default function SystemPage() {
       <section className="flex flex-col gap-3">
         <div className="flex items-center justify-between">
           <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
-            <Terminal className="h-4 w-4" /> Shell hooks
+            <Terminal className="h-4 w-4" /> {s.shellHooksHeading}
           </H2>
           <Button size="sm" className="uppercase" prefix={<Plus className="h-3.5 w-3.5" />} onClick={() => setHookModalOpen(true)}>
-            New hook
+            {s.newHook}
           </Button>
         </div>
         {(!hooks || hooks.hooks.length === 0) && (
@@ -1606,6 +1572,7 @@ function MemorySection({
   onReset: (target: "all" | "memory" | "user") => void;
 }) {
   const { t } = useI18n();
+  const s = pageStrings(t, "systemPage");
   const activeMemoryProvider = memory?.active
     ? memory.providers.find((provider) => provider.name === memory.active)
     : null;
@@ -1613,7 +1580,7 @@ function MemorySection({
   return (
       <section className="flex flex-col gap-3">
         <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
-          <Brain className="h-4 w-4" /> Memory
+          <Brain className="h-4 w-4" /> {s.memoryHeading}
         </H2>
         <Card>
           <CardContent className="flex flex-col gap-4 py-4">

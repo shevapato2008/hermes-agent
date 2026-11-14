@@ -39,6 +39,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { cn, themedBody } from "@/lib/utils";
 import { errorMessage } from "@/lib/api-error";
+import { usePageStrings } from "@/i18n/page-strings";
 import { RelayLinkPanel } from "./ChannelsRelayLink";
 
 // State → badge mapping. The backend emits a small, fixed vocabulary plus
@@ -156,11 +157,10 @@ function normalizeWhatsAppMode(mode: unknown): "bot" | "self-chat" | null {
 }
 
 export default function ChannelsPage() {
+  const s = usePageStrings("channelsPage");
   const [platforms, setPlatforms] = useState<MessagingPlatform[]>([]);
   const [envPath, setEnvPath] = useState("~/.hermes/.env");
-  const [gatewayStartCommand, setGatewayStartCommand] = useState(
-    "hermes gateway start",
-  );
+  const [gatewayStartCommand, setGatewayStartCommand] = useState("hermes gateway start");
   const [loading, setLoading] = useState(true);
   const { toast, showToast } = useToast();
   const { setEnd } = usePageHeader();
@@ -323,19 +323,13 @@ export default function ChannelsPage() {
 
   useLayoutEffect(() => {
     setEnd(
-      <Button
-        className="uppercase"
-        size="sm"
-        onClick={handleRestart}
-        disabled={restarting}
-        prefix={restarting ? <Spinner /> : <RotateCw className="h-4 w-4" />}
-      >
-        {restarting ? "Restarting…" : "Restart gateway"}
+      <Button className="uppercase" size="sm" onClick={handleRestart} disabled={restarting} prefix={restarting ? <Spinner /> : <RotateCw className="h-4 w-4" />}>
+        {restarting ? s.restarting : s.restartGateway}
       </Button>,
     );
     return () => setEnd(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [setEnd, restarting]);
+  }, [setEnd, restarting, s.restarting, s.restartGateway]);
 
   const configured = useMemo(
     () => platforms.filter((p) => p.configured).length,
@@ -360,9 +354,7 @@ export default function ChannelsPage() {
           <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-2 text-sm">
               <AlertTriangle className="h-4 w-4 shrink-0 text-warning" />
-              <span>
-                Changes are saved. Restart the gateway for them to take effect.
-              </span>
+              <span>{s.changesSavedRestartBanner}</span>
             </div>
             <Button
               size="sm"
@@ -371,7 +363,7 @@ export default function ChannelsPage() {
               disabled={restarting}
               prefix={restarting ? <Spinner /> : <RotateCw className="h-4 w-4" />}
             >
-              {restarting ? "Restarting…" : "Restart now"}
+              {restarting ? s.restarting : s.restartNow}
             </Button>
           </CardContent>
         </Card>
@@ -382,18 +374,20 @@ export default function ChannelsPage() {
           <CardContent className="flex items-center gap-2 p-4 text-sm text-muted-foreground">
             <WifiOff className="h-4 w-4 shrink-0" />
             <span>
-              The gateway is not running. Configure channels here, then start the
-              gateway with <code className="font-courier">{gatewayStartCommand}</code>{" "}
-              (or the Restart button above).
+              {s.gatewayStoppedPrefix}{" "}
+              <code className="font-courier">{gatewayStartCommand}</code>{" "}
+              {s.gatewayStoppedSuffix}
             </span>
           </CardContent>
         </Card>
       )}
 
       <p className="text-xs text-muted-foreground">
-        {configured} of {platforms.length} channels configured. Credentials are
-        written to <code className="font-courier">{envPath}</code>; the
-        gateway connects each enabled channel on its next restart.
+        {s.configuredSummaryPrefix
+          .replace("{configured}", String(configured))
+          .replace("{total}", String(platforms.length))}{" "}
+        <code className="font-courier">{envPath}</code>
+        {s.configuredSummarySuffix}
       </p>
 
       {/* Config modal */}
@@ -567,22 +561,11 @@ export default function ChannelsPage() {
               ))}
 
               <div className="flex flex-col-reverse gap-2 pt-1 sm:flex-row sm:justify-end">
-                <Button
-                  ghost
-                  size="sm"
-                  className="w-full sm:w-auto"
-                  onClick={() => setEditing(null)}
-                >
-                  Cancel
+                <Button ghost size="sm" className="w-full sm:w-auto" onClick={() => setEditing(null)}>
+                  {s.cancel}
                 </Button>
-                <Button
-                  className="w-full uppercase sm:w-auto"
-                  size="sm"
-                  onClick={handleSave}
-                  disabled={saving}
-                  prefix={saving ? <Spinner /> : undefined}
-                >
-                  {saving ? "Saving…" : "Save & enable"}
+                <Button className="w-full uppercase sm:w-auto" size="sm" onClick={handleSave} disabled={saving} prefix={saving ? <Spinner /> : undefined}>
+                  {saving ? s.saving : s.saveAndEnable}
                 </Button>
               </div>
             </div>
@@ -674,7 +657,7 @@ export default function ChannelsPage() {
                         )
                       }
                     >
-                      Test
+                      {s.test}
                     </Button>
                     {platform.id !== "telegram" && (
                       <Button
@@ -683,7 +666,7 @@ export default function ChannelsPage() {
                         onClick={() => openConfig(platform)}
                         prefix={<Settings2 className="h-4 w-4" />}
                       >
-                        Configure
+                        {s.configure}
                       </Button>
                     )}
                   </div>
