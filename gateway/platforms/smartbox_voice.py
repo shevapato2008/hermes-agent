@@ -122,7 +122,8 @@ class SmartBoxVoiceAdapter(BasePlatformAdapter):
     # BasePlatformAdapter lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        del is_reconnect
         try:
             self._sock = bind_unix_socket(self.socket_path)
             assert_uds_permissions(self.socket_path)

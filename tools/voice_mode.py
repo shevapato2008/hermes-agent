@@ -1200,7 +1200,11 @@ def _system_player_candidates(file_path: str) -> list[list[str]]:
         players.append(ps_cmd)
     players.append(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file_path])
     if system == "Linux":
-        players.append(["aplay", "-q", file_path])
+        players.append(["gst-play-1.0", "--no-interactive", "--quiet", file_path])
+        players.append(["play", "-q", file_path])
+        if file_path.lower().endswith(".wav"):
+            players.append(["paplay", file_path])
+            players.append(["aplay", "-q", file_path])
     return players
 
 
