@@ -26,6 +26,8 @@ describe("SmartBox 7-inch default theme and KaiTi font stacks", () => {
     const css = smartbox7InchTheme.customCSS ?? "";
     expect(css).toContain("@media (min-width: 1024px)");
     expect(css).toContain("#app-sidebar:not(.lg\\:w-14)");
+    expect(css).toContain('header[role="banner"] > div');
+    expect(css).toContain("padding-right: 6.75rem !important");
     expect(css).toContain("#app-sidebar > nav a");
     expect(css).toContain("min-height: 42px");
     expect(css).toContain("--text-secondary:");

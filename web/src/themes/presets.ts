@@ -260,6 +260,9 @@ html, body {
   #app-sidebar:not(.lg\\:w-14) {
     width: 15rem;
   }
+  header[role="banner"] > div {
+    padding-right: 6.75rem !important;
+  }
 }
 #app-sidebar > nav a {
   min-height: 42px;
