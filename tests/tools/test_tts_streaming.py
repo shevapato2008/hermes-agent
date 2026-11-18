@@ -1244,6 +1244,21 @@ def test_flush_drops_unterminated_think_tail(tag):
     assert chunker.flush() == ["The spoken part."]
 
 
+def test_chunker_char_by_char_cjk_coalesces_short_post_first_sentence():
+    from tools.tts_streaming import SentenceChunker
+
+    chunker = SentenceChunker()
+    emitted = []
+    text = "音量已经调小了，现在大约是百分之三十。需要再小一点或者调回去，跟我说一声就行。"
+    for ch in text:
+        emitted.extend(chunker.feed(ch))
+    emitted.extend(chunker.flush())
+    assert emitted == [
+        "音量已经调小了，",
+        "现在大约是百分之三十。需要再小一点或者调回去，跟我说一声就行。",
+    ]
+
+
 def test_generate_edge_tts_retries_transient_failures(monkeypatch, tmp_path):
     import asyncio
     from tools import tts_tool

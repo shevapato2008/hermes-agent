@@ -104,7 +104,7 @@ class SentenceChunker:
 
     def _first_valid_match(self, pattern: re.Pattern[str], min_chars: int) -> Optional[re.Match[str]]:
         start = 0
-        while m := pattern.search(self.buf, start):
+        while start <= len(self.buf) and (m := pattern.search(self.buf, start)):
             if len(self.buf[: m.end()].strip()) >= min_chars:
                 return m
             start = max(m.end(), m.start() + 1)
@@ -129,7 +129,7 @@ class SentenceChunker:
                 self.buf = self.buf[chosen.end() :]
                 self._emitted_first = True
         start = 0  # skip boundaries that would leave the head too short
-        while m := SENTENCE_BOUNDARY_RE.search(self.buf, start):
+        while start <= len(self.buf) and (m := SENTENCE_BOUNDARY_RE.search(self.buf, start)):
             head = self.buf[: m.end()]
             min_required = max(self.min_len, 18) if self._emitted_first else self._effective_min_len(head)
             if len(head.strip()) < min_required:
