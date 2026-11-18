@@ -321,16 +321,9 @@ def _tts_stream_begin(session_id: str | None = None, transport=None) -> Optional
     with _voice_output_start_barrier(session_id, transport) as allowed:
         if not allowed:
             return None
-        owner_sid, epoch, owner_transport, _capture_id = _voice_scope_snapshot()
-        authority_sid, authority_transport = _voice_authority_snapshot()
-        sid = str(session_id or owner_sid or authority_sid or "")
-        bound_transport = _voice_output_bound_transport(transport or owner_transport or authority_transport)
         _tts_stream_stop()
-        text_queue: queue.Queue = queue.Queue()
-        stop, done = threading.Event(), threading.Event()
-        on_play = lambda sentence: _voice_emit(
-            "voice.tts_sentence", {"text": sentence},
-            session_id=sid, lease_epoch=epoch, transport=bound_transport)
+        text_queue, stop, done = queue.Queue(), threading.Event(), threading.Event()
+        on_play = lambda sentence: _voice_emit("voice.tts_sentence", {"text": sentence})
 
         def _run_stream(q, stop_evt, done_evt):
             try:
