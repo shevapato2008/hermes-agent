@@ -47,6 +47,17 @@ class TestSentenceChunker:
             "A paragraph without punctuation\n\n"
         ]
 
+    def test_cjk_punctuation_streams_sentences_and_first_clause_without_spaces(self):
+        c = ts.SentenceChunker()
+        # First clause >= 8 chars cuts immediately on Chinese comma for low TTFA
+        assert c.feed("今天北京天气晴朗，") == ["今天北京天气晴朗，"]
+        # Subsequent Chinese sentences cut immediately on 。！？； without trailing whitespace
+        assert c.feed("最高气温二十五度。请问还需要查别的城市吗？尾句") == [
+            "最高气温二十五度。",
+            "请问还需要查别的城市吗？",
+        ]
+        assert c.flush() == ["尾句"]
+
 
 # ── Interruption latch ───────────────────────────────────────────────────
 

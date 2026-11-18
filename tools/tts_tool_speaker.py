@@ -106,7 +106,7 @@ class _SyncSentencePipeline:
     the bound keeps lookahead/temp files small and gives the caller backpressure.
     ``text_to_speech_tool`` / ``play_audio_file`` are resolved late so test patches apply."""
 
-    def __init__(self, stop_event: threading.Event, *, lookahead: int = 2):
+    def __init__(self, stop_event: threading.Event, *, lookahead: int = 3):
         self._stop = stop_event
         self._queue: queue.Queue[Optional[tuple[str, Future]]] = queue.Queue(maxsize=max(1, lookahead))
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-sync-synth")

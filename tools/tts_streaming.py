@@ -63,8 +63,13 @@ def take_speech_interrupted() -> bool:
     at, _interrupted_at = _interrupted_at, None
     return at is not None and time.monotonic() - at < _INTERRUPT_TTL_S
 
-# Sentence boundary: after .!? followed by whitespace, or a blank line.
-SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])(?:\s|\n)|(?:\n\n)")
+# Sentence boundary: after ASCII .!? followed by whitespace, after CJK sentence-ending
+# punctuation (。！？；…) with optional trailing whitespace, or a blank line.
+SENTENCE_BOUNDARY_RE = re.compile(
+    r"(?<=[.!?])(?:\s|\n)|(?<=[。！？；…])\s*|(?:\n\n)"
+)
+_CJK_CLAUSE_BOUNDARY_RE = re.compile(r"(?<=[，、：])\s*")
+_CJK_CHAR_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 # Reasoning tags come from the one canonical list (agent.think_scrubber), matched case-insensitively,
 # so feed() and flush() strip/cut exactly the tags every other reasoning-hiding surface does.
 _THINK_NAMES = "|".join(re.escape(name) for name in THINK_TAG_NAMES)
@@ -80,6 +85,7 @@ class SentenceChunker:
     def __init__(self, min_len: int = 20):
         self.min_len = min_len
         self.buf = ""
+        self._emitted_first = False
 
     @classmethod
     def from_config(cls, tts_config: dict) -> SentenceChunker:
@@ -91,6 +97,11 @@ class SentenceChunker:
         except (AttributeError, TypeError, ValueError):  # non-mapping / non-numeric → default
             return cls()
 
+    def _effective_min_len(self, text: str) -> int:
+        if _CJK_CHAR_RE.search(text):
+            return min(self.min_len, 6)
+        return self.min_len
+
     def feed(self, delta: str) -> list[str]:
         """Absorb *delta*; return every complete sentence now ready to speak."""
         self.buf = _THINK_BLOCK_RE.sub("", self.buf + delta)
@@ -100,12 +111,30 @@ class SentenceChunker:
         start = 0  # skip boundaries that would leave the head too short
         while m := SENTENCE_BOUNDARY_RE.search(self.buf, start):
             head = self.buf[: m.end()]
-            if len(head.strip()) < self.min_len:
+            if len(head.strip()) < self._effective_min_len(head):
                 start = m.end()
                 continue
             out.append(head)
             self.buf = self.buf[m.end():]
+            self._emitted_first = True
             start = 0
+        # Fast-start first CJK clause on comma/colon (>= 8 chars) or split long CJK
+        # run-on clauses (>= 45 chars) so streaming TTS starts immediately and never stalls.
+        if _CJK_CHAR_RE.search(self.buf):
+            clause_min = max(8 if not self._emitted_first else 15, self._effective_min_len(self.buf))
+            if not self._emitted_first or len(self.buf.strip()) >= 45:
+                start = 0
+                while m := _CJK_CLAUSE_BOUNDARY_RE.search(self.buf, start):
+                    head = self.buf[: m.end()]
+                    if len(head.strip()) < clause_min:
+                        start = m.end()
+                        continue
+                    out.append(head)
+                    self.buf = self.buf[m.end():]
+                    self._emitted_first = True
+                    start = 0
+                    if self._emitted_first and len(self.buf.strip()) < 45:
+                        break
         return out
 
     def flush(self) -> list[str]:
