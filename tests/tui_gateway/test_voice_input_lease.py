@@ -1951,3 +1951,4 @@ def test_wake_diagnostics_rpc_is_strict_and_owner_scoped(voice, monkeypatch):
     assert resets == [True]
     invalid = voice.rpc(owner, "wake.diagnostics", reset="yes")
     assert invalid["error"]["code"] == 4001
+

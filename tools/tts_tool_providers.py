@@ -9,15 +9,18 @@ are resolved through :func:`_origin` at call time.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import json
 import logging
 import os
+import queue
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 from urllib.parse import urlparse
 
 from tools.tts_tool_delivery import _origin, _section, _wrap_pcm_as_wav, _write_wav_bytes_as
@@ -193,15 +196,96 @@ def _rewrite_with_auxiliary_model(
 
 
 # --- Edge TTS (free default) ---
-async def _generate_edge_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
-    edge_tts = _origin()._import_edge_tts()
+def _edge_tts_kwargs(tts_config: dict[str, Any]) -> dict[str, Any]:
     edge_config = tts_config.get("edge") or {}
     speed = float(edge_config.get("speed", tts_config.get("speed", 1.0)))
-    kwargs = {"voice": edge_config.get("voice", DEFAULT_EDGE_VOICE)}
+    kwargs: dict[str, Any] = {"voice": edge_config.get("voice", DEFAULT_EDGE_VOICE)}
     if speed != 1.0:
         kwargs["rate"] = f"{round((speed - 1.0) * 100):+d}%"
-    await edge_tts.Communicate(text, **kwargs).save(output_path)
+    return kwargs
+
+
+async def _generate_edge_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
+    edge_tts = _origin()._import_edge_tts()
+    kwargs = _edge_tts_kwargs(tts_config)
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await edge_tts.Communicate(text, **kwargs).save(output_path)
+            return output_path
+        except Exception as exc:
+            if attempt >= max_attempts:
+                raise
+            logger.warning(
+                "Edge TTS synthesis attempt %d/%d failed (%s); retrying in 0.35s...",
+                attempt, max_attempts, exc,
+            )
+            await asyncio.sleep(0.35)
     return output_path
+
+
+def stream_edge_tts_mp3_chunks(
+    text: str,
+    stop_event: Optional[threading.Event] = None,
+    tts_config: Optional[dict[str, Any]] = None,
+) -> Iterator[bytes]:
+    """Stream MP3 byte chunks from ``edge_tts.Communicate(...).stream()`` synchronously."""
+    origin = _origin()
+    edge_tts = origin._import_edge_tts()
+    cfg = origin._load_tts_config() if tts_config is None else tts_config
+    kwargs = _edge_tts_kwargs(cfg)
+    chunk_q: queue.Queue[object] = queue.Queue()
+    sentinel = object()
+    errors: list[BaseException] = []
+
+    async def _produce() -> None:
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            emitted_any = False
+            try:
+                comm = edge_tts.Communicate(text, **kwargs)
+                async for item in comm.stream():
+                    if stop_event is not None and stop_event.is_set():
+                        return
+                    if isinstance(item, dict) and item.get("type") == "audio":
+                        data = item.get("data")
+                        if data:
+                            emitted_any = True
+                            chunk_q.put(bytes(data))
+                return
+            except Exception as exc:  # health: allow BLE001 -- re-raised on consumer thread via errors list
+                if emitted_any or attempt >= max_attempts or (stop_event is not None and stop_event.is_set()):
+                    errors.append(exc)
+                    return
+                logger.warning(
+                    "Edge TTS stream attempt %d/%d failed before first chunk (%s); retrying in 0.35s...",
+                    attempt, max_attempts, exc,
+                )
+                await asyncio.sleep(0.35)
+
+    def _runner() -> None:
+        try:
+            asyncio.run(_produce())
+        except BaseException as exc:  # health: allow BLE001 -- thread boundary: forward exception to consumer via errors list
+            errors.append(exc)
+        finally:
+            chunk_q.put(sentinel)
+
+    from agent.memory_provider import spawn_context_thread
+    worker = spawn_context_thread(_runner, name="edge-tts-stream")
+    worker.start()
+    try:
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                break
+            item = chunk_q.get()
+            if item is sentinel:
+                break
+            yield item  # type: ignore[misc]
+        if errors and not (stop_event is not None and stop_event.is_set()):
+            raise errors[0]
+    finally:
+        worker.join(timeout=2.0)
 
 
 # --- ElevenLabs ---

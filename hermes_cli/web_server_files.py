@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import stat
+import sys
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -397,6 +398,11 @@ def _dashboard_local_update_managed_externally() -> bool:
     from hermes_cli.web_server import PROJECT_ROOT
     from hermes_cli.config import detect_install_method
     if _default_hermes_root_is_opt_data():
+        return True
+    if (
+        str(Path(sys.prefix).resolve(strict=False)).startswith("/opt/smartbox")
+        or str(PROJECT_ROOT.resolve(strict=False)).startswith("/opt/smartbox")
+    ):
         return True
     try:
         from hermes_constants import is_container

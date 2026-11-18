@@ -6326,6 +6326,12 @@ export interface VoiceOutputDrainedPayload {
   lease_epoch: number
   capture_id?: string | null
 }
+export interface VoiceTtsSentencePayload {
+  owner_session_id: string
+  lease_epoch: number
+  capture_id?: string | null
+  text: string
+}
 /** ``methods_voice`` wake detector ``_on_detect``. */
 export interface WakeDetectedPayload {
   phrase: string
@@ -7537,6 +7543,8 @@ export interface BackendGatewayEventMap {
   'voice.status': VoiceStatusPayload
   /** A voice capture produced text (or a stop phrase / silence limit). */
   'voice.transcript': VoiceTranscriptPayload
+  /** A TTS sentence began speaker playback. */
+  'voice.tts_sentence': VoiceTtsSentencePayload
   /** A wake phrase fired. */
   'wake.detected': WakeDetectedPayload
 }
@@ -7623,5 +7631,6 @@ export const GATEWAY_EVENT_TYPES = [
   'voice.partial',
   'voice.status',
   'voice.transcript',
+  'voice.tts_sentence',
   'wake.detected'
 ] as const satisfies readonly BackendGatewayEventName[]

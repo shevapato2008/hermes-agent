@@ -361,6 +361,7 @@ class TestAudioRecorder:
 
         assert recorder.is_recording is True
         mock_sd.InputStream.assert_called_once()
+        assert mock_sd.InputStream.call_args.kwargs.get("blocksize") == 480
         mock_stream.start.assert_called_once()
 
     def test_ensure_stream_rebuilds_inactive_stream(self, mock_sd):
@@ -1482,6 +1483,69 @@ class TestFullDuplexListen:
         # Trip must come from the post-grace speech, not the onset transient:
         # by the time capture starts, we're past calib+transient+bleed blocks.
         assert stream.reads > self.CALIB + 8 + 40
+
+    def test_full_duplex_streams_pre_roll_and_capture_to_live_stt_after_trigger(
+        self, mock_sd, monkeypatch
+    ):
+        phases = []
+        partials = []
+        pushed_chunks = []
+        parked = []
+
+        class _FakeLive:
+            provider = "openai"
+
+            def __init__(self, on_partial=None):
+                self.on_partial = on_partial
+                self.rate = None
+                self.cancelled = False
+                self.ended = False
+
+            def set_input_rate(self, rate):
+                self.rate = rate
+
+            def push_audio(self, pcm):
+                pushed_chunks.append(pcm)
+                if len(pushed_chunks) == 1 and self.on_partial is not None:
+                    self.on_partial("流式部分识别")
+
+            def end_audio(self):
+                self.ended = True
+
+            def cancel(self):
+                self.cancelled = True
+
+        live_sessions = []
+
+        def fake_open_streaming_session(on_partial=None, **_kw):
+            assert phases == ["generation"], "live STT must open only after on_trigger fires"
+            sess = _FakeLive(on_partial=on_partial)
+            live_sessions.append(sess)
+            return sess
+
+        monkeypatch.setattr(
+            "tools.transcription_streaming.open_streaming_session",
+            fake_open_streaming_session,
+        )
+        monkeypatch.setattr(
+            "tools.voice_mode._park_live_session",
+            lambda wav_path, sess: parked.append((wav_path, sess)),
+        )
+
+        levels = [100] * self.CALIB + [5000] * 30 + [0] * 100
+        path, _, _ = self._run(
+            mock_sd,
+            monkeypatch,
+            levels,
+            on_trigger=lambda phase: phases.append(phase),
+            on_partial=lambda text: partials.append(text),
+        )
+        assert path == "/tmp/fd.wav"
+        assert len(live_sessions) == 1
+        assert live_sessions[0].rate == 16000
+        assert len(pushed_chunks) > 10
+        assert partials == ["流式部分识别"]
+        assert parked == [("/tmp/fd.wav", live_sessions[0])]
 
 class TestGetBeepVolume:
     """Issue #55908: beep amplitude must come from config.yaml, with safe fallback."""

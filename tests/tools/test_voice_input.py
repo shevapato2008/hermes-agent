@@ -116,6 +116,7 @@ def test_pulse_cli_is_mono_16k_s16le_scrubs_credentials_and_reaps(monkeypatch):
     argv, kwargs = opened[0]
     assert argv == [
         "parec", "--raw", "--format=s16le", "--rate=16000", "--channels=1",
+        "--latency-msec=30", "--process-time-msec=15",
         "--device=echo-cancel-source",
     ]
     assert kwargs["env"]["PULSE_SERVER"] == "unix:/run/smartbox/pulse/native"

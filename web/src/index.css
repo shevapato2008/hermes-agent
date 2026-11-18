@@ -71,8 +71,8 @@
     Consolas, "SmartBox Kai", "LXGW WenKai", "Kaiti SC", "STKaiti", "KaiTi",
     "AR PL UKai CN", "TW-Kai", monospace;
   --theme-font-display: var(--theme-font-sans);
-  --theme-base-size: 18px;
-  --theme-line-height: 1.58;
+  --theme-base-size: 20px;
+  --theme-line-height: 1.55;
   --theme-letter-spacing: 0;
 
   /* Override @nous-research/ui display & mono vars so Chinese glyphs fall

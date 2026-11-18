@@ -21,8 +21,6 @@ import pytest
 
 import tools.tts_streaming as ts
 
-pytest.importorskip("numpy")
-
 
 # ── SentenceChunker ──────────────────────────────────────────────────────
 
@@ -48,15 +46,22 @@ class TestSentenceChunker:
         ]
 
     def test_cjk_punctuation_streams_sentences_and_first_clause_without_spaces(self):
-        c = ts.SentenceChunker()
-        # First clause >= 8 chars cuts immediately on Chinese comma for low TTFA
+        c = ts.SentenceChunker(min_len=6)
+        # First clause >= 6 chars cuts immediately on Chinese comma for low TTFA
         assert c.feed("今天北京天气晴朗，") == ["今天北京天气晴朗，"]
-        # Subsequent Chinese sentences cut immediately on 。！？； without trailing whitespace
+        # Subsequent Chinese sentences coalesce short fragments up to >= 18 chars on 。！？… without trailing whitespace
         assert c.feed("最高气温二十五度。请问还需要查别的城市吗？尾句") == [
-            "最高气温二十五度。",
-            "请问还需要查别的城市吗？",
+            "最高气温二十五度。请问还需要查别的城市吗？",
         ]
         assert c.flush() == ["尾句"]
+
+    def test_sentence_chunker_fast_starts_first_clause_then_coalesces_subsequent_clauses(self):
+        chunker = ts.SentenceChunker(min_len=6)
+        text = "如果你没听清，我就先按最常见的方案给你安排：成都5天经典线。第一天：在成都市区，宽窄巷子、锦里、武侯祠。"
+        chunks = list(chunker.feed(text))
+        chunks.extend(chunker.flush())
+        assert chunks[0] == "如果你没听清，"
+        assert len(chunks) <= 3
 
 
 # ── Interruption latch ───────────────────────────────────────────────────
@@ -215,6 +220,7 @@ def _drain_queue(sentences):
 
 
 def _sd_mock():
+    pytest.importorskip("numpy")
     sd = MagicMock()
     out = MagicMock()
     sd.OutputStream.return_value = out
@@ -1236,3 +1242,201 @@ def test_flush_drops_unterminated_think_tail(tag):
     chunker = SentenceChunker()
     assert chunker.feed(f"The spoken part. {tag}half-formed reas") == []
     assert chunker.flush() == ["The spoken part."]
+
+
+def test_generate_edge_tts_retries_transient_failures(monkeypatch, tmp_path):
+    import asyncio
+    from tools import tts_tool
+    from tools import tts_tool_providers
+
+    attempts = []
+
+    def _write_mp3(output_path: str) -> None:
+        with open(output_path, "wb") as fh:
+            fh.write(b"ID3-mp3-data")
+
+    class _FakeCommunicate:
+        def __init__(self, text, **kwargs):
+            self.text = text
+            self.kwargs = kwargs
+
+        async def save(self, output_path):
+            attempts.append(output_path)
+            if len(attempts) < 3:
+                raise ConnectionError("temporary DNS error")
+            _write_mp3(output_path)
+
+    fake_edge = MagicMock(Communicate=_FakeCommunicate)
+    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: fake_edge)
+    sleeps = []
+
+    async def _fast_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(tts_tool_providers.asyncio, "sleep", _fast_sleep)
+    out = str(tmp_path / "retry.mp3")
+    res = asyncio.run(tts_tool_providers._generate_edge_tts("你好", out, {}))
+    assert res == out
+    assert len(attempts) == 3
+    assert sleeps == [0.35, 0.35]
+
+
+def test_sync_pipeline_pipes_edge_mp3_chunks_to_gst_launch_and_emits_on_sentence_play(monkeypatch):
+    from tools import tts_tool
+    from tools import tts_tool_providers
+    from tools import tts_tool_speaker
+
+    played_sentences = []
+    piped_procs = []
+
+    class _FakeStdin:
+        def __init__(self):
+            self.data = bytearray()
+            self.closed = False
+
+        def write(self, b):
+            self.data.extend(b)
+            return len(b)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs):
+            self.argv = list(argv)
+            self.stdin = _FakeStdin()
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            self.returncode = -15
+
+    def _fake_popen(argv, **kwargs):
+        proc = _FakeProc(argv, **kwargs)
+        piped_procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "edge", "streaming": {"min_len": 6}})
+    monkeypatch.setattr(tts_tool, "_get_provider", lambda cfg: "edge")
+    monkeypatch.setattr(tts_tool, "_importable", lambda importer: True)
+    monkeypatch.setattr(
+        tts_tool_providers,
+        "stream_edge_tts_mp3_chunks",
+        lambda text, stop_event=None, tts_config=None: iter([b"MP3A", b"MP3B"]),
+    )
+    monkeypatch.setattr(
+        tts_tool_speaker.shutil,
+        "which",
+        lambda name: "/usr/bin/gst-launch-1.0" if name == "gst-launch-1.0" else None,
+    )
+    monkeypatch.setattr(tts_tool_speaker.subprocess, "Popen", _fake_popen)
+    fake_vm = MagicMock()
+    monkeypatch.setitem(sys.modules, "tools.voice_mode", fake_vm)
+
+    q = _drain_queue(["如果你没听清，", "我就先按最常见的方案给你安排：成都5天经典线。"])
+    stop, done = threading.Event(), threading.Event()
+    with patch("tools.tts_streaming.resolve_streaming_provider", return_value=None):
+        tts_tool_speaker.stream_tts_to_speaker(
+            q, stop, done, on_sentence_play=played_sentences.append
+        )
+
+    assert done.is_set()
+    assert played_sentences == [
+        "如果你没听清，",
+        "我就先按最常见的方案给你安排：成都5天经典线。",
+    ]
+    assert len(piped_procs) == 2
+    assert piped_procs[0].argv[:4] == ["gst-launch-1.0", "-q", "fdsrc", "fd=0"]
+    assert bytes(piped_procs[0].stdin.data) == b"MP3AMP3B"
+    assert piped_procs[0].stdin.closed is True
+
+
+def test_tui_gateway_tts_stream_begin_and_full_duplex_listener_emit_voice_events(monkeypatch):
+    import types
+    from tui_gateway import server
+
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_voice_emit",
+        lambda event, payload=None, **scope: emitted.append((event, payload, scope)) or True,
+    )
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    transport = types.SimpleNamespace(_closed=False, send_line=lambda _line: None)
+    epoch = server._acquire_voice_lease("sid-1", transport)
+    monkeypatch.setattr(server, "_arm_barge_listener_if_enabled", lambda *_a: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.tts_tool",
+        types.SimpleNamespace(check_tts_requirements=lambda: True),
+    )
+
+    captured_on_play = []
+
+    def fake_stream(q, stop_evt, done_evt, *, on_sentence_play=None, **_kw):
+        captured_on_play.append(on_sentence_play)
+        if on_sentence_play is not None:
+            on_sentence_play("第一句播报。")
+        done_evt.set()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.tts_tool_speaker",
+        types.SimpleNamespace(stream_tts_to_speaker=fake_stream),
+    )
+
+    class _InlineThread:
+        def __init__(self, *, target, args=(), **_kw):
+            self.target, self.args = target, args
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(
+        server,
+        "_start_voice_thread",
+        lambda target, *, name, args=(): _InlineThread(target=target, args=args).start(),
+    )
+
+    q = server._tts_stream_begin("sid-1", transport)
+    assert q is not None
+    assert len(captured_on_play) == 1 and callable(captured_on_play[0])
+    assert any(
+        ev == "voice.tts_sentence" and payload == {"text": "第一句播报。"}
+        for ev, payload, _ in emitted
+    )
+
+    emitted.clear()
+    monkeypatch.setattr(server, "_fd_trip", lambda *_a: True)
+
+    def fake_fd_listen(_should_stop, *, on_trigger=None, on_partial=None, **_kw):
+        on_trigger("generation")
+        assert callable(on_partial)
+        on_partial("流式识别中")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.voice_mode",
+        types.SimpleNamespace(
+            full_duplex_listen=fake_fd_listen,
+            is_audio_output_active=lambda: False,
+            transcribe_recording=lambda _p: {"success": True, "transcript": ""},
+        ),
+    )
+    server._full_duplex_listener("sid-1", epoch, transport)
+    assert any(
+        ev == "voice.partial" and payload == {"text": "流式识别中"}
+        for ev, payload, _ in emitted
+    )
+    server._release_voice_lease(session_id="sid-1", lease_epoch=epoch, transport=transport, stop_loop=False)
+
+

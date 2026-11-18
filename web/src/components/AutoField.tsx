@@ -82,6 +82,37 @@ function NestedValueEditor({
   );
 }
 
+function SelectAutoField({
+  label,
+  schemaKey,
+  schema,
+  value,
+  onChange,
+}: AutoFieldProps & { label: string }) {
+  const rawOptions = (schema.options as string[]) ?? [];
+  const optionLabels = isRecord(schema.option_labels)
+    ? (schema.option_labels as Record<string, string>)
+    : {};
+  const currentStr = String(value ?? "");
+  const options =
+    currentStr && !rawOptions.includes(currentStr)
+      ? [...rawOptions, currentStr]
+      : rawOptions;
+  return (
+    <div className="grid gap-1.5">
+      <Label className="text-sm">{label}</Label>
+      <FieldHint schema={schema} schemaKey={schemaKey} />
+      <Select value={currentStr} onValueChange={(v) => onChange(v)}>
+        {options.map((opt) => (
+          <SelectOption key={opt} value={opt}>
+            {optionLabels[opt] || opt || "(none)"}
+          </SelectOption>
+        ))}
+      </Select>
+    </div>
+  );
+}
+
 export function AutoField({
   schemaKey,
   schema,
@@ -114,19 +145,14 @@ export function AutoField({
   }
 
   if (schema.type === "select") {
-    const options = (schema.options as string[]) ?? [];
     return (
-      <div className="grid gap-1.5">
-        <Label className="text-sm">{label}</Label>
-        <FieldHint schema={schema} schemaKey={schemaKey} />
-        <Select value={String(value ?? "")} onValueChange={(v) => onChange(v)}>
-          {options.map((opt) => (
-            <SelectOption key={opt} value={opt}>
-              {opt || "(none)"}
-            </SelectOption>
-          ))}
-        </Select>
-      </div>
+      <SelectAutoField
+        label={label}
+        schemaKey={schemaKey}
+        schema={schema}
+        value={value}
+        onChange={onChange}
+      />
     );
   }
 

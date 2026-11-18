@@ -17,10 +17,12 @@ import logging
 import os
 import platform
 import queue
+import shutil
+import subprocess
 import tempfile
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Callable, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Iterable, Iterator, List, Optional
 
 from agent.memory_provider import ctx_bound, spawn_context_thread
 from tools.tts_text_normalize import _strip_markdown_for_tts
@@ -98,6 +100,32 @@ def _first_written_artifact(raw: object, requested: str) -> str:
     return requested
 
 
+_STOCK_WHICH = shutil.which
+
+
+def _edge_pipe_player_cmd() -> Optional[list[str]]:
+    if shutil.which("gst-launch-1.0"):
+        return [
+            "gst-launch-1.0", "-q", "fdsrc", "fd=0",
+            "!", "decodebin", "!", "audioconvert", "!", "audioresample", "!", "pulsesink",
+        ]
+    if (platform.system() != "Darwin" or shutil.which is not _STOCK_WHICH) and shutil.which("ffplay"):
+        return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"]
+    return None
+
+
+def _can_stream_edge_pipe(tts_config: dict, preferred: Optional[str] = None) -> bool:
+    if _edge_pipe_player_cmd() is None:
+        return False
+    origin = _origin()
+    provider = (preferred or origin._get_provider(tts_config)).lower().strip()
+    if provider != "edge" or origin._resolve_command_provider_config("edge", tts_config) is not None:
+        return False
+    if getattr(origin.text_to_speech_tool, "__module__", "") != "tools.tts_tool":
+        return False
+    return bool(origin._importable(origin._import_edge_tts))
+
+
 class _SyncSentencePipeline:
     """Overlap per-sentence synthesis with playback for non-streaming providers.
 
@@ -106,26 +134,132 @@ class _SyncSentencePipeline:
     the bound keeps lookahead/temp files small and gives the caller backpressure.
     ``text_to_speech_tool`` / ``play_audio_file`` are resolved late so test patches apply."""
 
-    def __init__(self, stop_event: threading.Event, *, lookahead: int = 3):
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        *,
+        lookahead: int = 3,
+        on_sentence_play: Optional[Callable[[str], None]] = None,
+        use_edge_pipe: bool = False,
+        tts_config: Optional[dict[str, Any]] = None,
+    ):
         self._stop = stop_event
-        self._queue: queue.Queue[Optional[tuple[str, Future]]] = queue.Queue(maxsize=max(1, lookahead))
+        self._on_sentence_play = on_sentence_play
+        self._use_edge_pipe = use_edge_pipe
+        self._tts_config = tts_config
+        self._queue: queue.Queue[Optional[tuple[str, Future, Optional[queue.Queue[Optional[bytes]]]]]] = (
+            queue.Queue(maxsize=max(1, lookahead))
+        )
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-sync-synth")
         self._player = spawn_context_thread(self._drain, name="tts-sync-play")
         self._player.start()
 
+    def _notify_sentence_play(self, sentence: str) -> None:
+        if self._on_sentence_play is not None and sentence and not self._stop.is_set():
+            try:
+                self._on_sentence_play(sentence)
+            except Exception:
+                logger.debug("on_sentence_play callback failed", exc_info=True)
+
     def speak(self, cleaned: str) -> None:
         """Queue one sentence. Blocks only when the lookahead bound is full."""
-        if not self._stop.is_set():
+        if self._stop.is_set():
+            return
+        if self._use_edge_pipe:
+            chunk_queue: queue.Queue[Optional[bytes]] = queue.Queue()
             self._queue.put((
                 cleaned,
-                self._executor.submit(ctx_bound(self._synthesize_to_tmp), cleaned),
+                self._executor.submit(ctx_bound(self._prefetch_edge_chunks), cleaned, chunk_queue),
+                chunk_queue,
             ))
+            return
+        self._queue.put((
+            cleaned,
+            self._executor.submit(ctx_bound(self._synthesize_to_tmp), cleaned),
+            None,
+        ))
 
     def close(self) -> None:
         """Flush queued sentences in order (skipped if stopped), then join."""
         self._queue.put(None)
         self._player.join()
         self._executor.shutdown(wait=True)
+
+    def _prefetch_edge_chunks(self, cleaned: str, chunk_queue: queue.Queue[Optional[bytes]]) -> None:
+        try:
+            if self._stop.is_set():
+                return
+            from tools.tts_tool_providers import stream_edge_tts_mp3_chunks
+            for chunk in stream_edge_tts_mp3_chunks(cleaned, stop_event=self._stop, tts_config=self._tts_config):
+                if self._stop.is_set():
+                    break
+                if chunk:
+                    chunk_queue.put(chunk)
+        except Exception as exc:
+            logger.warning("Edge streaming TTS prefetch failed: %s", exc, exc_info=True)
+        finally:
+            chunk_queue.put(None)
+
+    def _play_edge_chunk_queue(self, sentence: str, chunk_queue: queue.Queue[Optional[bytes]]) -> None:
+        first = chunk_queue.get()
+        if first is None or self._stop.is_set():
+            return
+        cmd = _edge_pipe_player_cmd()
+        if cmd is None:
+            return
+        try:
+            from tools.voice_mode import (
+                _playback_lock,
+                _set_active_playback,
+                mark_audio_output_active,
+            )
+            import tools.voice_mode as _voice_mode
+        except Exception:
+            logger.debug("voice_mode playback helpers unavailable", exc_info=True)
+            _playback_lock = threading.Lock()
+            _voice_mode = None
+            _set_active_playback = lambda _proc: None
+            mark_audio_output_active = lambda _active: None
+        proc = None
+        mark_audio_output_active(True)
+        try:
+            from tools.environments.local import hermes_subprocess_env
+
+            self._notify_sentence_play(sentence)
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=hermes_subprocess_env(inherit_credentials=False),
+            )
+            _set_active_playback(proc)
+            assert proc.stdin is not None
+            for chunk in itertools.chain([first], iter(chunk_queue.get, None)):
+                if self._stop.is_set():
+                    break
+                try:
+                    proc.stdin.write(chunk)
+                except BrokenPipeError:
+                    break
+            with contextlib.suppress(Exception):
+                proc.stdin.close()
+            if self._stop.is_set():
+                with contextlib.suppress(Exception):
+                    proc.terminate()
+            proc.wait(timeout=120)
+        except Exception as exc:
+            logger.warning("Edge pipe TTS playback failed: %s", exc, exc_info=True)
+            if proc is not None and proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    proc.terminate()
+                    proc.wait(timeout=5)
+        finally:
+            if _voice_mode is not None:
+                with _playback_lock:
+                    if getattr(_voice_mode, "_active_playback", None) is proc:
+                        _voice_mode._active_playback = None
+            mark_audio_output_active(False)
 
     def _synthesize_to_tmp(self, cleaned: str) -> Optional[str]:
         if self._stop.is_set():
@@ -145,11 +279,17 @@ class _SyncSentencePipeline:
             return None
 
     def _drain(self) -> None:
-        for _sentence, future in iter(self._queue.get, None):
+        for sentence, future, chunk_queue in iter(self._queue.get, None):
+            if chunk_queue is not None:
+                self._play_edge_chunk_queue(sentence, chunk_queue)
+                with contextlib.suppress(Exception):
+                    future.result(timeout=5)
+                continue
             tmp_path = None
             try:
                 tmp_path = future.result()
                 if tmp_path and not self._stop.is_set() and os.path.isfile(tmp_path) and os.path.getsize(tmp_path) > 0:
+                    self._notify_sentence_play(sentence)
                     from tools.voice_mode import play_audio_file
                     play_audio_file(tmp_path)
             except Exception as exc:
@@ -169,20 +309,35 @@ class _StreamerPlayback:
     _MAX_REINIT = 3
     _CHUNK_QUEUE_MAX = 64
 
-    def __init__(self, streamer, stop_event: threading.Event):
+    def __init__(
+        self,
+        streamer,
+        stop_event: threading.Event,
+        *,
+        on_sentence_play: Optional[Callable[[str], None]] = None,
+    ):
         self.streamer, self.stop_event = streamer, stop_event
+        self._on_sentence_play = on_sentence_play
         # The device is opened lazily, once the first sentence's first chunk has arrived: an
         # OpenAI-compatible endpoint reports its real PCM rate in the response headers, so
         # ``streamer.sample_rate`` is only trustworthy after the request answered (#76466).
         self.output_stream = None
         self._use_device = self._device_usable()
         self._audio_queue: queue.Queue[Optional[queue.Queue[Optional[bytes]]]] = queue.Queue()
+        self._sentence_texts: queue.Queue[str] = queue.Queue()
         self._prefetch_threads: list[threading.Thread] = []
         self._prefetch_sem = threading.Semaphore(3)
         self._worker = spawn_context_thread(
             self._playback_worker, name="tts-stream-play"
         )
         self._worker.start()
+
+    def _notify_sentence_play(self, sentence: str) -> None:
+        if self._on_sentence_play is not None and sentence and not self.stop_event.is_set():
+            try:
+                self._on_sentence_play(sentence)
+            except Exception:
+                logger.debug("on_sentence_play callback failed", exc_info=True)
 
     def _create_output_stream(self):
         sd = _origin()._import_sounddevice()
@@ -237,6 +392,7 @@ class _StreamerPlayback:
             return
         self._prefetch_sem.acquire()
         chunk_queue: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=self._CHUNK_QUEUE_MAX)
+        self._sentence_texts.put(text)
         self._audio_queue.put(chunk_queue)
         self._prefetch_threads.append(spawn_context_thread(
             self._consume_to_queue,
@@ -258,15 +414,21 @@ class _StreamerPlayback:
             chunk_queue.put(None)  # sentinel: no more chunks
             self._prefetch_sem.release()
 
-    def _play_sentence_via_tempfile(self, chunk_queue) -> None:
+    def _play_sentence_via_tempfile(self, chunk_queue, sentence: str = "") -> None:
         chunks = _drain_chunks(chunk_queue)  # drained first: the rate is final once chunks exist
+        if chunks and not self.stop_event.is_set():
+            self._notify_sentence_play(sentence)
         _play_via_tempfile(chunks, self.stop_event, self.streamer.sample_rate)
 
-    def _for_each_sentence(self, play: Callable[[queue.Queue], None]) -> None:
+    def _for_each_sentence(self, play: Callable[..., None]) -> None:
         """Feed queued sentences to *play* in order until the end sentinel; stopped sentences are skipped."""
         for chunk_queue in iter(self._audio_queue.get, None):
+            try:
+                sentence = self._sentence_texts.get_nowait()
+            except queue.Empty:
+                sentence = ""
             if not self.stop_event.is_set():
-                play(chunk_queue)
+                play(chunk_queue, sentence)
 
     def _write_pcm(self, buf: bytes) -> None:
         self._current_stream.write(self._np.frombuffer(buf, dtype="<i2").reshape(-1, 1))
@@ -291,12 +453,13 @@ class _StreamerPlayback:
         self._current_stream = self.output_stream
         return self._current_stream is not None
 
-    def _play_sentence_via_stream(self, chunk_queue) -> None:
+    def _play_sentence_via_stream(self, chunk_queue, sentence: str = "") -> None:
         """Write one sentence's PCM to PortAudio; after an unrecoverable write failure the rest is dropped."""
         chunks = iter(chunk_queue.get, None)
         first = next(chunks, None)  # blocks until the endpoint answered: the rate is final now
         if first is None:
             return
+        self._notify_sentence_play(sentence)
         chunks = itertools.chain([first], chunks)
         if not self._ensure_output_stream():
             _play_via_tempfile(list(chunks), self.stop_event, self.streamer.sample_rate)
@@ -339,7 +502,8 @@ class _StreamerPlayback:
 
 def stream_tts_to_speaker(
     text_queue: queue.Queue, stop_event: threading.Event, tts_done_event: threading.Event,
-    display_callback: Optional[Callable[[str], None]] = None, provider: Optional[str] = None):
+    display_callback: Optional[Callable[[str], None]] = None, provider: Optional[str] = None,
+    on_sentence_play: Optional[Callable[[str], None]] = None):
     """Consume text deltas from *text_queue*, cut into sentences, speak each the moment it's ready.
 
     A registered streaming provider plays chunked PCM; every other provider is spoken
@@ -358,12 +522,17 @@ def stream_tts_to_speaker(
         streamer = resolve_streaming_provider(tts_config, preferred=provider)
         stream_max_len = 0
         if streamer is None:
-            sync_pipeline = _SyncSentencePipeline(stop_event)
+            sync_pipeline = _SyncSentencePipeline(
+                stop_event,
+                on_sentence_play=on_sentence_play,
+                use_edge_pipe=_can_stream_edge_pipe(tts_config, preferred=provider),
+                tts_config=tts_config,
+            )
         else:
             with contextlib.suppress(Exception):
                 stream_max_len = origin._resolve_max_text_length(
                     provider or origin._get_provider(tts_config), tts_config)
-            playback = _StreamerPlayback(streamer, stop_event)
+            playback = _StreamerPlayback(streamer, stop_event, on_sentence_play=on_sentence_play)
         chunker = SentenceChunker.from_config(tts_config)
         spoken_sentences: list[str] = []  # skip duplicate/near-duplicate sentences (LLM repetition)
 

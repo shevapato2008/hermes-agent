@@ -510,6 +510,8 @@ class PulseCliVoiceInputProvider(_ExclusiveProvider):
             "--format=s16le",
             "--rate=16000",
             "--channels=1",
+            "--latency-msec=30",
+            "--process-time-msec=15",
             f"--device={self.pulse_source}",
         ]
         try:

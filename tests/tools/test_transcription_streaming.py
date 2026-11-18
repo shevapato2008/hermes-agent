@@ -87,3 +87,51 @@ def test_recording_uses_the_live_transcript_and_falls_back_to_the_file(tmp_path,
     voice_mode._park_live_session(failed_wav, _Session({"success": False, "transcript": "", "error": "socket"}))
     assert voice_mode.transcribe_recording(failed_wav)["transcript"] == "from file"
     assert uploads == [failed_wav]
+
+
+def test_openai_realtime_custom_base_url_streams_direct_16k_and_replaces_non_monotonic_text():
+    partials: list[str] = []
+    session = ts.OpenAIRealtimeSession(
+        "secret",
+        "http://127.0.0.1:8091/v1",
+        "smartbox-sherpa-zh-en",
+        "zh",
+        None,
+        on_partial=partials.append,
+    )
+    assert session._stream_rate == 16000
+    assert session._resample is None
+
+    sent_frames: list[dict] = []
+
+    class _FakeWS:
+        def send(self, raw: str) -> None:
+            sent_frames.append(json.loads(raw))
+
+    ws = _FakeWS()
+    session._open(ws)
+    assert sent_frames[0]["session"]["audio"]["input"]["format"]["rate"] == 16000
+
+    raw_pcm = b"\x01\x02" * 480
+    session._send_audio(ws, raw_pcm)
+    import base64
+    assert base64.b64decode(sent_frames[1]["audio"]) == raw_pcm
+
+    session._event({"type": "conversation.item.input_audio_transcription.delta", "delta": "今天是", "text": "今天是"})
+    session._event({"type": "conversation.item.input_audio_transcription.delta", "delta": "", "text": "今天十点"})
+    assert partials == ["今天是", "今天十点"]
+    done = session._event({"type": "conversation.item.input_audio_transcription.completed", "transcript": ""})
+    assert done == {"success": True, "transcript": "今天十点", "provider": "openai"}
+
+
+def test_openai_realtime_cloud_base_url_keeps_24k_resampler():
+    session = ts.OpenAIRealtimeSession(
+        "sk-test",
+        "https://api.openai.com/v1",
+        ts.DEFAULT_OPENAI_STREAMING_MODEL,
+        "zh",
+        None,
+    )
+    assert session._stream_rate == 24000
+    assert session._resample is not None
+

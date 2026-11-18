@@ -124,6 +124,35 @@ _SCHEMA_OVERRIDES: dict[str, dict[str, Any]] = {
         "Text-to-speech provider",
         "edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "gemini", "neutts", "kittentts", "piper",
     ),
+    "tts.edge.voice": _select(
+        "Edge TTS voice (e.g. zh-TW-HsiaoChenNeural for Taiwanese female, zh-CN-XiaoxiaoNeural for Mainland female)",
+        "zh-TW-HsiaoChenNeural",
+        "zh-TW-HsiaoYuNeural",
+        "zh-TW-YunJheNeural",
+        "zh-CN-XiaoxiaoNeural",
+        "zh-CN-XiaoyiNeural",
+        "zh-CN-YunxiNeural",
+        "zh-CN-YunjianNeural",
+        "zh-CN-liaoning-XiaobeiNeural",
+        "zh-HK-HiuMaanNeural",
+        "en-US-AriaNeural",
+        "en-US-JennyNeural",
+        "en-US-GuyNeural",
+        option_labels={
+            "zh-TW-HsiaoChenNeural": "zh-TW-HsiaoChenNeural · 台湾女声·晓臻 (小智AI同款)",
+            "zh-TW-HsiaoYuNeural": "zh-TW-HsiaoYuNeural · 台湾女声·晓雨",
+            "zh-TW-YunJheNeural": "zh-TW-YunJheNeural · 台湾男声·云哲",
+            "zh-CN-XiaoxiaoNeural": "zh-CN-XiaoxiaoNeural · 大陆女声·晓晓",
+            "zh-CN-XiaoyiNeural": "zh-CN-XiaoyiNeural · 大陆女声·晓伊",
+            "zh-CN-YunxiNeural": "zh-CN-YunxiNeural · 大陆男声·云希",
+            "zh-CN-YunjianNeural": "zh-CN-YunjianNeural · 大陆男声·云健",
+            "zh-CN-liaoning-XiaobeiNeural": "zh-CN-liaoning-XiaobeiNeural · 东北女声·晓北",
+            "zh-HK-HiuMaanNeural": "zh-HK-HiuMaanNeural · 粤语女声·晓曼",
+            "en-US-AriaNeural": "en-US-AriaNeural · 英语女声·Aria",
+            "en-US-JennyNeural": "en-US-JennyNeural · 英语女声·Jenny",
+            "en-US-GuyNeural": "en-US-GuyNeural · 英语男声·Guy",
+        },
+    ),
     "stt.provider": _select(
         "Speech-to-text provider", "local", "groq", "openai", "mistral", "xai", "elevenlabs", "deepinfra"),
     "stt.local.model": _select("Local faster-whisper model size", *STT_MODEL_CATALOG["local"]),
@@ -137,7 +166,8 @@ _SCHEMA_OVERRIDES: dict[str, dict[str, Any]] = {
     "display.skin": _select("CLI visual theme", "default", "ares", "mono", "slate"),
     "dashboard.theme": _select(
         "Web dashboard visual theme",
-        "smartbox-7inch", "default", "default-large", "nous-blue", "midnight", "ember", "mono", "cyberpunk", "rose",
+        "smartbox-7inch", "smartbox-7inch-18", "smartbox-7inch-b", "smartbox-7inch-c",
+        "default", "default-large", "nous-blue", "midnight", "ember", "mono", "cyberpunk", "rose",
     ),
     "display.resume_display": _select("How resumed sessions display history", "minimal", "full", "off"),
     "display.busy_input_mode": _select("Input behavior while agent is running", "interrupt", "queue", "steer"),
@@ -390,6 +420,12 @@ def _schema_with_dynamic_provider_options() -> dict[str, dict[str, Any]]:
         existing = _schema_select_options(f"{kind}.provider")
         if existing is not None:
             merge(f"{kind}.provider", _custom_provider_options(kind, list(existing), cfg))
+
+    edge_voices = _schema_select_options("tts.edge.voice")
+    if edge_voices is not None:
+        current_voice = str(cfg_get(cfg, "tts", "edge", "voice") or "").strip()
+        if current_voice and current_voice not in edge_voices:
+            merge("tts.edge.voice", [*edge_voices, current_voice])
 
     merge("memory.provider", _memory_provider_schema_options(cfg))
 

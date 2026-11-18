@@ -243,18 +243,50 @@ export const defaultLargeTheme: DashboardTheme = {
   },
 };
 
-const SMARTBOX_7INCH_CUSTOM_CSS = `
+interface Smartbox7InchCssMetrics {
+  navFontSize?: string;
+  navMinHeight?: string;
+  smallUtilityFontSize: string;
+  textSm?: string;
+  textXs: string;
+}
+
+function buildSmartbox7InchCustomCss({
+  navFontSize,
+  navMinHeight = "42px",
+  smallUtilityFontSize,
+  textSm,
+  textXs,
+}: Smartbox7InchCssMetrics): string {
+  const rootLines = [
+    "  --text-secondary: color-mix(in srgb, var(--midground-base) 88%, transparent);",
+    "  --text-tertiary: color-mix(in srgb, var(--midground-base) 74%, transparent);",
+  ];
+  if (textSm) {
+    rootLines.push(`  --text-sm: ${textSm};`);
+  }
+  rootLines.push(`  --text-xs: ${textXs};`);
+
+  const navLines = [];
+  if (navFontSize) {
+    navLines.push(`  font-size: ${navFontSize};`);
+  }
+  navLines.push(
+    `  min-height: ${navMinHeight};`,
+    "  padding-top: 0.45rem;",
+    "  padding-bottom: 0.45rem;",
+  );
+
+  return `
 :root {
-  --text-secondary: color-mix(in srgb, var(--midground-base) 88%, transparent);
-  --text-tertiary: color-mix(in srgb, var(--midground-base) 74%, transparent);
-  --text-xs: max(0.75rem, 14px);
+${rootLines.join("\n")}
 }
 html, body {
   font-synthesis: none;
   -webkit-font-smoothing: antialiased;
 }
 [class*="text-[0.6"], [class*="text-[0.7"], [class*="text-[10px]"], [class*="text-[11px]"] {
-  font-size: 14px !important;
+  font-size: ${smallUtilityFontSize} !important;
 }
 @media (min-width: 1024px) {
   #app-sidebar:not(.lg\\:w-14) {
@@ -265,9 +297,7 @@ html, body {
   }
 }
 #app-sidebar > nav a {
-  min-height: 42px;
-  padding-top: 0.45rem;
-  padding-bottom: 0.45rem;
+${navLines.join("\n")}
 }
 html[lang^="zh"] #app-sidebar > nav a,
 html[lang^="zh"] .uppercase {
@@ -278,11 +308,64 @@ select {
   min-height: 40px;
 }
 `.trim();
+}
+
+const SMARTBOX_7INCH_OPTION_A_CSS = buildSmartbox7InchCustomCss({
+  textSm: "19px",
+  textXs: "max(0.75rem, 16px)",
+  smallUtilityFontSize: "15px",
+  navFontSize: "18.5px",
+  navMinHeight: "42px",
+});
+
+const SMARTBOX_7INCH_18_CSS = buildSmartbox7InchCustomCss({
+  textXs: "max(0.75rem, 14px)",
+  smallUtilityFontSize: "14px",
+  navMinHeight: "42px",
+});
+
+const SMARTBOX_7INCH_OPTION_B_CSS = buildSmartbox7InchCustomCss({
+  textSm: "21px",
+  textXs: "max(0.75rem, 17.5px)",
+  smallUtilityFontSize: "16px",
+  navFontSize: "20px",
+  navMinHeight: "42px",
+});
+
+const SMARTBOX_7INCH_OPTION_C_CSS = buildSmartbox7InchCustomCss({
+  textSm: "23px",
+  textXs: "max(0.75rem, 19px)",
+  smallUtilityFontSize: "17px",
+  navFontSize: "22px",
+  navMinHeight: "44px",
+});
 
 export const smartbox7InchTheme: DashboardTheme = {
   name: "smartbox-7inch",
-  label: "智星盒 7″ 楷体",
-  description: "7-inch 1024×600 high-contrast KaiTi touch layout",
+  label: "智星盒 7″ · 方案A 大字 (20px)",
+  description: "7-inch 1024×600 high-contrast KaiTi touch layout (20px Option A)",
+  palette: defaultTheme.palette,
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans: SMARTBOX_KAITI_UI_STACK,
+    baseSize: "20px",
+    lineHeight: "1.55",
+  },
+  layout: {
+    radius: "0.5rem",
+    density: "comfortable",
+  },
+  terminalBackground: "#021010",
+  terminalForeground: "#fff2df",
+  terminalFontSize: 15,
+  terminalLineHeight: 1.2,
+  customCSS: SMARTBOX_7INCH_OPTION_A_CSS,
+};
+
+export const smartbox7Inch18Theme: DashboardTheme = {
+  name: "smartbox-7inch-18",
+  label: "智星盒 7″ · 标准字号 (18px)",
+  description: "7-inch 1024×600 high-contrast KaiTi touch layout (18px Standard)",
   palette: defaultTheme.palette,
   typography: {
     ...DEFAULT_TYPOGRAPHY,
@@ -296,13 +379,60 @@ export const smartbox7InchTheme: DashboardTheme = {
   },
   terminalBackground: "#021010",
   terminalForeground: "#fff2df",
-  terminalFontSize: 16,
+  terminalFontSize: 14,
   terminalLineHeight: 1.18,
-  customCSS: SMARTBOX_7INCH_CUSTOM_CSS,
+  customCSS: SMARTBOX_7INCH_18_CSS,
+};
+
+export const smartbox7InchBTheme: DashboardTheme = {
+  name: "smartbox-7inch-b",
+  label: "智星盒 7″ · 方案B 特大 (22px)",
+  description: "7-inch 1024×600 high-contrast KaiTi touch layout (22px Option B)",
+  palette: defaultTheme.palette,
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans: SMARTBOX_KAITI_UI_STACK,
+    baseSize: "22px",
+    lineHeight: "1.52",
+  },
+  layout: {
+    radius: "0.5rem",
+    density: "comfortable",
+  },
+  terminalBackground: "#021010",
+  terminalForeground: "#fff2df",
+  terminalFontSize: 16.5,
+  terminalLineHeight: 1.2,
+  customCSS: SMARTBOX_7INCH_OPTION_B_CSS,
+};
+
+export const smartbox7InchCTheme: DashboardTheme = {
+  name: "smartbox-7inch-c",
+  label: "智星盒 7″ · 方案C 适老 (24px)",
+  description: "7-inch 1024×600 high-contrast KaiTi touch layout (24px Option C)",
+  palette: defaultTheme.palette,
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans: SMARTBOX_KAITI_UI_STACK,
+    baseSize: "24px",
+    lineHeight: "1.48",
+  },
+  layout: {
+    radius: "0.5rem",
+    density: "comfortable",
+  },
+  terminalBackground: "#021010",
+  terminalForeground: "#fff2df",
+  terminalFontSize: 18,
+  terminalLineHeight: 1.22,
+  customCSS: SMARTBOX_7INCH_OPTION_C_CSS,
 };
 
 export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
   "smartbox-7inch": smartbox7InchTheme,
+  "smartbox-7inch-18": smartbox7Inch18Theme,
+  "smartbox-7inch-b": smartbox7InchBTheme,
+  "smartbox-7inch-c": smartbox7InchCTheme,
   default: defaultTheme,
   "default-large": defaultLargeTheme,
   "nous-blue": nousBlueTheme,

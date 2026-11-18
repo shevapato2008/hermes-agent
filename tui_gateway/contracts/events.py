@@ -831,6 +831,10 @@ class VoiceOutputDrainedPayload(VoiceScopePayload):
     pass
 
 
+class VoiceTtsSentencePayload(VoiceScopePayload):
+    text: str
+
+
 class VoiceInputErrorPayload(VoiceScopePayload):
     message: str
     stage: str  # provider | open | read | stt | close
@@ -858,6 +862,7 @@ event("voice.transcript", VoiceTranscriptPayload, doc="A voice capture produced 
 event("voice.input_error", VoiceInputErrorPayload, doc="The scoped microphone/STT pipeline failed terminally.")
 event("voice.output_drained", VoiceOutputDrainedPayload,
       doc="The owning turn and every backend audio-output pipeline are idle.")
+event("voice.tts_sentence", VoiceTtsSentencePayload, doc="A TTS sentence began speaker playback.")
 event("wake.detected", WakeDetectedPayload, doc="A wake phrase fired.")
 
 
@@ -947,5 +952,5 @@ __all__ = [
     "ToolGeneratingPayload", "ToolLabel", "ToolLabelKind", "ToolOutputRiskPayload", "ToolProgressPayload",
     "ToolStartPayload",
     "TurnStatus", "VoiceOutputDrainedPayload", "VoicePartialPayload", "VoiceStatusPayload",
-    "VoiceTranscriptPayload", "WakeDetectedPayload",
+    "VoiceTranscriptPayload", "VoiceTtsSentencePayload", "WakeDetectedPayload",
 ]

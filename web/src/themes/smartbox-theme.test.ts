@@ -11,15 +11,49 @@ describe("SmartBox 7-inch default theme and KaiTi font stacks", () => {
     document.getElementById("hermes-theme-custom-css")?.remove();
   });
 
-  it("registers smartbox-7inch first in BUILTIN_THEMES with 7-inch touch metrics", () => {
-    expect(Object.keys(BUILTIN_THEMES)[0]).toBe("smartbox-7inch");
+  it("registers smartbox-7inch first in BUILTIN_THEMES with 7-inch Option A (20px) touch metrics and additional presets", () => {
+    expect(Object.keys(BUILTIN_THEMES).slice(0, 4)).toEqual([
+      "smartbox-7inch",
+      "smartbox-7inch-18",
+      "smartbox-7inch-b",
+      "smartbox-7inch-c",
+    ]);
     expect(BUILTIN_THEMES["smartbox-7inch"]).toBe(smartbox7InchTheme);
-    expect(smartbox7InchTheme.typography.baseSize).toBe("18px");
-    expect(smartbox7InchTheme.typography.lineHeight).toBe("1.58");
-    expect(smartbox7InchTheme.terminalFontSize).toBe(16);
-    expect(smartbox7InchTheme.terminalLineHeight).toBe(1.18);
+    expect(smartbox7InchTheme.label).toBe("智星盒 7″ · 方案A 大字 (20px)");
+    expect(smartbox7InchTheme.typography.baseSize).toBe("20px");
+    expect(smartbox7InchTheme.typography.lineHeight).toBe("1.55");
+    expect(smartbox7InchTheme.terminalFontSize).toBe(15);
+    expect(smartbox7InchTheme.terminalLineHeight).toBe(1.2);
     expect(smartbox7InchTheme.terminalBackground).toBe("#021010");
     expect(smartbox7InchTheme.terminalForeground).toBe("#fff2df");
+
+    const preset18 = BUILTIN_THEMES["smartbox-7inch-18"];
+    expect(preset18.label).toBe("智星盒 7″ · 标准字号 (18px)");
+    expect(preset18.typography.baseSize).toBe("18px");
+    expect(preset18.typography.lineHeight).toBe("1.58");
+    expect(preset18.terminalFontSize).toBe(14);
+    expect(preset18.terminalLineHeight).toBe(1.18);
+    expect(preset18.customCSS).toContain("--text-xs: max(0.75rem, 14px)");
+
+    const presetB = BUILTIN_THEMES["smartbox-7inch-b"];
+    expect(presetB.label).toBe("智星盒 7″ · 方案B 特大 (22px)");
+    expect(presetB.typography.baseSize).toBe("22px");
+    expect(presetB.typography.lineHeight).toBe("1.52");
+    expect(presetB.terminalFontSize).toBe(16.5);
+    expect(presetB.terminalLineHeight).toBe(1.2);
+    expect(presetB.customCSS).toContain("--text-sm: 21px");
+    expect(presetB.customCSS).toContain("--text-xs: max(0.75rem, 17.5px)");
+    expect(presetB.customCSS).toContain("font-size: 20px");
+
+    const presetC = BUILTIN_THEMES["smartbox-7inch-c"];
+    expect(presetC.label).toBe("智星盒 7″ · 方案C 适老 (24px)");
+    expect(presetC.typography.baseSize).toBe("24px");
+    expect(presetC.typography.lineHeight).toBe("1.48");
+    expect(presetC.terminalFontSize).toBe(18);
+    expect(presetC.terminalLineHeight).toBe(1.22);
+    expect(presetC.customCSS).toContain("--text-sm: 23px");
+    expect(presetC.customCSS).toContain("--text-xs: max(0.75rem, 19px)");
+    expect(presetC.customCSS).toContain("font-size: 22px");
   });
 
   it("scopes customCSS to #app-sidebar and :root portal-safe tokens", () => {
@@ -30,11 +64,14 @@ describe("SmartBox 7-inch default theme and KaiTi font stacks", () => {
     expect(css).toContain("padding-right: 6.75rem !important");
     expect(css).toContain("#app-sidebar > nav a");
     expect(css).toContain("min-height: 42px");
+    expect(css).toContain("font-size: 18.5px");
     expect(css).toContain("--text-secondary:");
     expect(css).toContain("--text-tertiary:");
     expect(css).not.toContain("--color-text-secondary");
     expect(css).not.toContain("--color-text-tertiary");
-    expect(css).toContain("--text-xs: max(0.75rem, 14px)");
+    expect(css).toContain("--text-sm: 19px");
+    expect(css).toContain("--text-xs: max(0.75rem, 16px)");
+    expect(css).toContain("font-size: 15px !important");
   });
 
   it("places SmartBox Sans ahead of SmartBox Kai and includes KaiTi in every built-in theme", () => {
@@ -60,10 +97,10 @@ describe("SmartBox 7-inch default theme and KaiTi font stacks", () => {
     try {
       applyTheme(smartbox7InchTheme);
       expect(document.documentElement.style.getPropertyValue("--theme-terminal-font-size")).toBe(
-        "16",
+        "15",
       );
       expect(document.documentElement.style.getPropertyValue("--theme-terminal-line-height")).toBe(
-        "1.18",
+        "1.2",
       );
       expect(onResize).toHaveBeenCalledTimes(1);
 

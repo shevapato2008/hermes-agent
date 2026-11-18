@@ -882,7 +882,8 @@ class AudioRecorder(_RecorderBase):
             try:  # may block on CoreAudio (first call only)
                 stream = provider.open_stream(
                     phase="ordinary", sample_rate=self._sample_rate, channels=CHANNELS,
-                    dtype=DTYPE, callback=_callback, on_error=self._on_stream_error)
+                    dtype=DTYPE, blocksize=int(self._sample_rate * 0.03),
+                    callback=_callback, on_error=self._on_stream_error)
                 stream.start()
                 break
             except Exception as e:
@@ -1460,6 +1461,20 @@ def _vad_log(msg: str) -> None:
             print(f"[voice-vad] {msg}", file=sys.stderr, flush=True)
 
 
+def _open_fd_live_session(pre_roll, on_partial: Optional[Callable[[str], None]]) -> Any:
+    from tools.transcription_streaming import open_streaming_session
+    try:
+        live = open_streaming_session(on_partial=on_partial)
+    except Exception:
+        logger.debug("Full-duplex live STT session did not open", exc_info=True)
+        return None
+    if live is not None:
+        live.set_input_rate(SAMPLE_RATE)
+        for frame in pre_roll:
+            live.push_audio(frame.tobytes())
+    return live
+
+
 def _capture_until_quiet(
     stream,
     np,
@@ -1469,6 +1484,7 @@ def _capture_until_quiet(
     endpoint_blocks: int,
     max_blocks: int,
     quiet_floor: float = float(SILENCE_RMS_THRESHOLD),
+    live: Any = None,
 ) -> str:
     """After a trip, read until *endpoint_blocks* of quiet (or *max_blocks*) and write
     pre-roll + capture to a WAV. Playback was cut by the trigger; use the room floor
@@ -1479,13 +1495,23 @@ def _capture_until_quiet(
         PLAYBACK_MIN_TRIGGER,
         max(float(SILENCE_RMS_THRESHOLD), quiet_floor * 1.5),
     )
-    for _ in range(max_blocks):
-        data, _ = stream.read(block)
-        frames.append(data.copy())
-        quiet = quiet + 1 if _rms(np, data) < endpoint_threshold else 0
-        if quiet >= endpoint_blocks:
-            break
-    return AudioRecorder._write_wav(np.concatenate(frames, axis=0))
+    try:
+        for _ in range(max_blocks):
+            data, _ = stream.read(block)
+            frames.append(data.copy())
+            if live is not None:
+                live.push_audio(data.tobytes())
+            quiet = quiet + 1 if _rms(np, data) < endpoint_threshold else 0
+            if quiet >= endpoint_blocks:
+                break
+        wav_path = AudioRecorder._write_wav(np.concatenate(frames, axis=0))
+    except BaseException:
+        if live is not None:
+            with suppress(Exception):
+                live.cancel()
+        raise
+    _park_live_session(wav_path, live)
+    return wav_path
 
 
 class _BargeDetector:
@@ -1590,6 +1616,7 @@ def full_duplex_listen(
     endpoint_silence_ms: int = 1250, max_utterance_ms: int = 30_000,
     on_input_error: Optional[Callable[[BaseException], None]] = None,
     start_barrier: Optional[Callable[[], Any]] = None,
+    on_partial: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
     """Listen across an ENTIRE agent turn; return the captured interruption WAV path.
 
@@ -1642,7 +1669,7 @@ def full_duplex_listen(
                     try:
                         on_trigger(phase)
                     except Exception as e:
-                        logger.debug("full-duplex trigger callback failed: %s", e)
+                        logger.debug("full-duplex trigger callback failed: %s", e, exc_info=True)
                 return _capture_until_quiet(
                     stream,
                     np,
@@ -1651,6 +1678,7 @@ def full_duplex_listen(
                     endpoint_blocks=endpoint_blocks,
                     max_blocks=max(1, max_utterance_ms // 30),
                     quiet_floor=detector.quiet_floor,
+                    live=_open_fd_live_session(pre_roll, on_partial),
                 )
         finally:
             stream.close()

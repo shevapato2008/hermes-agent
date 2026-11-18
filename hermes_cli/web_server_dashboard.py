@@ -46,6 +46,14 @@ def _layer_hex(palette: dict[str, Any], key: str, default: str) -> str:
     return layer.get("hex", default) if isinstance(layer, dict) else default
 
 
+_BUILTIN_BOOTSTRAP_TYPOGRAPHY: dict[str, tuple[str, str]] = {
+    "smartbox-7inch-18": ("18px", "1.58"),
+    "smartbox-7inch-b": ("22px", "1.52"),
+    "smartbox-7inch-c": ("24px", "1.48"),
+    "default-large": ("18px", "1.65"),
+}
+
+
 def _render_active_theme_bootstrap_css() -> str:
     """Critical-CSS ``<style>`` shim for the active *user* theme, so the first paint uses the
     target palette instead of flashing the bundle's default Hermes Teal until
@@ -62,11 +70,10 @@ def _render_active_theme_bootstrap_css() -> str:
         if not active or not isinstance(active, str) or active == "smartbox-7inch":
             return ""
         if any(b["name"] == active for b in _BUILTIN_DASHBOARD_THEMES):
-            if active == "default-large":
-                return ""
+            base_size, line_height = _BUILTIN_BOOTSTRAP_TYPOGRAPHY.get(active, ("15px", "1.55"))
             return (
                 '<style id="hermes-theme-bootstrap">'
-                ":root{--theme-base-size:15px;--theme-line-height:1.55;}"
+                f":root{{--theme-base-size:{base_size};--theme-line-height:{line_height};}}"
                 "</style>"
             )
         for theme in _discover_user_themes():
@@ -311,7 +318,10 @@ def mount_spa(application: FastAPI):
 
 # Built-in themes — label + description only; colors live in web/src/themes/presets.ts.
 _BUILTIN_DASHBOARD_THEMES = [
-    {"name": "smartbox-7inch", "label": "智星盒 7″ 楷体", "description": "7-inch 1024×600 high-contrast KaiTi touch layout"},
+    {"name": "smartbox-7inch",    "label": "智星盒 7″ · 方案A 大字 (20px)", "description": "7-inch 1024×600 high-contrast KaiTi touch layout (20px Option A)"},
+    {"name": "smartbox-7inch-18", "label": "智星盒 7″ · 标准字号 (18px)",   "description": "7-inch 1024×600 high-contrast KaiTi touch layout (18px Standard)"},
+    {"name": "smartbox-7inch-b",  "label": "智星盒 7″ · 方案B 特大 (22px)", "description": "7-inch 1024×600 high-contrast KaiTi touch layout (22px Option B)"},
+    {"name": "smartbox-7inch-c",  "label": "智星盒 7″ · 方案C 适老 (24px)", "description": "7-inch 1024×600 high-contrast KaiTi touch layout (24px Option C)"},
     {"name": "default",       "label": "Hermes Teal",         "description": "Classic dark teal — the canonical Hermes look"},
     {"name": "default-large", "label": "Hermes Teal (Large)", "description": "Hermes Teal with bigger fonts and roomier spacing"},
     {"name": "nous-blue",     "label": "Nous Blue",           "description": "Light mode — vivid Nous-blue accents on cream canvas"},

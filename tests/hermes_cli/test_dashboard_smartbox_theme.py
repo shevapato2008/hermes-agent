@@ -1,6 +1,8 @@
 """Tests for SmartBox 7-inch KaiTi dashboard theme, font shards, and bootstrap CSS."""
 from __future__ import annotations
 
+from pathlib import Path
+import sys
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -17,6 +19,7 @@ from hermes_cli.web_server_dashboard import (
     _render_active_theme_bootstrap_css,
     mount_spa,
 )
+from hermes_cli.web_server_files import _dashboard_local_update_managed_externally
 from hermes_cli.web_server_static_assets import is_static_asset_path, public_font_file
 
 
@@ -25,12 +28,23 @@ def test_default_dashboard_theme_is_smartbox_7inch():
 
 
 def test_builtin_themes_font_choices_and_config_schema_synced():
-    builtin_names = {t["name"] for t in _BUILTIN_DASHBOARD_THEMES}
-    assert "smartbox-7inch" in builtin_names
-    assert _BUILTIN_DASHBOARD_THEMES[0]["name"] == "smartbox-7inch"
+    builtin_names = [t["name"] for t in _BUILTIN_DASHBOARD_THEMES]
+    assert builtin_names[:4] == [
+        "smartbox-7inch",
+        "smartbox-7inch-18",
+        "smartbox-7inch-b",
+        "smartbox-7inch-c",
+    ]
+    assert _BUILTIN_DASHBOARD_THEMES[0]["label"] == "智星盒 7″ · 方案A 大字 (20px)"
     assert "kaiti" in _FONT_CHOICES
-    schema_options = set(CONFIG_SCHEMA["dashboard.theme"]["options"])
-    assert schema_options >= builtin_names
+    schema_options = list(CONFIG_SCHEMA["dashboard.theme"]["options"])
+    assert schema_options[:4] == [
+        "smartbox-7inch",
+        "smartbox-7inch-18",
+        "smartbox-7inch-b",
+        "smartbox-7inch-c",
+    ]
+    assert set(schema_options) >= set(builtin_names)
 
 
 def test_fonts_kai_is_public_and_resolves_without_path_traversal(tmp_path):
@@ -86,8 +100,33 @@ def test_theme_bootstrap_css_handles_smartbox_15px_builtins_and_user_themes(tmp_
     monkeypatch.setattr(_cfg_mod, "load_config", lambda: {"dashboard": {"theme": "smartbox-7inch"}})
     assert _render_active_theme_bootstrap_css() == ""
 
+    monkeypatch.setattr(_cfg_mod, "load_config", lambda: {"dashboard": {"theme": "smartbox-7inch-18"}})
+    assert _render_active_theme_bootstrap_css() == (
+        '<style id="hermes-theme-bootstrap">'
+        ":root{--theme-base-size:18px;--theme-line-height:1.58;}"
+        "</style>"
+    )
+
+    monkeypatch.setattr(_cfg_mod, "load_config", lambda: {"dashboard": {"theme": "smartbox-7inch-b"}})
+    assert _render_active_theme_bootstrap_css() == (
+        '<style id="hermes-theme-bootstrap">'
+        ":root{--theme-base-size:22px;--theme-line-height:1.52;}"
+        "</style>"
+    )
+
+    monkeypatch.setattr(_cfg_mod, "load_config", lambda: {"dashboard": {"theme": "smartbox-7inch-c"}})
+    assert _render_active_theme_bootstrap_css() == (
+        '<style id="hermes-theme-bootstrap">'
+        ":root{--theme-base-size:24px;--theme-line-height:1.48;}"
+        "</style>"
+    )
+
     monkeypatch.setattr(_cfg_mod, "load_config", lambda: {"dashboard": {"theme": "default-large"}})
-    assert _render_active_theme_bootstrap_css() == ""
+    assert _render_active_theme_bootstrap_css() == (
+        '<style id="hermes-theme-bootstrap">'
+        ":root{--theme-base-size:18px;--theme-line-height:1.65;}"
+        "</style>"
+    )
 
     monkeypatch.setattr(_cfg_mod, "load_config", lambda: {"dashboard": {"theme": "default"}})
     bootstrap_15 = _render_active_theme_bootstrap_css()
@@ -96,6 +135,16 @@ def test_theme_bootstrap_css_handles_smartbox_15px_builtins_and_user_themes(tmp_
         ":root{--theme-base-size:15px;--theme-line-height:1.55;}"
         "</style>"
     )
+
+
+def test_dashboard_local_update_managed_externally_for_opt_smartbox(monkeypatch):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(sys, "prefix", "/opt/smartbox/hermes-venv")
+    assert _dashboard_local_update_managed_externally() is True
+
+    monkeypatch.setattr(sys, "prefix", "/usr/local")
+    monkeypatch.setattr(ws, "PROJECT_ROOT", Path("/opt/smartbox/hermes-agent"))
+    assert _dashboard_local_update_managed_externally() is True
 
 
 def test_normalise_theme_definition_preserves_and_clamps_terminal_metrics():

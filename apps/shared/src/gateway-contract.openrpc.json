@@ -49211,6 +49211,42 @@
         "title": "VoiceTtsResult",
         "type": "object"
       },
+      "VoiceTtsSentencePayload": {
+        "additionalProperties": false,
+        "properties": {
+          "owner_session_id": {
+            "title": "Owner Session Id",
+            "type": "string"
+          },
+          "lease_epoch": {
+            "title": "Lease Epoch",
+            "type": "integer"
+          },
+          "capture_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Capture Id"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner_session_id",
+          "lease_epoch",
+          "text"
+        ],
+        "title": "VoiceTtsSentencePayload",
+        "type": "object"
+      },
       "WaitBarrierTarget": {
         "additionalProperties": false,
         "properties": {
@@ -52607,6 +52643,18 @@
           "name": "payload",
           "schema": {
             "$ref": "#/components/schemas/VoiceTranscriptPayload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "voice.tts_sentence",
+      "summary": "A TTS sentence began speaker playback.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/VoiceTtsSentencePayload"
           }
         }
       ]

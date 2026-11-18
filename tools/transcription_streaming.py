@@ -260,15 +260,25 @@ class _WebSocketSession(StreamingSession):
 class OpenAIRealtimeSession(_WebSocketSession):
     provider = "openai"
 
-    def __init__(self, api_key: str, base_url: str, model: str, language: Optional[str],
-                 prompt: Optional[str], on_partial: Optional[PartialCallback] = None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "",
+        model: str = DEFAULT_OPENAI_STREAMING_MODEL,
+        language: Optional[str] = None,
+        prompt: Optional[str] = None,
+        on_partial: Optional[PartialCallback] = None,
+    ) -> None:
         super().__init__(on_partial)
-        parts = urlsplit(base_url.rstrip("/"))
+        clean_base = str(base_url or "https://api.openai.com/v1").rstrip("/")
+        parts = urlsplit(clean_base)
         scheme = "wss" if parts.scheme == "https" else "ws"
         self.url = urlunsplit((scheme, parts.netloc, f"{parts.path}/realtime", "intent=transcription", ""))
         self.headers = {"Authorization": f"Bearer {api_key}"}
         self.model, self.language, self.prompt = model, language, prompt
-        self._resample = Resampler(INPUT_RATE, 24000)
+        is_openai_cloud = urlsplit(str(base_url or "")).hostname in {None, "", "api.openai.com"}
+        self._stream_rate = 24000 if is_openai_cloud else INPUT_RATE
+        self._resample = Resampler(INPUT_RATE, 24000) if is_openai_cloud else None
         self._text = ""
         self._sent_audio = False
 
@@ -284,11 +294,11 @@ class OpenAIRealtimeSession(_WebSocketSession):
         if self.prompt:
             transcription["prompt"] = self.prompt
         ws.send(json.dumps({"type": "session.update", "session": {"type": "transcription", "audio": {"input": {
-            "format": {"type": "audio/pcm", "rate": 24000}, "transcription": transcription,
+            "format": {"type": "audio/pcm", "rate": self._stream_rate}, "transcription": transcription,
             "turn_detection": None}}}}))
 
     def _send_audio(self, ws: Any, chunk: bytes) -> None:
-        pcm = self._resample(chunk)
+        pcm = self._resample(chunk) if self._resample is not None else chunk
         if pcm:
             self._sent_audio = True
             ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode()}))
@@ -303,7 +313,10 @@ class OpenAIRealtimeSession(_WebSocketSession):
     def _event(self, event: dict[str, Any]) -> Optional[dict[str, Any]]:
         kind = str(event.get("type") or "")
         if kind.endswith("input_audio_transcription.delta"):
-            self._text += str(event.get("delta") or "")
+            if event.get("text") is not None:
+                self._text = str(event["text"])
+            else:
+                self._text += str(event.get("delta") or "")
             self._set_partial(self._text)
         elif kind.endswith("input_audio_transcription.completed"):
             return {"success": True, "transcript": str(event.get("transcript") or self._text).strip(),

@@ -321,14 +321,24 @@ def _tts_stream_begin(session_id: str | None = None, transport=None) -> Optional
     with _voice_output_start_barrier(session_id, transport) as allowed:
         if not allowed:
             return None
+        owner_sid, epoch, owner_transport, _capture_id = _voice_scope_snapshot()
+        authority_sid, authority_transport = _voice_authority_snapshot()
+        sid = str(session_id or owner_sid or authority_sid or "")
+        bound_transport = _voice_output_bound_transport(transport or owner_transport or authority_transport)
         _tts_stream_stop()
         text_queue: queue.Queue = queue.Queue()
         stop, done = threading.Event(), threading.Event()
-        _start_voice_thread(
-            stream_tts_to_speaker,
-            name="voice-tts-stream",
-            args=(text_queue, stop, done),
-        )
+        on_play = lambda sentence: _voice_emit(
+            "voice.tts_sentence", {"text": sentence},
+            session_id=sid, lease_epoch=epoch, transport=bound_transport)
+
+        def _run_stream(q, stop_evt, done_evt):
+            try:
+                stream_tts_to_speaker(q, stop_evt, done_evt, on_sentence_play=on_play)
+            except TypeError:
+                stream_tts_to_speaker(q, stop_evt, done_evt)
+
+        _start_voice_thread(_run_stream, name="voice-tts-stream", args=(text_queue, stop, done))
         with _tts_stream_lock:
             _tts_stream_state = {"stop": stop, "done": done}
         _arm_barge_listener_if_enabled(session_id, transport)
@@ -409,21 +419,13 @@ def _full_duplex_scope(session_id: str | None = None, transport=None):
 
 
 def _emit_voice_lease_changed(
-    session_id: str,
-    lease_epoch: int,
-    transport,
-    previous_lease_epoch: int | None,
-    phase: str,
+    session_id: str, lease_epoch: int, transport, previous_lease_epoch: int | None, phase: str,
 ) -> bool:
     if previous_lease_epoch is None or previous_lease_epoch == lease_epoch:
         return False
-    return _voice_emit(
-        "voice.lease_changed",
-        {"previous_lease_epoch": previous_lease_epoch, "phase": phase},
-        session_id=session_id,
-        lease_epoch=lease_epoch,
-        transport=transport,
-    )
+    return _voice_emit("voice.lease_changed",
+                       {"previous_lease_epoch": previous_lease_epoch, "phase": phase},
+                       session_id=session_id, lease_epoch=lease_epoch, transport=transport)
 
 
 def _arm_full_duplex_listener(session_id: str | None = None, transport=None) -> bool:
@@ -648,29 +650,26 @@ def _full_duplex_listener(
         def _on_trigger(phase: str) -> None:
             if _fd_trip(phase, session_id, lease_epoch, transport):
                 tripped.set()
+        on_partial = ctx_bound(lambda text: _voice_emit(
+            "voice.partial", {"text": text},
+            session_id=session_id, lease_epoch=lease_epoch, transport=transport,
+        ) if tripped.is_set() and _voice_scope_matches(session_id, lease_epoch, transport) else None)
         mult, grace_ms = _fd_barge_params(_voice_cfg_dict())
         wav_path = full_duplex_listen(_should_stop, is_playing=is_audio_output_active,
                                       on_trigger=_on_trigger, multiplier=mult or None,
                                       grace_ms=grace_ms, on_input_error=on_input_error,
                                       start_barrier=lambda: _voice_input_start_barrier(
-                                          session_id, lease_epoch, transport))
+                                          session_id, lease_epoch, transport),
+                                      on_partial=on_partial)
         with _sessions_lock:
             record = _sessions.get(session_id)
             session_running = bool(record and record.get("running"))
-        if (
-            not wav_path
-            and not tripped.is_set()
-            and _voice_scope_matches(session_id, lease_epoch, transport)
-            and not session_running
-            and not _fd_tts_pending()
-            and not is_audio_output_active()
-        ):
-            _voice_emit(
-                "voice.output_drained",
-                session_id=session_id,
-                lease_epoch=lease_epoch,
-                transport=transport,
-            )
+        if (not wav_path and not tripped.is_set()
+                and _voice_scope_matches(session_id, lease_epoch, transport)
+                and not session_running and not _fd_tts_pending()
+                and not is_audio_output_active()):
+            _voice_emit("voice.output_drained", session_id=session_id,
+                        lease_epoch=lease_epoch, transport=transport)
         if not (wav_path and tripped.is_set()):
             return
         try:
@@ -690,13 +689,9 @@ def _full_duplex_listener(
                     transcript_text, session_id, lease_epoch, transport)
             elif result.get("success") and _voice_scope_matches(
                     session_id, lease_epoch, transport):
-                _voice_emit(
-                    "voice.transcript",
-                    {"text": "", "retryable_empty": True, "outcome": "empty"},
-                    session_id=session_id,
-                    lease_epoch=lease_epoch,
-                    transport=transport,
-                )
+                _voice_emit("voice.transcript",
+                            {"text": "", "retryable_empty": True, "outcome": "empty"},
+                            session_id=session_id, lease_epoch=lease_epoch, transport=transport)
             elif not result.get("success"):
                 from tools.voice_input import VoiceInputError
                 on_input_error(VoiceInputError(
@@ -1000,10 +995,13 @@ def _frame_fields(frame: dict) -> dict:
 
 def _wake_probe(cfg: dict, params: dict, surface: str) -> tuple[str, dict]:
     """``(capture_mode, requirements)``; capture stamped so the probe matches what would arm.
-    Desktop (gui) prefers client capture (Mac mic → wake.feed PCM); CLI/TUI stay local."""
+    Desktop (gui) prefers client capture (Mac mic → wake.feed PCM); CLI/TUI stay local unless the
+    caller explicitly advertises a ``client_capture`` feeder (e.g. SmartBox's native voice daemon)."""
     from tools.wake_word import check_wake_word_requirements, resolve_capture_mode
-    prefer_client = surface in ("gui", "desktop") or bool(params.get("client_capture"))
-    capture_mode = resolve_capture_mode(cfg, prefer_client=prefer_client)
+    client_capture = bool(params.get("client_capture"))
+    prefer_client = surface in ("gui", "desktop") or client_capture
+    force_local = surface in ("cli", "tui") and not client_capture
+    capture_mode = resolve_capture_mode(cfg, prefer_client=prefer_client, force_local=force_local)
     return capture_mode, check_wake_word_requirements({**cfg, "capture": capture_mode})
 
 
