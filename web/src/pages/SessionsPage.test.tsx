@@ -317,3 +317,102 @@ describe("SessionsPage header slots across navigation", () => {
     expect(header()).not.toContain(zh.sessionsExtra!.pruneOldSessions);
   });
 });
+
+describe("SessionsPage click-to-expand history in list and overview tabs", () => {
+  it("expands session messages when clicking rows in both default list view and overview recent sessions", async () => {
+    const rows = [
+      {
+        id: "sid-untitled",
+        profile: "default",
+        source: "tui",
+        model: "deepseek-flash",
+        title: null,
+        started_at: 2,
+        ended_at: null,
+        last_active: 2,
+        is_active: false,
+        message_count: 0,
+        tool_call_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        preview: "",
+      },
+      {
+        id: "sid-weekday",
+        profile: "default",
+        source: "smartbox_voice",
+        model: "deepseek-flash",
+        title: "查询今天星期几",
+        started_at: 1,
+        ended_at: null,
+        last_active: 1,
+        is_active: false,
+        message_count: 2,
+        tool_call_count: 0,
+        input_tokens: 10,
+        output_tokens: 10,
+        preview: "今天星期几",
+      },
+    ];
+    apiMocks.getSessions.mockImplementation(async (limit: number) => ({
+      sessions: rows,
+      total: rows.length,
+      limit,
+      offset: 0,
+    }));
+    apiMocks.getSessionMessages.mockImplementation(async (id: string) => ({
+      session_id: id,
+      messages:
+        id === "sid-weekday"
+          ? [
+              { role: "user", content: "今天星期几" },
+              { role: "assistant", content: "今天是星期二。" },
+            ]
+          : [],
+    }));
+
+    const [{ default: SessionsPage }, { I18nProvider }, { SystemActionsProvider }, { ProfileProvider }, { PageHeaderProvider }] =
+      await Promise.all([
+        import("./SessionsPage"),
+        import("@/i18n"),
+        import("@/contexts/SystemActions"),
+        import("@/contexts/ProfileProvider"),
+        import("@/contexts/PageHeaderProvider"),
+      ]);
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () =>
+      root.render(
+        <I18nProvider>
+          <MemoryRouter>
+            <SystemActionsProvider>
+              <ProfileProvider>
+                <PageHeaderProvider pluginTabs={[]}>
+                  <SessionsPage />
+                </PageHeaderProvider>
+              </ProfileProvider>
+            </SystemActionsProvider>
+          </MemoryRouter>
+        </I18nProvider>,
+      ),
+    );
+    await waitFor(() => Boolean(button(zh.sessions.deleteSession)));
+
+    // Switch to Overview ("概览") tab and click the second session ("查询今天星期几")
+    const overviewBtn = Array.from(document.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === zh.sessions.overview,
+    );
+    expect(overviewBtn).toBeTruthy();
+    await act(async () => click(overviewBtn ?? null));
+    await waitFor(() => (document.body.textContent ?? "").includes(zh.status.recentSessions));
+
+    const weekdayRow = Array.from(document.querySelectorAll("div.cursor-pointer")).find((el) =>
+      el.textContent?.includes("查询今天星期几"),
+    );
+    expect(weekdayRow).toBeTruthy();
+    await act(async () => click(weekdayRow ?? null));
+    await waitFor(() => (document.body.textContent ?? "").includes("今天是星期二。"));
+    expect(apiMocks.getSessionMessages).toHaveBeenCalledWith("sid-weekday", "default");
+  });
+});

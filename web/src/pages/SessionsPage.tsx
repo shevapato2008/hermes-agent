@@ -13,7 +13,6 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  Database,
   ListFilter,
   Search,
   Trash2,
@@ -376,7 +375,7 @@ function MessageList({
   return (
     <div
       ref={containerRef}
-      className="flex flex-col gap-3 max-h-[600px] overflow-y-auto pr-2"
+      className="flex flex-col gap-3 max-h-[min(60vh,600px)] overflow-y-auto pr-2"
     >
       {messages.map((msg, i) => (
         <MessageBubble key={i} msg={msg} highlight={highlight} />
@@ -391,6 +390,7 @@ function SessionRow({
   searchQuery,
   isExpanded,
   isSelected,
+  showCheckbox = true,
   onToggle,
   onSelectClick,
   onDelete,
@@ -398,6 +398,7 @@ function SessionRow({
   onExport,
   resumeInChatEnabled,
 }: SessionRowProps) {
+  const rowRef = useRef<HTMLDivElement | null>(null);
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [renaming, setRenaming] = useState(false);
@@ -405,6 +406,14 @@ function SessionRow({
   const [renameSaving, setRenameSaving] = useState(false);
   const { t } = useI18n();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!isExpanded) return;
+    const timer = setTimeout(() => {
+      rowRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+    }, 50);
+    return () => clearTimeout(timer);
+  }, [isExpanded]);
 
   useEffect(() => {
     if (!isExpanded || messages !== null) return;
@@ -540,19 +549,30 @@ function SessionRow({
 
   return (
     <div
+      ref={rowRef}
       className={`max-w-full min-w-0 overflow-hidden border transition-colors ${containerClasses}`}
     >
       <div
         className="flex cursor-pointer items-start gap-3 p-3 transition-colors hover:bg-secondary/30"
         onClick={onToggle}
+        aria-expanded={isExpanded}
       >
-        <span className="flex shrink-0 items-center pt-0.5">
-          <Checkbox
-            checked={isSelected}
-            onClick={handleSelectClick}
-            aria-label={t.sessions.selectSession}
-          />
-        </span>
+        {showCheckbox && (
+          <span className="flex shrink-0 items-center pt-0.5">
+            <Checkbox
+              checked={isSelected}
+              onClick={handleSelectClick}
+              aria-label={t.sessions.selectSession}
+            />
+          </span>
+        )}
+        <div className="shrink-0 pt-0.5 text-muted-foreground">
+          {isExpanded ? (
+            <ChevronDown className="h-4 w-4" />
+          ) : (
+            <ChevronRight className="h-4 w-4" />
+          )}
+        </div>
         <div className={`shrink-0 pt-0.5 ${sourceInfo.color}`}>
           <SourceIcon className="h-4 w-4" />
         </div>
@@ -645,6 +665,11 @@ function SessionRow({
                 <span className="text-border">&#183;</span>
                 <span className="shrink-0">{timeAgo(session.last_active)}</span>
               </div>
+              {hasTitle && session.preview && !snippet && (
+                <p className="font-mondwest normal-case mt-0.5 min-w-0 max-w-full truncate text-xs text-text-tertiary">
+                  {session.preview}
+                </p>
+              )}
               {snippet && <SnippetHighlight snippet={snippet} />}
             </div>
 
@@ -751,7 +776,7 @@ export default function SessionsPage() {
   const logScrollRef = useRef<HTMLPreElement | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [overviewSessions, setOverviewSessions] = useState<SessionInfo[]>([]);
-  const [view, setView] = useState<SessionsView>("overview");
+  const [view, setView] = useState<SessionsView>("list");
   const [sessionCategory, setSessionCategory] =
     useState<SessionFilterCategory>("chats");
   const [sourceSelectionsByCategory, setSourceSelectionsByCategory] =
@@ -1201,8 +1226,10 @@ export default function SessionsPage() {
   // Current search rows carry the same stamp; an unstamped row from an older
   // backend still falls back to the management profile.
   const rowProfile = useCallback(
-    (id: string) => (searchResults ?? sessions).find((s) => s.id === id)?.profile,
-    [searchResults, sessions],
+    (id: string) =>
+      (searchResults ?? sessions).find((s) => s.id === id)?.profile ??
+      overviewSessions.find((s) => s.id === id)?.profile,
+    [overviewSessions, searchResults, sessions],
   );
 
   const sessionDelete = useConfirmDelete({
@@ -1211,6 +1238,7 @@ export default function SessionsPage() {
         try {
           await api.deleteSession(id, rowProfile(id));
           setSessions((prev) => prev.filter((s) => s.id !== id));
+          setOverviewSessions((prev) => prev.filter((s) => s.id !== id));
           setTotal((prev) => prev - 1);
           if (expandedId === id) setExpandedId(null);
           // Drop the deleted ID from any active bulk-select set — it
@@ -1467,7 +1495,8 @@ export default function SessionsPage() {
   }, [pruneDays, showToast, loadSessions, loadStats]);
 
   const pendingSession = sessionDelete.pendingId
-    ? sessions.find((s) => s.id === sessionDelete.pendingId)
+    ? (sessions.find((s) => s.id === sessionDelete.pendingId) ??
+       overviewSessions.find((s) => s.id === sessionDelete.pendingId))
     : null;
 
   // Build snippet map from search results (session_id → snippet)
@@ -2069,48 +2098,21 @@ export default function SessionsPage() {
 
               <CardContent className="grid min-w-0 gap-3">
                 {recentSessions.map((s) => (
-                  <div
+                  <SessionRow
                     key={s.id}
-                    className="flex min-w-0 max-w-full flex-col gap-2 border border-border p-3 sm:flex-row sm:items-center sm:justify-between"
-                  >
-                    <div className="flex min-w-0 flex-1 flex-col gap-1">
-                      <span
-                        className={`font-mondwest normal-case min-w-0 truncate text-sm ${s.title ? "font-medium" : "text-muted-foreground italic"}`}
-                      >
-                        {s.title ??
-                          (s.preview
-                            ? s.preview.slice(0, 60)
-                            : t.common.untitled)}
-                      </span>
-
-                      <span className="min-w-0 break-words text-xs text-muted-foreground">
-                        {s.model && (
-                          <>
-                            <span className="font-mono-ui">
-                              {s.model.split("/").pop()}
-                            </span>{" "}
-                            ·{" "}
-                          </>
-                        )}
-                        {s.message_count} {t.common.msgs} ·{" "}
-                        {timeAgo(s.last_active)}
-                      </span>
-
-                      {s.preview && s.title && (
-                        <p className="font-mondwest normal-case min-w-0 max-w-full text-xs leading-snug text-text-tertiary [overflow-wrap:anywhere]">
-                          {s.preview}
-                        </p>
-                      )}
-                    </div>
-
-                    <Badge
-                      tone="outline"
-                      className="shrink-0 self-start text-xs sm:self-center"
-                    >
-                      <Database className="mr-1 h-3 w-3" />
-                      {s.source ? sourceLabel(s.source) : "local"}
-                    </Badge>
-                  </div>
+                    session={s}
+                    isExpanded={expandedId === s.id}
+                    isSelected={false}
+                    showCheckbox={false}
+                    onToggle={() =>
+                      setExpandedId((prev) => (prev === s.id ? null : s.id))
+                    }
+                    onSelectClick={() => {}}
+                    onDelete={() => sessionDelete.requestDelete(s.id)}
+                    onRename={handleRename}
+                    onExport={handleExport}
+                    resumeInChatEnabled={resumeInChatEnabled}
+                  />
                 ))}
               </CardContent>
             </Card>
@@ -2134,6 +2136,7 @@ interface SessionRowProps {
   resumeInChatEnabled: boolean;
   searchQuery?: string;
   session: SessionInfo;
+  showCheckbox?: boolean;
   snippet?: string;
 }
 
