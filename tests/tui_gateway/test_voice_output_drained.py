@@ -293,3 +293,29 @@ def test_auto_continue_keeps_same_text_barge_in_when_inflight_interrupted_and_dr
     assert server._drain_queued_prompt("drain-1", "sid-ac", session) is True
     assert session.get("_turn_cancel_requested") is False
 
+
+def test_send_tts_eof_enqueues_none_sentinel_once_and_preserves_tts_queue():
+    import queue
+    from tui_gateway import prompt_turn
+
+    q: queue.Queue = queue.Queue()
+    st = prompt_turn._TurnRun(
+        agent=types.SimpleNamespace(),
+        one_turn_restore=None,
+        terminal_callback=None,
+        receipt_committed=True,
+        tts_queue=q,
+    )
+    assert getattr(st, "tts_eof_sent", False) is False
+    prompt_turn._send_tts_eof(st)
+    assert st.tts_eof_sent is True
+    assert st.tts_queue is q
+    assert q.get_nowait() is None
+    assert q.empty()
+
+    # Second call (e.g. in _release_turn_scopes) must be a no-op
+    prompt_turn._send_tts_eof(st)
+    assert q.empty()
+    assert st.tts_queue is q
+
+

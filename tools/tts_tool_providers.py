@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import contextlib
 import json
 import logging
 import os
 import queue
 import re
+import socket
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -224,6 +226,99 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: dict[str, 
     return output_path
 
 
+_EDGE_LOOP_LOCK = threading.Lock()
+_EDGE_LOOP_PID: Optional[int] = None
+_EDGE_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_EDGE_LOOP_THREAD: Optional[threading.Thread] = None
+_EDGE_SHARED_CONNECTOR: Any = None
+
+
+async def _create_edge_shared_connector() -> Any:
+    with contextlib.suppress(Exception):
+        import aiohttp
+
+        class _SharedTCPConnector(aiohttp.TCPConnector):
+            async def close(self, *_args: Any, **_kwargs: Any) -> None:
+                pass
+
+            async def aclose_real(self) -> None:
+                await super().close()
+
+        return _SharedTCPConnector(
+            family=socket.AF_INET,
+            ttl_dns_cache=300,
+            limit=8,
+        )
+    return None
+
+
+def _get_edge_tts_loop_and_connector() -> tuple[asyncio.AbstractEventLoop, Any]:
+    global _EDGE_LOOP_PID, _EDGE_LOOP, _EDGE_LOOP_THREAD, _EDGE_SHARED_CONNECTOR
+    pid = os.getpid()
+    with _EDGE_LOOP_LOCK:
+        if (
+            _EDGE_LOOP is not None
+            and not _EDGE_LOOP.is_closed()
+            and _EDGE_LOOP_PID == pid
+            and _EDGE_LOOP_THREAD is not None
+            and _EDGE_LOOP_THREAD.is_alive()
+        ):
+            return _EDGE_LOOP, _EDGE_SHARED_CONNECTOR
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run_loop() -> None:
+            asyncio.set_event_loop(loop)
+            ready.set()
+            loop.run_forever()
+
+        thread = threading.Thread(  # health: allow HX012 -- persistent daemon event loop for Edge TTS connector reuse
+            target=_run_loop, name="edge-tts-shared-loop", daemon=True
+        )
+        thread.start()
+        ready.wait(timeout=2.0)
+        init_fut = asyncio.run_coroutine_threadsafe(_create_edge_shared_connector(), loop)
+        connector = init_fut.result(timeout=2.0)
+        _EDGE_LOOP_PID = pid
+        _EDGE_LOOP = loop
+        _EDGE_LOOP_THREAD = thread
+        _EDGE_SHARED_CONNECTOR = connector
+        return loop, connector
+
+
+def _build_edge_communicate(
+    edge_tts: Any, text: str, kwargs: dict[str, Any], connector: Any
+) -> Any:
+    if connector is not None:
+        try:
+            return edge_tts.Communicate(
+                text, connector=connector, connect_timeout=4, **kwargs
+            )
+        except TypeError:
+            pass
+    return edge_tts.Communicate(text, **kwargs)
+
+
+async def _stream_edge_once(
+    comm: Any,
+    chunk_q: queue.Queue[object],
+    stop_event: Optional[threading.Event],
+) -> bool:
+    emitted_any = False
+    async with contextlib.aclosing(comm.stream()) as stream:
+        async for item in stream:
+            if stop_event is not None and stop_event.is_set():
+                return emitted_any
+            if not isinstance(item, dict) or item.get("type") != "audio":
+                continue
+            data = item.get("data")
+            if not data:
+                continue
+            emitted_any = True
+            chunk_q.put(bytes(data))
+    return emitted_any
+
+
 def stream_edge_tts_mp3_chunks(
     text: str,
     stop_event: Optional[threading.Event] = None,
@@ -237,21 +332,15 @@ def stream_edge_tts_mp3_chunks(
     chunk_q: queue.Queue[object] = queue.Queue()
     sentinel = object()
     errors: list[BaseException] = []
+    loop, connector = _get_edge_tts_loop_and_connector()
 
     async def _produce() -> None:
         max_attempts = 2
         for attempt in range(1, max_attempts + 1):
             emitted_any = False
             try:
-                comm = edge_tts.Communicate(text, **kwargs)
-                async for item in comm.stream():
-                    if stop_event is not None and stop_event.is_set():
-                        return
-                    if isinstance(item, dict) and item.get("type") == "audio":
-                        data = item.get("data")
-                        if data:
-                            emitted_any = True
-                            chunk_q.put(bytes(data))
+                comm = _build_edge_communicate(edge_tts, text, kwargs, connector)
+                emitted_any = await _stream_edge_once(comm, chunk_q, stop_event)
                 return
             except Exception as exc:  # health: allow BLE001 -- re-raised on consumer thread via errors list
                 if emitted_any or attempt >= max_attempts or (stop_event is not None and stop_event.is_set()):
@@ -263,17 +352,8 @@ def stream_edge_tts_mp3_chunks(
                 )
                 await asyncio.sleep(0.35)
 
-    def _runner() -> None:
-        try:
-            asyncio.run(_produce())
-        except BaseException as exc:  # health: allow BLE001 -- thread boundary: forward exception to consumer via errors list
-            errors.append(exc)
-        finally:
-            chunk_q.put(sentinel)
-
-    from agent.memory_provider import spawn_context_thread
-    worker = spawn_context_thread(_runner, name="edge-tts-stream")
-    worker.start()
+    fut = asyncio.run_coroutine_threadsafe(_produce(), loop)
+    fut.add_done_callback(lambda _f: chunk_q.put(sentinel))
     try:
         while True:
             if stop_event is not None and stop_event.is_set():
@@ -288,7 +368,11 @@ def stream_edge_tts_mp3_chunks(
         if errors and not (stop_event is not None and stop_event.is_set()):
             raise errors[0]
     finally:
-        worker.join(timeout=0.1 if (stop_event is not None and stop_event.is_set()) else 2.0)
+        if not fut.done():
+            fut.cancel()
+        concurrent.futures.wait(
+            [fut], timeout=0.1 if (stop_event is not None and stop_event.is_set()) else 2.0
+        )
 
 
 # --- ElevenLabs ---

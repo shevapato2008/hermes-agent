@@ -510,6 +510,7 @@ class _TurnRun:
     scopes: _TurnScopes = dataclasses.field(default_factory=_TurnScopes)
     result: Any = None  # read after the finally for leftover /steer
     tts_queue: Any = None
+    tts_eof_sent: bool = False
     thinking_started: bool = False
     history: list = dataclasses.field(default_factory=list)
     history_version: int = 0
@@ -520,6 +521,14 @@ class _TurnRun:
     prompt_text: str = ""
     marker_key: str = ""
     receipt_attempted: bool = False
+
+
+def _send_tts_eof(st: _TurnRun) -> None:
+    """Enqueue the end-of-text sentinel onto ``st.tts_queue`` once so ``chunker.flush()``
+    starts before post-turn SQLite/Judge work while keeping ``st.tts_queue`` non-None."""
+    if st.tts_queue is not None and not st.tts_eof_sent:
+        st.tts_eof_sent = True
+        st.tts_queue.put(None)
 
 
 def _adopt_out_of_band_turns(session: dict) -> None:
@@ -1071,8 +1080,7 @@ def _release_turn_scopes(sid: str, session: dict, st: _TurnRun) -> None:
         with contextlib.suppress(Exception):
             from tools.voice_mode import stop_thinking_sound
             stop_thinking_sound()
-    if st.tts_queue is not None:
-        st.tts_queue.put(None)  # end-of-text sentinel — flush + finish speaking
+    _send_tts_eof(st)
     if st.one_turn_restore:
         try:
             _restore_agent_model_runtime(st.agent, st.one_turn_restore)
@@ -1205,6 +1213,7 @@ def _run_prompt_submit(
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
                 display_metadata, turn_author, text)
+            _send_tts_eof(st)
             status_note = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)

@@ -63,6 +63,64 @@ class TestSentenceChunker:
         assert chunks[0] == "如果你没听清，"
         assert len(chunks) <= 3
 
+    def test_smartbox_chunker_short_expressive_cjk_and_no_mid_token_tilde_splits(self):
+        c1 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c1.feed("喵——喵～") == ["喵——喵～"]
+        assert c1.flush() == []
+
+        c2 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c2.feed("嗯，你说。") == ["嗯，你说。"]
+        assert c2.flush() == []
+
+        for sample in (
+            "文件在~/.hermes/config.yaml。",
+            "今天延迟大约~50ms。",
+            "营业时间是周一~周五。",
+            "今天广州晴天，气温20～31度。",
+        ):
+            single = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+            assert single.feed(sample) == [sample], f"unexpected single-shot split for {sample!r}"
+            assert single.flush() == []
+
+            char_by_char = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+            emitted: list[str] = []
+            for ch in sample:
+                emitted.extend(char_by_char.feed(ch))
+            emitted.extend(char_by_char.flush())
+            assert emitted == [sample], f"unexpected char-by-char split for {sample!r}: {emitted!r}"
+
+    def test_smartbox_chunker_avoids_short_comma_chop_and_emits_post_first_sentence_immediately(self):
+        c1 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        date_reply = "今天是星期四，十一月十九号，晚上六点半。"
+        emitted: list[str] = []
+        for ch in date_reply:
+            emitted.extend(c1.feed(ch))
+        assert emitted == [date_reply]
+        assert c1.flush() == []
+
+        c2 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        first_clause = "英国短毛猫本身是源自英国的传统家猫品种，"
+        second_sent = "主要按毛色分。"
+        assert len(first_clause) >= 18
+        assert 6 <= len(second_sent) < 18
+        assert c2.feed(first_clause) == [first_clause]
+        # Must emit immediately in feed() without waiting for flush()
+        assert c2.feed(second_sent) == [second_sent]
+        assert c2.flush() == []
+
+    def test_from_config_loads_min_len_first_clause_and_post_first_min_len(self):
+        cfg = {
+            "streaming": {
+                "min_len": 4,
+                "first_clause_min_len": 18,
+                "post_first_min_len": 6,
+            }
+        }
+        c = ts.SentenceChunker.from_config(cfg)
+        assert c.min_len == 4
+        assert c.first_clause_min_len == 18
+        assert c.post_first_min_len == 6
+
 
 # ── Interruption latch ───────────────────────────────────────────────────
 
@@ -1492,6 +1550,111 @@ def test_edge_pipe_player_cmd_and_sync_sentence_pipeline_fast_stop(monkeypatch):
     finally:
         setter.cancel()
         stop_event.set()
+
+
+def test_sync_sentence_pipeline_edge_pipe_uses_two_workers_for_concurrent_prefetch(monkeypatch):
+    from tools import tts_tool_providers
+    from tools import tts_tool_speaker
+
+    stop_plain = threading.Event()
+    plain_pipeline = tts_tool_speaker._SyncSentencePipeline(
+        stop_plain, lookahead=3, use_edge_pipe=False
+    )
+    try:
+        assert plain_pipeline._executor._max_workers == 1
+    finally:
+        stop_plain.set()
+        plain_pipeline.close()
+
+    s1_first_chunk_sent = threading.Event()
+    s1_allow_finish = threading.Event()
+    s2_started = threading.Event()
+
+    def _fake_stream(text, stop_event=None, tts_config=None):
+        if text.startswith("第一句"):
+            yield b"MP3-1A"
+            s1_first_chunk_sent.set()
+            s1_allow_finish.wait(timeout=2.0)
+            yield b"MP3-1B"
+        else:
+            s2_started.set()
+            yield b"MP3-2A"
+
+    monkeypatch.setattr(tts_tool_providers, "stream_edge_tts_mp3_chunks", _fake_stream)
+    monkeypatch.setattr(
+        tts_tool_speaker._SyncSentencePipeline,
+        "_play_edge_chunk_queue",
+        lambda self, sentence, chunk_queue: s1_allow_finish.wait(timeout=2.0),
+    )
+
+    stop_edge = threading.Event()
+    edge_pipeline = tts_tool_speaker._SyncSentencePipeline(
+        stop_edge, lookahead=3, use_edge_pipe=True
+    )
+    try:
+        assert edge_pipeline._executor._max_workers == 2
+        edge_pipeline.speak("第一句正在持续流式传输，")
+        assert s1_first_chunk_sent.wait(timeout=1.0), "Sentence 1 did not start streaming"
+        edge_pipeline.speak("第二句应该在第一句尚未结束时并发预取。")
+        assert s2_started.wait(timeout=1.0), (
+            "Sentence 2 prefetch did not overlap while Sentence 1 was still streaming"
+        )
+    finally:
+        s1_allow_finish.set()
+        stop_edge.set()
+        edge_pipeline.close()
+
+
+def test_stream_edge_tts_mp3_chunks_acloses_async_stream_on_stop_and_early_break(monkeypatch):
+    from tools import tts_tool
+    from tools import tts_tool_providers
+
+    closed_streams: list[str] = []
+
+    class _FakeAsyncStream:
+        def __init__(self, text: str):
+            self.text = text
+            self.step = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self.step += 1
+            if self.step <= 3:
+                return {"type": "audio", "data": f"chunk-{self.step}".encode()}
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            closed_streams.append(self.text)
+
+    class _FakeCommunicate:
+        def __init__(self, text, **kwargs):
+            self.text = text
+            self.kwargs = kwargs
+
+        def stream(self):
+            return _FakeAsyncStream(self.text)
+
+    fake_edge = MagicMock(Communicate=_FakeCommunicate)
+    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: fake_edge)
+
+    # Case 1: stop_event triggers mid-stream
+    stop_evt = threading.Event()
+    gen1 = tts_tool_providers.stream_edge_tts_mp3_chunks("停止测试", stop_event=stop_evt, tts_config={})
+    first = next(gen1)
+    assert first == b"chunk-1"
+    stop_evt.set()
+    remaining = list(gen1)
+    assert remaining == []
+    assert "停止测试" in closed_streams
+
+    # Case 2: caller closes generator early after first chunk
+    gen2 = tts_tool_providers.stream_edge_tts_mp3_chunks("提前退出测试", stop_event=threading.Event(), tts_config={})
+    assert next(gen2) == b"chunk-1"
+    gen2.close()
+    assert "提前退出测试" in closed_streams
+
 
 
 

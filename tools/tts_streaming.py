@@ -63,10 +63,12 @@ def take_speech_interrupted() -> bool:
     at, _interrupted_at = _interrupted_at, None
     return at is not None and time.monotonic() - at < _INTERRUPT_TTL_S
 
-# Sentence boundary: after ASCII .!? followed by whitespace, after CJK sentence-ending
-# punctuation (。！？…) with optional trailing whitespace, or a blank line.
+# Sentence boundary: after ASCII .!? followed by whitespace, after expressive ~ following a word/CJK
+# char before whitespace/newline, after CJK sentence-ending punctuation (。！？…～〜) outside numeric
+# ranges with optional trailing whitespace, or a blank line.
 SENTENCE_BOUNDARY_RE = re.compile(
-    r"(?<=[.!?])(?:\s|\n)|(?<=[。！？…])\s*|(?:\n\n)"
+    r"(?<=[.!?])(?:\s|\n)|(?<=[\u3400-\u9fff\uf900-\ufaffA-Za-z]~)(?:\s|\n)"
+    r"|(?<=[。！？…])\s*|(?<![0-9一二三四五六七八九十零][～〜])(?<=[～〜])(?![0-9])\s*|(?:\n\n)"
 )
 _CJK_CLAUSE_BOUNDARY_RE = re.compile(r"(?<=[，、；：])\s*")
 _CJK_CHAR_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
@@ -82,24 +84,43 @@ class SentenceChunker:
     speak-stream WebSocket so every surface cuts speech identically. Strips ``<think>`` blocks (even
     split across deltas) and merges fragments shorter than *min_len* into the following sentence."""
 
-    def __init__(self, min_len: int = 20):
+    def __init__(
+        self,
+        min_len: int = 20,
+        first_clause_min_len: int = 6,
+        post_first_min_len: Optional[int] = None,
+    ):
         self.min_len = min_len
+        self.first_clause_min_len = first_clause_min_len
+        self.post_first_min_len = post_first_min_len
         self.buf = ""
         self._emitted_first = False
 
     @classmethod
     def from_config(cls, tts_config: dict) -> SentenceChunker:
-        """Chunker honouring ``tts.streaming.min_len``. 20 suits English; a CJK opener of 5–7
-        characters is a whole clause, so voice setups lower it to speak the first sentence
-        alone instead of buffering it behind the second. Floor 1: 0 would emit every boundary."""
+        """Chunker honouring ``tts.streaming.min_len`` ( plus ``first_clause_min_len`` /
+        ``post_first_min_len``). 20 suits English; a CJK opener of 5–7 characters is a whole
+        sentence, so voice setups lower it to speak the first sentence alone instead of buffering
+        it behind the second. Floor 1: 0 would emit every boundary."""
         try:
-            return cls(min_len=max(1, int((tts_config.get("streaming") or {}).get("min_len", 20))))
+            streaming_cfg = tts_config.get("streaming") or {}
+            raw_first_clause = streaming_cfg.get("first_clause_min_len", 6)
+            raw_post_first = streaming_cfg.get("post_first_min_len")
+            return cls(
+                min_len=max(1, int(streaming_cfg.get("min_len", 20))),
+                first_clause_min_len=max(1, int(raw_first_clause)),
+                post_first_min_len=(
+                    max(1, int(raw_post_first)) if raw_post_first is not None else None
+                ),
+            )
         except (AttributeError, TypeError, ValueError):  # non-mapping / non-numeric → default
             return cls()
 
     def _effective_min_len(self, text: str) -> int:
         if _CJK_CHAR_RE.search(text):
             return min(self.min_len, 6)
+        if self.post_first_min_len is not None:
+            return max(self.min_len, 12)
         return self.min_len
 
     def _first_valid_match(self, pattern: re.Pattern[str], min_chars: int) -> Optional[re.Match[str]]:
@@ -117,9 +138,10 @@ class SentenceChunker:
             return []  # open think tag — the closing tag may arrive next delta
         out: list[str] = []
         if not self._emitted_first and _CJK_CHAR_RE.search(self.buf):
-            first_min = min(self.min_len, 6)
-            clause_m = self._first_valid_match(_CJK_CLAUSE_BOUNDARY_RE, first_min)
-            sent_m = self._first_valid_match(SENTENCE_BOUNDARY_RE, first_min)
+            sent_min = min(self.min_len, 6)
+            clause_min = max(2, int(self.first_clause_min_len))
+            clause_m = self._first_valid_match(_CJK_CLAUSE_BOUNDARY_RE, clause_min)
+            sent_m = self._first_valid_match(SENTENCE_BOUNDARY_RE, sent_min)
             if clause_m is not None and sent_m is not None:
                 chosen = clause_m if clause_m.end() <= sent_m.end() else sent_m
             else:
@@ -129,9 +151,14 @@ class SentenceChunker:
                 self.buf = self.buf[chosen.end() :]
                 self._emitted_first = True
         start = 0  # skip boundaries that would leave the head too short
+        post_min = (
+            self.post_first_min_len
+            if self.post_first_min_len is not None
+            else max(self.min_len, 18)
+        )
         while start <= len(self.buf) and (m := SENTENCE_BOUNDARY_RE.search(self.buf, start)):
             head = self.buf[: m.end()]
-            min_required = max(self.min_len, 18) if self._emitted_first else self._effective_min_len(head)
+            min_required = post_min if self._emitted_first else self._effective_min_len(head)
             if len(head.strip()) < min_required:
                 start = max(m.end(), m.start() + 1)
                 continue

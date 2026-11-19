@@ -174,7 +174,8 @@ class _SyncSentencePipeline:
         self._queue: queue.Queue[Optional[tuple[str, Future, Optional[queue.Queue[Optional[bytes]]]]]] = (
             queue.Queue(maxsize=max(1, lookahead))
         )
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-sync-synth")
+        workers = min(2, max(1, lookahead)) if self._use_edge_pipe else 1
+        self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tts-sync-synth")
         self._player = spawn_context_thread(self._drain, name="tts-sync-play")
         self._player.start()
 
