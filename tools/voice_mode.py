@@ -434,6 +434,8 @@ def play_beep(frequency: int = 880, duration: float = 0.12, count: int = 1) -> N
         samples_per_beep = int(SAMPLE_RATE * duration)
         gap = np.zeros(int(SAMPLE_RATE * 0.06), dtype=np.int16)  # 60ms between beeps
         beep_volume = _get_beep_volume()
+        if beep_volume <= 0.0 or str(_voice_config().get("input_provider") or "").strip().lower() == "pulse_cli":
+            return
         parts = []
         for i in range(count):
             t = np.linspace(0, duration, samples_per_beep, endpoint=False)
