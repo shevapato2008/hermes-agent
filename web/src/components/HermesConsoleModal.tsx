@@ -16,6 +16,10 @@ import {
   refitWhenTerminalFontLoads,
   TERMINAL_FONT_FAMILY,
 } from "@/lib/terminal-font-refit";
+import {
+  terminalFontSizeForWidth,
+  terminalTierWidthPx,
+} from "@/lib/terminal-appearance";
 import { cn, themedBody } from "@/lib/utils";
 import { useTheme } from "@/themes";
 import { errorMessage } from "@/lib/api-error";
@@ -356,7 +360,7 @@ export function HermesConsoleModal({ open, onClose }: HermesConsoleModalProps) {
       allowProposedApi: true,
       cursorBlink: true,
       fontFamily: TERMINAL_FONT_FAMILY,
-      fontSize: 13,
+      fontSize: terminalFontSizeForWidth(terminalTierWidthPx(host)),
       lineHeight: 1.25,
       letterSpacing: 0,
       macOptionIsMeta: true,

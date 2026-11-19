@@ -107,11 +107,35 @@ def _edge_pipe_player_cmd() -> Optional[list[str]]:
     if shutil.which("gst-launch-1.0"):
         return [
             "gst-launch-1.0", "-q", "fdsrc", "fd=0",
-            "!", "decodebin", "!", "audioconvert", "!", "audioresample", "!", "pulsesink",
+            "!", "decodebin", "!", "audioconvert", "!", "audioresample",
+            "!", "pulsesink", "buffer-time=60000", "latency-time=20000",
         ]
     if (platform.system() != "Darwin" or shutil.which is not _STOCK_WHICH) and shutil.which("ffplay"):
         return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"]
     return None
+
+
+def _queue_get_stop(
+    q: queue.Queue, stop_event: threading.Event, timeout: float = 0.05
+) -> tuple[Any, bool]:
+    while not stop_event.is_set():
+        try:
+            return q.get(timeout=timeout), stop_event.is_set()
+        except queue.Empty:
+            continue
+    return None, True
+
+
+def _terminate_pipe_proc(proc: subprocess.Popen) -> None:
+    with contextlib.suppress(OSError):
+        proc.terminate()
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            proc.kill()
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            proc.wait(timeout=1.0)
 
 
 def _can_stream_edge_pipe(tts_config: dict, preferred: Optional[str] = None) -> bool:
@@ -167,23 +191,36 @@ class _SyncSentencePipeline:
             return
         if self._use_edge_pipe:
             chunk_queue: queue.Queue[Optional[bytes]] = queue.Queue()
-            self._queue.put((
+            item = (
                 cleaned,
                 self._executor.submit(ctx_bound(self._prefetch_edge_chunks), cleaned, chunk_queue),
                 chunk_queue,
-            ))
-            return
-        self._queue.put((
-            cleaned,
-            self._executor.submit(ctx_bound(self._synthesize_to_tmp), cleaned),
-            None,
-        ))
+            )
+        else:
+            item = (
+                cleaned,
+                self._executor.submit(ctx_bound(self._synthesize_to_tmp), cleaned),
+                None,
+            )
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.05)
+                return
+            except queue.Full:
+                continue
+        item[1].cancel()
+        if item[2] is None:
+            item[1].add_done_callback(
+                lambda fut: _unlink_quietly(fut.result())
+                if not fut.cancelled() and fut.exception() is None
+                else None
+            )
 
     def close(self) -> None:
         """Flush queued sentences in order (skipped if stopped), then join."""
         self._queue.put(None)
         self._player.join()
-        self._executor.shutdown(wait=True)
+        self._executor.shutdown(wait=not self._stop.is_set(), cancel_futures=True)
 
     def _prefetch_edge_chunks(self, cleaned: str, chunk_queue: queue.Queue[Optional[bytes]]) -> None:
         try:
@@ -201,8 +238,10 @@ class _SyncSentencePipeline:
             chunk_queue.put(None)
 
     def _play_edge_chunk_queue(self, sentence: str, chunk_queue: queue.Queue[Optional[bytes]]) -> None:
-        first = chunk_queue.get()
-        if first is None or self._stop.is_set():
+        if self._stop.is_set():
+            return
+        first, stopped = _queue_get_stop(chunk_queue, self._stop)
+        if first is None or stopped:
             return
         cmd = _edge_pipe_player_cmd()
         if cmd is None:
@@ -235,25 +274,25 @@ class _SyncSentencePipeline:
             )
             _set_active_playback(proc)
             assert proc.stdin is not None
-            for chunk in itertools.chain([first], iter(chunk_queue.get, None)):
-                if self._stop.is_set():
-                    break
+            chunk: Optional[bytes] = first
+            while chunk is not None and not self._stop.is_set():
                 try:
                     proc.stdin.write(chunk)
                 except BrokenPipeError:
                     break
+                chunk, stopped = _queue_get_stop(chunk_queue, self._stop)
+                if stopped:
+                    break
             with contextlib.suppress(Exception):
                 proc.stdin.close()
             if self._stop.is_set():
-                with contextlib.suppress(Exception):
-                    proc.terminate()
-            proc.wait(timeout=120)
+                _terminate_pipe_proc(proc)
+            else:
+                proc.wait(timeout=120)
         except Exception as exc:
             logger.warning("Edge pipe TTS playback failed: %s", exc, exc_info=True)
             if proc is not None and proc.poll() is None:
-                with contextlib.suppress(Exception):
-                    proc.terminate()
-                    proc.wait(timeout=5)
+                _terminate_pipe_proc(proc)
         finally:
             if _voice_mode is not None:
                 with _playback_lock:
@@ -280,10 +319,15 @@ class _SyncSentencePipeline:
 
     def _drain(self) -> None:
         for sentence, future, chunk_queue in iter(self._queue.get, None):
+            if self._stop.is_set():
+                if future is not None:
+                    future.cancel()
+                continue
             if chunk_queue is not None:
                 self._play_edge_chunk_queue(sentence, chunk_queue)
-                with contextlib.suppress(Exception):
-                    future.result(timeout=5)
+                if not self._stop.is_set():
+                    with contextlib.suppress(Exception):
+                        future.result(timeout=5)
                 continue
             tmp_path = None
             try:

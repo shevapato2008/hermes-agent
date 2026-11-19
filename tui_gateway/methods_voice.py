@@ -739,16 +739,22 @@ def _fd_trip(
         for _stop, _done in _fd_speak_pipelines:
             _stop.set()
     stop_playback()
-    if phase != "playback":
-        try:
-            with _sessions_lock:
-                session = _sessions.get(session_id)
-            agent = session.get("agent") if session and session.get("running") else None
+    try:
+        with _sessions_lock:
+            session = _sessions.get(session_id)
+        if session and session.get("running"):
+            lock = session.get("history_lock")
+            if lock is not None:
+                with lock:
+                    session["_turn_cancel_requested"] = True
+            else:
+                session["_turn_cancel_requested"] = True
+            agent = session.get("agent")
             if agent is not None and hasattr(agent, "interrupt"):
                 with contextlib.suppress(Exception):
                     agent.interrupt()
-        except Exception as e:
-            logger.debug("voice interjection interrupt failed: %s", e)
+    except Exception as e:
+        logger.debug("voice interjection interrupt failed: %s", e)
     _voice_emit(
         "voice.interrupted", session_id=session_id, lease_epoch=lease_epoch,
         transport=transport)
@@ -1743,43 +1749,11 @@ def _(rid, params: dict) -> dict:
             sid, transport, allow_unclaimed=True
         ):
             return _err(rid, 4016, "voice capture is owned by another session")
-        if owner and not capture_live:
-            with _fd_listener_lock:
-                full_duplex_active = _fd_listener_active
-            placeholder_handoff = (
-                owner == "__local_voice__" and owner_transport is transport
-            )
-            same_scope = owner == sid and owner_transport is transport
-            if not full_duplex_active and not placeholder_handoff and not same_scope:
-                release_failures = []
-                released, release_error = _release_voice_lease(
-                    session_id=owner, lease_epoch=epoch, transport=owner_transport,
-                    stop_loop=False,
-                    before_expose=lambda: _resume_voice_wake(
-                        expected_transport=owner_transport,
-                        expected_epoch=epoch,
-                    ),
-                    on_failure=release_failures.append)
-                if not released:
-                    if not release_failures:
-                        return _err(rid, 4016, release_error)
-                    from tools.voice_input import VoiceInputReleaseError
-                    _voice_terminal_error_epochs.add(epoch)
-                    failure = release_failures[-1]
-                    _voice_emit(
-                        "voice.input_error",
-                        _input_error_payload(
-                            failure if isinstance(failure, VoiceInputReleaseError)
-                            else VoiceInputReleaseError(str(failure)),
-                            released=False,
-                        ),
-                        session_id=owner,
-                        lease_epoch=epoch,
-                        transport=owner_transport,
-                        capture_id=capture_id,
-                    )
-                    return _err(rid, 5025, release_error)
-                owner, epoch, owner_transport, capture_id = _voice_scope_snapshot()
+        if pre_err := _release_pre_record_lease(
+            rid, sid, transport, owner, epoch, owner_transport, capture_id, capture_live
+        ):
+            return pre_err
+        owner, epoch, owner_transport, capture_id = _voice_scope_snapshot()
         unleased_capture = owner_transport is None and capture_live
         requested_capture = capture_id or uuid.uuid4().hex
         with _voice_lifecycle_lock:

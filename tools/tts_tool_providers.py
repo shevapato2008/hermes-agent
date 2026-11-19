@@ -278,14 +278,17 @@ def stream_edge_tts_mp3_chunks(
         while True:
             if stop_event is not None and stop_event.is_set():
                 break
-            item = chunk_q.get()
+            try:
+                item = chunk_q.get(timeout=0.05)
+            except queue.Empty:
+                continue
             if item is sentinel:
                 break
             yield item  # type: ignore[misc]
         if errors and not (stop_event is not None and stop_event.is_set()):
             raise errors[0]
     finally:
-        worker.join(timeout=2.0)
+        worker.join(timeout=0.1 if (stop_event is not None and stop_event.is_set()) else 2.0)
 
 
 # --- ElevenLabs ---

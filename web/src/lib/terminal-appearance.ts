@@ -37,12 +37,10 @@ function readRootNumberVar(varName: string): number | null {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
-function configuredFontSizeForWidth(layoutWidthPx: number, configured: number): number {
-  if (layoutWidthPx < 300) return 9;
+export function configuredFontSizeForWidth(layoutWidthPx: number, configured: number): number {
   if (layoutWidthPx < 360) return 10;
-  if (layoutWidthPx < 440) return 12;
-  if (layoutWidthPx < 640) return Math.max(13, configured - 2);
-  if (layoutWidthPx < 780) return Math.max(14, configured - 1);
+  if (layoutWidthPx < 460) return Math.max(11, configured - 2);
+  if (layoutWidthPx < 580) return Math.max(12, configured - 1);
   return configured;
 }
 

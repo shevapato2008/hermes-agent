@@ -144,6 +144,13 @@ def _ac_inflight_original(session: dict) -> str:
     return str(turn.get("user") or "").strip() if isinstance(turn, dict) else ""
 
 
+def _ac_inflight_interrupted(session: dict) -> bool:
+    if session.get("_turn_cancel_requested") is True:
+        return True
+    agent = session.get("agent")
+    return getattr(agent, "_interrupt_requested", False) is True
+
+
 def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None,
                     turn_author: dict | None = None) -> dict | None:
     """Queue a message for the next turn. Text-only arrivals share a slot and merge losslessly (like the
@@ -158,7 +165,12 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
     _drop_queued_duplicates_of_inflight_user(session)
     text_only = not image_paths and isinstance(text, str)
     # A text-only self-copy of the live prompt would restart it on drain; an authored copy is another sender's message.
-    if text_only and not turn_author and text.strip() == _ac_inflight_original(session) != "":
+    if (
+        text_only
+        and not turn_author
+        and text.strip() == _ac_inflight_original(session) != ""
+        and not _ac_inflight_interrupted(session)
+    ):
         return None
     queued = {"text": text, "transport": transport, **({"image_paths": image_paths} if image_paths else {}),
               **({"turn_author": turn_author} if turn_author else {})}
@@ -204,7 +216,7 @@ def _drop_queued_duplicates_of_inflight_user(session: dict) -> None:
     different prompt via redirect, that stale self-duplicate must not ``_drain_queued_prompt`` after the
     redirected turn completes — otherwise the original prompt restarts as a fresh agent turn (#84417).
     """
-    if not (original := _ac_inflight_original(session)):
+    if not (original := _ac_inflight_original(session)) or _ac_inflight_interrupted(session):
         return
     head = session.get("queued_prompt")
     cleaned = (_sanitize_queued_entry_vs_inflight_user(e, original)
@@ -463,6 +475,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         _ac_set_queue(session, session.get("queued_prompts") or [])
         session["running"] = True
+        session["_turn_cancel_requested"] = False
         queued_transport = queued.get("transport")
         # The queuer's transport is pinned so the drained turn reaches the client that sent it — but
         # ATTACHED, not rebound: a mid-turn prompt from a second client used to silence the first for the

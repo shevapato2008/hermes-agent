@@ -8,9 +8,21 @@
 
 const CHAT_PANEL_COLLAPSED_KEY = "hermes-chat-panel-collapsed";
 
+export const CHAT_NARROW_MEDIA_QUERY = "(max-width: 1024px)";
+
+export function isNarrowChatViewport(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia(CHAT_NARROW_MEDIA_QUERY).matches
+  );
+}
+
 /** The panel's collapsed flag remembered from the previous visit. */
 export function readChatPanelCollapsed(): boolean {
-  return localStorage.getItem(CHAT_PANEL_COLLAPSED_KEY) === "1";
+  const stored = localStorage.getItem(CHAT_PANEL_COLLAPSED_KEY);
+  if (stored === null) return isNarrowChatViewport();
+  return stored === "1";
 }
 
 /** Flip the collapsed flag and persist the new choice. */

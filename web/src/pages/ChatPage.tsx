@@ -37,7 +37,7 @@ import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { readStoredWorkspace, writeStoredWorkspace } from "@/lib/chat-workspaces";
 import { latchChatActivation } from "@/lib/chat-activation";
-import { readChatPanelCollapsed, toggleChatPanelCollapsed } from "@/lib/chat-panel-collapsed";
+import { CHAT_NARROW_MEDIA_QUERY, isNarrowChatViewport, readChatPanelCollapsed, toggleChatPanelCollapsed } from "@/lib/chat-panel-collapsed";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { createPtyCompositionForwarder } from "@/lib/pty-composition";
@@ -164,16 +164,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // In gated (OAuth) mode the server intentionally omits the session token —
   // the dashboard API layer authenticates the WS via a single-use ticket,
   // so a missing token there is expected, not an error.
-  const tokenMissing =
+  const isTokenMissing = () =>
     typeof window !== "undefined" &&
     !window.__HERMES_SESSION_TOKEN__ &&
     !window.__HERMES_AUTH_REQUIRED__;
   const [banner, setBanner] = useState<string | null>(() =>
-    tokenMissing ? PTY_TOKEN_MISSING_BANNER.text : null,
+    isTokenMissing() ? PTY_TOKEN_MISSING_BANNER.text : null,
   );
   // Which one-click fix (if any) the banner offers next to its text.
   const [bannerAction, setBannerAction] = useState<PtyBannerAction>(() =>
-    tokenMissing ? PTY_TOKEN_MISSING_BANNER.action : null,
+    isTokenMissing() ? PTY_TOKEN_MISSING_BANNER.action : null,
   );
   // True after the automatic reconnect ladder used its last attempt: the
   // overlay then says so and offers "Check server status" alongside Reconnect.
@@ -308,11 +308,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const [portalRoot] = useState<HTMLElement | null>(() =>
     typeof document !== "undefined" ? document.body : null,
   );
-  const [narrow, setNarrow] = useState(() =>
-    typeof window !== "undefined"
-      ? window.matchMedia("(max-width: 1023px)").matches
-      : false,
-  );
+  const [narrow, setNarrow] = useState(isNarrowChatViewport);
 
   const { theme } = useTheme();
   const terminalBg = theme.terminalBackground ?? DEFAULT_TERMINAL_BACKGROUND;
@@ -421,7 +417,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   }, [resumeParam, scopedProfile, searchParams, setSearchParams]);
 
   useEffect(() => {
-    const mql = window.matchMedia("(max-width: 1023px)");
+    const mql = window.matchMedia(CHAT_NARROW_MEDIA_QUERY);
     const sync = () => setNarrow(mql.matches);
     sync();
     mql.addEventListener("change", sync);
@@ -443,7 +439,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   }, [mobilePanelOpen, closeMobilePanel]);
 
   useEffect(() => {
-    const mql = window.matchMedia("(min-width: 1024px)");
+    const mql = window.matchMedia("(min-width: 1025px)");
     const onChange = (e: MediaQueryListEvent) => {
       if (e.matches) setMobilePanelOpenRaw(false);
     };
@@ -1967,7 +1963,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             color={terminalFg}
           />
 
-          {chatPanelCollapsed && (
+          {!narrow && chatPanelCollapsed && (
             <Button
               ghost
               onClick={toggleChatPanel}

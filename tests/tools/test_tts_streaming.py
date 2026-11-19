@@ -1455,3 +1455,43 @@ def test_tui_gateway_tts_stream_begin_and_full_duplex_listener_emit_voice_events
     server._release_voice_lease(session_id="sid-1", lease_epoch=epoch, transport=transport, stop_loop=False)
 
 
+def test_edge_pipe_player_cmd_and_sync_sentence_pipeline_fast_stop(monkeypatch):
+    from tools import tts_tool_speaker
+
+    monkeypatch.setattr(
+        tts_tool_speaker.shutil,
+        "which",
+        lambda name: "/usr/bin/gst-launch-1.0" if name == "gst-launch-1.0" else None,
+    )
+    cmd = tts_tool_speaker._edge_pipe_player_cmd()
+    assert cmd is not None
+    assert "buffer-time=60000" in cmd
+    assert "latency-time=20000" in cmd
+
+    stop_event = threading.Event()
+    pipeline = tts_tool_speaker._SyncSentencePipeline(
+        stop_event, lookahead=3, use_edge_pipe=True
+    )
+    # Block chunk_queue.get() without putting any chunks, then set stop_event
+    slow_q: queue.Queue = queue.Queue()
+    t0 = time.monotonic()
+    setter = threading.Timer(0.04, stop_event.set)
+    setter.start()
+    try:
+        pipeline._play_edge_chunk_queue("未到达首包就被打断", slow_q)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.2, f"_play_edge_chunk_queue took {elapsed:.3f}s after stop_event.set()"
+
+        # Queued lookahead sentences in _drain must be skipped immediately without blocking on future
+        never_done: tts_tool_speaker.Future = tts_tool_speaker.Future()
+        pipeline._queue.put(("queued-lookahead", never_done, queue.Queue()))
+        t1 = time.monotonic()
+        pipeline.close()
+        close_elapsed = time.monotonic() - t1
+        assert close_elapsed < 0.2, f"pipeline.close() blocked for {close_elapsed:.3f}s"
+    finally:
+        setter.cancel()
+        stop_event.set()
+
+
+

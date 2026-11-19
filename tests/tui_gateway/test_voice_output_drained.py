@@ -180,3 +180,116 @@ def test_full_duplex_retryable_empty_fence_uses_frozen_session_after_listen_clos
         )
     ]
     assert not wav.exists()
+
+
+def test_fd_trip_playback_interrupts_running_agent_and_marks_turn_cancel_requested(
+    monkeypatch,
+):
+    import threading
+    import tools.tts_streaming as ts
+
+    owner = types.SimpleNamespace(_closed=False, send_line=lambda _line: None)
+    epoch = server._acquire_voice_lease("sid-barge", owner)
+    interrupted_calls = []
+    fake_agent = types.SimpleNamespace(
+        interrupt=lambda: interrupted_calls.append("interrupt"),
+    )
+    session_state = {
+        "running": True,
+        "agent": fake_agent,
+        "history_lock": threading.RLock(),
+    }
+    monkeypatch.setattr(server, "_sessions", {"sid-barge": session_state})
+    monkeypatch.setattr(ts, "mark_speech_interrupted", lambda: None)
+    _fake_tts_modules(monkeypatch)
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload)),
+    )
+
+    assert server._fd_trip("playback", "sid-barge", epoch, owner) is True
+    assert interrupted_calls == ["interrupt"]
+    assert session_state.get("_turn_cancel_requested") is True
+    assert any(ev == "voice.interrupted" for ev, _, _ in emitted)
+
+
+def test_voice_record_start_same_scope_preempts_active_full_duplex_lease(monkeypatch):
+    owner = types.SimpleNamespace(
+        _closed=False, send_line=lambda _line: None, write=lambda _obj: True
+    )
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    epoch = server._claim_voice_authority("sid-preempt", owner, allow_unclaimed=True)
+    server._fd_listener_active = True
+    server._fd_listener_epoch = epoch
+
+    release_calls = []
+    orig_release = server._release_voice_lease
+
+    def tracking_release(**kwargs):
+        release_calls.append(kwargs)
+        return orig_release(**kwargs)
+
+    monkeypatch.setattr(server, "_release_voice_lease", tracking_release)
+    monkeypatch.setattr(server, "_capture_live", lambda: False)
+    started_captures = []
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(
+            start_continuous=lambda on_transcript, **kw: started_captures.append(kw),
+            stop_continuous=lambda: None,
+            is_active=lambda: False,
+        ),
+    )
+
+    token = server.bind_transport(owner)
+    try:
+        resp = server._methods["voice.record"](
+            "req-1", {"action": "start", "session_id": "sid-preempt"}
+        )
+    finally:
+        server.reset_transport(token)
+
+    assert "result" in resp, f"Expected recording result, got error: {resp}"
+    assert resp["result"]["status"] == "recording"
+    assert resp["result"]["previous_lease_epoch"] == epoch
+    assert resp["result"]["lease_epoch"] > epoch
+    assert len(release_calls) == 1
+    assert release_calls[0]["session_id"] == "sid-preempt"
+    assert release_calls[0]["lease_epoch"] == epoch
+    assert server._fd_listener_active is False
+
+
+def test_auto_continue_keeps_same_text_barge_in_when_inflight_interrupted_and_drain_clears_cancel(
+    monkeypatch,
+):
+    import threading
+
+    fake_agent = types.SimpleNamespace(_interrupt_requested=False)
+    session = {
+        "running": True,
+        "agent": fake_agent,
+        "history_lock": threading.RLock(),
+        "inflight_turn": {"user": "继续"},
+        "_turn_cancel_requested": True,
+    }
+    transport = types.SimpleNamespace(
+        _closed=False, send_line=lambda _line: None, write=lambda _obj: True
+    )
+    env = server._enqueue_prompt(session, "继续", transport)
+    assert env is not None
+    assert session["queued_prompt"]["text"] == "继续"
+    server._drop_queued_duplicates_of_inflight_user(session)
+    assert session["queued_prompt"] is not None
+    assert session["queued_prompt"]["text"] == "继续"
+
+    # When _drain_queued_prompt claims the queued prompt on idle transition, it resets _turn_cancel_requested
+    session["running"] = False
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _s: False)
+    monkeypatch.setattr(server, "_replace_queued_user_row_for_turn", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_a, **_k: None)
+    assert server._drain_queued_prompt("drain-1", "sid-ac", session) is True
+    assert session.get("_turn_cancel_requested") is False
+

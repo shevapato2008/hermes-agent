@@ -1444,6 +1444,7 @@ PLAYBACK_MIN_TRIGGER = 1500.0  # min trigger while TTS flows: bleed alone never 
 TRIGGER_CEILING = 4000.0  # a noisy room must never push the trigger past normal speech
 DEFAULT_BARGE_MULTIPLIER = 3.0  # over the quiet floor: 300 * 3 = 900 vs 3000+ speech
 SILERO_VAD_THRESHOLD = 0.5
+POST_PLAYBACK_HOLD_BLOCKS = 10  # 300ms hold after playback stops so PulseAudio drain tail doesn't trip or raise ambient
 
 
 def _new_silero_vad():
@@ -1563,12 +1564,17 @@ class _BargeDetector:
         if not self.floor_locked and not self._calibrate(rms, playing):
             return None
         self._track_playback(playing)
+        in_playback_hold = bool(
+            self.playback_seen and self.blocks_since_playback <= POST_PLAYBACK_HOLD_BLOCKS
+        )
+        effective_playing = playing or in_playback_hold
         # Trigger: quiet baseline x multiplier, phase-clamped.
-        trigger = max(self.quiet_floor * self.mult,
-                      PLAYBACK_MIN_TRIGGER if playing else float(SILENCE_RMS_THRESHOLD) * 2)
+        playback_thresh = max(self.quiet_floor * self.mult, PLAYBACK_MIN_TRIGGER)
+        gen_thresh = max(self.quiet_floor * self.mult, float(SILENCE_RMS_THRESHOLD) * 2)
+        trigger = playback_thresh if effective_playing else gen_thresh
         trigger = min(trigger, TRIGGER_CEILING)
         # Track ambient drift ONLY while nothing plays (never absorb bleed) and the block isn't speech.
-        if not playing and rms < trigger:
+        if not effective_playing and rms < self.quiet_floor * 1.5:
             self.ambient.append(rms)
             _, self.quiet_floor = self._floor()
         above = rms >= trigger

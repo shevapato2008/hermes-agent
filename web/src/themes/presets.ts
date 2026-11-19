@@ -290,7 +290,7 @@ html, body {
 }
 @media (min-width: 1024px) {
   #app-sidebar:not(.lg\\:w-14) {
-    width: 15rem;
+    width: 240px;
   }
   header[role="banner"] > div {
     padding-right: 6.75rem !important;
@@ -319,6 +319,7 @@ const SMARTBOX_7INCH_OPTION_A_CSS = buildSmartbox7InchCustomCss({
 });
 
 const SMARTBOX_7INCH_18_CSS = buildSmartbox7InchCustomCss({
+  textSm: "17px",
   textXs: "max(0.75rem, 14px)",
   smallUtilityFontSize: "14px",
   navMinHeight: "42px",
@@ -357,7 +358,7 @@ export const smartbox7InchTheme: DashboardTheme = {
   },
   terminalBackground: "#021010",
   terminalForeground: "#fff2df",
-  terminalFontSize: 15,
+  terminalFontSize: 19,
   terminalLineHeight: 1.2,
   customCSS: SMARTBOX_7INCH_OPTION_A_CSS,
 };
@@ -379,8 +380,8 @@ export const smartbox7Inch18Theme: DashboardTheme = {
   },
   terminalBackground: "#021010",
   terminalForeground: "#fff2df",
-  terminalFontSize: 14,
-  terminalLineHeight: 1.18,
+  terminalFontSize: 18,
+  terminalLineHeight: 1.2,
   customCSS: SMARTBOX_7INCH_18_CSS,
 };
 
@@ -401,7 +402,7 @@ export const smartbox7InchBTheme: DashboardTheme = {
   },
   terminalBackground: "#021010",
   terminalForeground: "#fff2df",
-  terminalFontSize: 16.5,
+  terminalFontSize: 21,
   terminalLineHeight: 1.2,
   customCSS: SMARTBOX_7INCH_OPTION_B_CSS,
 };
@@ -423,7 +424,7 @@ export const smartbox7InchCTheme: DashboardTheme = {
   },
   terminalBackground: "#021010",
   terminalForeground: "#fff2df",
-  terminalFontSize: 18,
+  terminalFontSize: 23,
   terminalLineHeight: 1.22,
   customCSS: SMARTBOX_7INCH_OPTION_C_CSS,
 };

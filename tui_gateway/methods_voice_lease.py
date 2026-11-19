@@ -746,5 +746,70 @@ def _resume_voice_wake(*, expected_transport=None, expected_epoch: int | None = 
     return False
 
 
+def _release_pre_record_lease(
+    rid,
+    sid: str,
+    transport,
+    owner: str,
+    epoch: int,
+    owner_transport,
+    capture_id: str | None,
+    capture_live: bool,
+) -> dict | None:
+    """Release an idle foreign lease or preempt a same-scope full-duplex listener before recording."""
+    if not owner or capture_live:
+        return None
+    with _fd_listener_lock:
+        full_duplex_active = _fd_listener_active
+    placeholder_handoff = owner == "__local_voice__" and owner_transport is transport
+    same_scope = owner == sid and owner_transport is transport
+    preempt_full_duplex = same_scope and full_duplex_active
+    if not (
+        preempt_full_duplex
+        or (not full_duplex_active and not placeholder_handoff and not same_scope)
+    ):
+        return None
+    release_failures = []
+    released, release_error = _release_voice_lease(
+        session_id=owner,
+        lease_epoch=epoch,
+        transport=owner_transport,
+        stop_loop=False,
+        before_expose=(
+            None
+            if same_scope
+            else lambda: _resume_voice_wake(
+                expected_transport=owner_transport,
+                expected_epoch=epoch,
+            )
+        ),
+        on_failure=release_failures.append,
+    )
+    if not released:
+        if not release_failures:
+            return _err(rid, 4016, release_error)
+        from tools.voice_input import VoiceInputReleaseError
+
+        _voice_terminal_error_epochs.add(epoch)
+        failure = release_failures[-1]
+        _voice_emit(
+            "voice.input_error",
+            _input_error_payload(
+                failure
+                if isinstance(failure, VoiceInputReleaseError)
+                else VoiceInputReleaseError(str(failure)),
+                released=False,
+            ),
+            session_id=owner,
+            lease_epoch=epoch,
+            transport=owner_transport,
+            capture_id=capture_id,
+        )
+        return _err(rid, 5025, release_error)
+    if preempt_full_duplex:
+        _retire_full_duplex_listener(epoch, None)
+    return None
+
+
 def register(server) -> None:
     bind_module(globals(), server, skip=("Optional", "Transport"))

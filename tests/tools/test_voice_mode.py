@@ -1815,3 +1815,39 @@ class TestWSLAudioEnvironmentGate:
         assert any(
             "PulseAudio" in n and "WSL" in n for n in result["notices"]
         )
+
+
+def test_barge_detector_holds_playback_threshold_and_pauses_ambient_during_post_playback_hold():
+    np = pytest.importorskip("numpy")
+    from tools.voice_mode import POST_PLAYBACK_HOLD_BLOCKS, _BargeDetector
+
+    det = _BargeDetector(np, mult=3.0, calib_blocks=4, trip_blocks=5, grace_blocks=0)
+    # 1. Calibrate quiet floor at 200 RMS
+    for _ in range(4):
+        assert det.feed(200.0, False) is None
+    assert det.floor_locked is True
+    assert det.quiet_floor == 200.0
+
+    # 2. One block of active playback marks playback_seen=True
+    assert det.feed(800.0, True) is None
+    assert det.playback_seen is True
+
+    # 3. During POST_PLAYBACK_HOLD_BLOCKS (10 blocks = 300ms) after playing -> False,
+    # a 677 RMS post-playback drain tail must NOT trip (trigger stays 1500.0, not 600.0)
+    # and must NOT be absorbed into ambient.
+    ambient_len_before = len(det.ambient)
+    for _ in range(POST_PLAYBACK_HOLD_BLOCKS):
+        assert det.feed(677.0, False) is None
+    assert len(det.ambient) == ambient_len_before
+    assert det.quiet_floor == 200.0
+
+    # 4. Also verify a real >= 1500 RMS user utterance during the post-playback hold DOES trip:
+    det2 = _BargeDetector(np, mult=3.0, calib_blocks=4, trip_blocks=5, grace_blocks=0)
+    for _ in range(4):
+        det2.feed(200.0, False)
+    det2.feed(800.0, True)
+    tripped = None
+    for _ in range(4):
+        tripped = det2.feed(1800.0, False)
+    assert tripped == "generation"
+
