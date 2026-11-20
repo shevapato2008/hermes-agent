@@ -12,6 +12,7 @@ Plugin ``TTSProvider``s join by declaring ``streams_pcm`` + ``stream_sample_rate
 from __future__ import annotations
 
 import logging
+import math
 import re
 import time
 from abc import ABC, abstractmethod
@@ -68,7 +69,7 @@ def take_speech_interrupted() -> bool:
 # ranges with optional trailing whitespace, or a blank line.
 SENTENCE_BOUNDARY_RE = re.compile(
     r"(?<=[.!?])(?:\s|\n)|(?<=[\u3400-\u9fff\uf900-\ufaffA-Za-z]~)(?:\s|\n)"
-    r"|(?<=[。！？…])\s*|(?<![0-9一二三四五六七八九十零][～〜])(?<=[～〜])(?![0-9])\s*|(?:\n\n)"
+    r"|(?<=[。！？…])\s*|(?<![0-9一二三四五六七八九十百千万两零][～〜])(?<=[～〜])(?![0-9])\s*|(?:\n\n)"
 )
 _CJK_CLAUSE_BOUNDARY_RE = re.compile(r"(?<=[，、；：])\s*")
 _CJK_CHAR_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
@@ -77,6 +78,58 @@ _CJK_CHAR_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 _THINK_NAMES = "|".join(re.escape(name) for name in THINK_TAG_NAMES)
 _THINK_BLOCK_RE = re.compile(rf"<({_THINK_NAMES})[\s>].*?</\1>", flags=re.DOTALL | re.IGNORECASE)
 _THINK_OPEN_RE = re.compile(rf"<(?:{_THINK_NAMES})(?=[\s>]|$)", flags=re.IGNORECASE)
+_THINK_OPEN_PREFIXES = tuple(f"<{name.lower()}" for name in THINK_TAG_NAMES)
+_CLOSED_FENCE_RE = re.compile(r"```[\s\S]*?```")
+_CLOSED_INLINE_CODE_RE = re.compile(r"``(?:(?!``)[\s\S])+``|(?<!`)`[^`]+`(?!`)")
+_CLOSED_MD_LINK_RE = re.compile(r"!?\[[^\]\n]*\]\([^)\n]*\)")
+_UNCLOSED_MD_LINK_TAIL_RE = re.compile(r"!?\[[^\]\n]*(?:\](?:\([^)\n]*)?)?$")
+_CLOSED_DOUBLE_EMPH_RE = re.compile(r"(\*\*|__|~~)([\s\S]+?)\1")
+_TRAILING_INCOMPLETE_TOKEN_RE = re.compile(
+    r"(?:(?:https?|wss?|ftp|file|mailto)://\S+"
+    r"|(?<![A-Za-z0-9_./:%+~*@&#=-])[A-Za-z0-9_./:%+~*@&#=-]+"
+    r"|\d,\s*|\d\s*°"
+    r"|[0-9一二三四五六七八九十百千万两零]\s*[～〜~\u2013\u2014-]"
+    r"|[$¥￥€£\u2212-]|[\[(#*`_~<])$"
+)
+_IDLE_SAFE_BOUNDARY_RE = re.compile(
+    r"(?<=[.!?])\s+|(?<=[。！？…，、；：])\s*|(?<=[,;:])\s+|\n+"
+)
+
+
+def _split_open_think_tail(buf: str) -> tuple[str, str]:
+    """Split *buf* into ``(speakable_prefix, unclosed_or_partial_think_tail)``."""
+    if m := _THINK_OPEN_RE.search(buf):
+        candidate, think_tail = buf[: m.start()], buf[m.start() :]
+    else:
+        candidate, think_tail = buf, ""
+    last_lt = candidate.rfind("<")
+    if last_lt != -1:
+        tail_fragment = candidate[last_lt:].lower()
+        if any(p.startswith(tail_fragment) for p in _THINK_OPEN_PREFIXES):
+            candidate, think_tail = candidate[:last_lt], candidate[last_lt:] + think_tail
+    return candidate, think_tail
+
+
+def _unclosed_span_or_token_start(candidate: str) -> Optional[int]:
+    """Return the earliest index in *candidate* that starts an unclosed code/Markdown span or
+    trailing incomplete token, or ``None`` if *candidate* ends cleanly."""
+    masked = _CLOSED_FENCE_RE.sub(lambda m: " " * len(m.group(0)), candidate)
+    if (fence_idx := masked.find("```")) != -1:
+        return fence_idx
+    masked = _CLOSED_INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), masked)
+    if (bt_idx := masked.find("`")) != -1:
+        return bt_idx
+    masked = _CLOSED_MD_LINK_RE.sub(lambda m: " " * len(m.group(0)), masked)
+    hold_indices: list[int] = []
+    if link_m := _UNCLOSED_MD_LINK_TAIL_RE.search(masked):
+        hold_indices.append(link_m.start())
+    masked = _CLOSED_DOUBLE_EMPH_RE.sub(lambda m: f"  {m.group(2)}  ", masked)
+    for marker in ("**", "__", "~~"):
+        if (m_idx := masked.find(marker)) != -1:
+            hold_indices.append(m_idx)
+    if tok_m := _TRAILING_INCOMPLETE_TOKEN_RE.search(masked):
+        hold_indices.append(tok_m.start())
+    return min(hold_indices) if hold_indices else None
 
 
 class SentenceChunker:
@@ -89,29 +142,40 @@ class SentenceChunker:
         min_len: int = 20,
         first_clause_min_len: int = 6,
         post_first_min_len: Optional[int] = None,
+        idle_flush_s: float = 1.0,
     ):
         self.min_len = min_len
         self.first_clause_min_len = first_clause_min_len
         self.post_first_min_len = post_first_min_len
+        self.idle_flush_s = max(0.0, float(idle_flush_s))
         self.buf = ""
         self._emitted_first = False
 
     @classmethod
     def from_config(cls, tts_config: dict) -> SentenceChunker:
         """Chunker honouring ``tts.streaming.min_len`` ( plus ``first_clause_min_len`` /
-        ``post_first_min_len``). 20 suits English; a CJK opener of 5–7 characters is a whole
-        sentence, so voice setups lower it to speak the first sentence alone instead of buffering
-        it behind the second. Floor 1: 0 would emit every boundary."""
+        ``post_first_min_len`` / ``idle_flush_s``). 20 suits English; a CJK opener of 5–7 characters
+        is a whole sentence, so voice setups lower it to speak the first sentence alone instead of
+        buffering it behind the second. Floor 1: 0 would emit every boundary."""
         try:
             streaming_cfg = tts_config.get("streaming") or {}
             raw_first_clause = streaming_cfg.get("first_clause_min_len", 6)
             raw_post_first = streaming_cfg.get("post_first_min_len")
+            raw_idle = streaming_cfg.get("idle_flush_s")
+            if raw_idle is False:
+                idle_flush_s = 0.0
+            elif raw_idle in (None, True):
+                idle_flush_s = 1.0
+            else:
+                parsed_idle = float(raw_idle)
+                idle_flush_s = max(0.0, parsed_idle) if math.isfinite(parsed_idle) else 1.0
             return cls(
                 min_len=max(1, int(streaming_cfg.get("min_len", 20))),
                 first_clause_min_len=max(1, int(raw_first_clause)),
                 post_first_min_len=(
                     max(1, int(raw_post_first)) if raw_post_first is not None else None
                 ),
+                idle_flush_s=idle_flush_s,
             )
         except (AttributeError, TypeError, ValueError):  # non-mapping / non-numeric → default
             return cls()
@@ -167,6 +231,33 @@ class SentenceChunker:
             self._emitted_first = True
             start = 0
         return out
+
+    def flush_idle(self) -> list[str]:
+        """Flush settled speakable text when the upstream LLM has been silent for ``idle_flush_s``,
+        while preserving open/partial ``<think>`` tags, unclosed code/Markdown spans, and trailing
+        incomplete tokens in ``self.buf``."""
+        self.buf = _THINK_BLOCK_RE.sub("", self.buf)
+        candidate, think_tail = _split_open_think_tail(self.buf)
+        if not candidate.strip():
+            return []
+        hold_start = _unclosed_span_or_token_start(candidate)
+        if hold_start is not None:
+            last_b = None
+            for b_m in _IDLE_SAFE_BOUNDARY_RE.finditer(candidate[:hold_start]):
+                last_b = b_m
+            if last_b is None:
+                return []
+            emit_head = candidate[: last_b.end()]
+            rem_tail = candidate[last_b.end() :] + think_tail
+        else:
+            emit_head = candidate
+            rem_tail = think_tail
+        min_idle_len = min(self.min_len, 2) if _CJK_CHAR_RE.search(emit_head) else min(self.min_len, 6)
+        if len(emit_head.strip()) < min_idle_len:
+            return []
+        self.buf = rem_tail
+        self._emitted_first = True
+        return [emit_head.strip()]
 
     def flush(self) -> list[str]:
         """Drain the tail (end-of-text or long-idle flush)."""

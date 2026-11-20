@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable, Iterable, Iterator, List, Optional
 
@@ -599,14 +600,23 @@ def stream_tts_to_speaker(
             if stream_max_len and len(cleaned) > stream_max_len:
                 cleaned = cleaned[:stream_max_len]
             playback.speak(cleaned)
+        idle_flush_s = float(getattr(chunker, "idle_flush_s", 1.0) or 0.0)
+        poll_s = min(0.25, max(0.05, idle_flush_s / 4.0)) if idle_flush_s > 0 else 0.5
+        last_delta_at = time.monotonic()
         while not stop_event.is_set():
+            sentences: Iterable[str] = ()
             try:
-                delta = text_queue.get(timeout=0.5)
+                delta = text_queue.get(timeout=poll_s)
             except queue.Empty:
-                delta = ""  # idle producer: flush a long buffer instead of sitting on it
-                sentences = chunker.flush() if len(chunker.buf) > 100 else ()
-            else:
-                sentences = chunker.flush() if delta is None else chunker.feed(delta)
+                delta = ""
+            if delta is None:
+                sentences = chunker.flush()
+            elif delta:
+                last_delta_at = time.monotonic()
+                sentences = chunker.feed(delta)
+            elif idle_flush_s > 0 and (time.monotonic() - last_delta_at) >= idle_flush_s:
+                sentences = chunker.flush_idle()
+                last_delta_at = time.monotonic()
             for sentence in sentences:
                 _speak_sentence(sentence)
             if delta is None:

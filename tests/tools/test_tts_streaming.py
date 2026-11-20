@@ -120,6 +120,152 @@ class TestSentenceChunker:
         assert c.min_len == 4
         assert c.first_clause_min_len == 18
         assert c.post_first_min_len == 6
+        assert c.idle_flush_s == 1.0
+
+    def test_flush_idle_emits_unpunctuated_and_weird_symbol_utterances(self):
+        c1 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c1.feed("喵——喵 ♪") == []
+        assert c1.flush_idle() == ["喵——喵 ♪"]
+        assert c1.flush() == []
+
+        c2 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c2.feed("好嘞😄") == []
+        assert c2.flush_idle() == ["好嘞😄"]
+        assert c2.flush() == []
+
+        c_q = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c_q.feed("需要帮您查一下吗?") == []
+        assert c_q.flush_idle() == ["需要帮您查一下吗?"]
+        assert c_q.flush() == []
+
+        c3 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c3.feed("好的，我先帮您查一下今天的天气") == []
+        assert c3.flush_idle() == ["好的，我先帮您查一下今天的天气"]
+        assert c3.feed("今天北京晴，气温25度。") == ["今天北京晴，气温25度。"]
+        assert c3.flush() == []
+
+    def test_flush_idle_preserves_open_and_partial_think_tags_without_leaking_reasoning(self):
+        c1 = ts.SentenceChunker(min_len=4, first_clause_min_len=18)
+        assert c1.feed("<think>" + "很长的内部推理思考过程" * 15) == []
+        assert len(c1.buf) > 100
+        assert c1.flush_idle() == []
+        assert c1.flush_idle() == []
+        assert c1.feed("继续推理直到结束</think>真正的回答。") == ["真正的回答。"]
+        assert c1.flush() == []
+
+        c2 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c2.feed("好的，我想一下<think>内部推理中") == []
+        assert c2.flush_idle() == ["好的，我想一下"]
+        assert c2.buf == "<think>内部推理中"
+        assert c2.feed("，还在推理</think>查到了，今天晴。") == ["查到了，今天晴。"]
+        assert c2.flush() == []
+
+        # Partial opening tag `<` or `<思` at buffer tail on idle pause
+        c3 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c3.feed("好的，我想一下<") == []
+        assert c3.flush_idle() == ["好的，我想一下"]
+        assert c3.buf == "<"
+        assert c3.feed("think>内部推理</think>真正的回答。") == ["真正的回答。"]
+        assert c3.flush() == []
+
+        c4 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c4.feed("好的，我想一下<思") == []
+        assert c4.flush_idle() == ["好的，我想一下"]
+        assert c4.buf == "<思"
+        assert c4.feed("考>内部推理</思考>真正的回答。") == ["真正的回答。"]
+        assert c4.flush() == []
+
+    def test_flush_idle_protects_fenced_code_inline_code_markdown_urls_and_numbers(self):
+        # Unclosed fenced code block with 1 inner backtick (even total backtick count = 4)
+        c_fence1 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c_fence1.feed("好的，请看代码：\n```js\nconst a = `hi;\n") == []
+        assert c_fence1.flush_idle() == ["好的，请看代码："]
+        assert c_fence1.buf == "```js\nconst a = `hi;\n"
+
+        # Unclosed fenced code block with closed inner backticks (odd total backtick count = 5)
+        c_fence2 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c_fence2.feed("好的，请运行：\n```bash\necho `hostname`\n") == []
+        assert c_fence2.flush_idle() == ["好的，请运行："]
+        assert c_fence2.buf == "```bash\necho `hostname`\n"
+
+        # Partial 2-backtick fence opener `` at buffer tail
+        c_fence_part = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c_fence_part.feed("好的，请看代码：\n``") == []
+        assert c_fence_part.flush_idle() == ["好的，请看代码："]
+        assert c_fence_part.buf == "``"
+
+        # Closed emphasis **...** at buffer tail must idle-flush cleanly
+        c_closed_bold1 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c_closed_bold1.feed("这是**重点内容**") == []
+        assert c_closed_bold1.flush_idle() == ["这是**重点内容**"]
+        assert c_closed_bold1.buf == ""
+
+        c_closed_bold2 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c_closed_bold2.feed("好的，**完全没问题**") == []
+        assert c_closed_bold2.flush_idle() == ["好的，**完全没问题**"]
+        assert c_closed_bold2.buf == ""
+
+        # Unclosed Markdown link [text and [text] and bold **text and nested **[text
+        c_link1 = ts.SentenceChunker(min_len=2, first_clause_min_len=18)
+        assert c_link1.feed("好的，请查看 [配置说明") == []
+        assert c_link1.flush_idle() == ["好的，"]
+        assert c_link1.buf == "请查看 [配置说明"
+
+        c_link2 = ts.SentenceChunker(min_len=2, first_clause_min_len=18)
+        assert c_link2.feed("好的，请查看 [配置说明]") == []
+        assert c_link2.flush_idle() == ["好的，"]
+        assert c_link2.buf == "请查看 [配置说明]"
+
+        c_bold = ts.SentenceChunker(min_len=2, first_clause_min_len=18)
+        assert c_bold.feed("好的，请点击 **确认按钮") == []
+        assert c_bold.flush_idle() == ["好的，"]
+        assert c_bold.buf == "请点击 **确认按钮"
+
+        c_nested = ts.SentenceChunker(min_len=2, first_clause_min_len=18)
+        assert c_nested.feed("好的，请看 **[配置说明") == []
+        assert c_nested.flush_idle() == ["好的，"]
+        assert c_nested.buf == "请看 **[配置说明"
+
+        # URL with query string
+        c_url = ts.SentenceChunker(min_len=2, first_clause_min_len=18)
+        assert c_url.feed("好的，请访问 https://example.com/search?q=1&") == []
+        assert c_url.flush_idle() == ["好的，"]
+        assert c_url.buf == "请访问 https://example.com/search?q=1&"
+
+        # Numbers, thousands commas, minus, degrees, and CJK ranges
+        c_num1 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c_num1.feed("今天广州晴天，气温20") == []
+        assert c_num1.flush_idle() == ["今天广州晴天，"]
+        assert c_num1.buf == "气温20"
+        assert c_num1.feed("～31度。") == ["气温20～31度。"]
+
+        c_num2 = ts.SentenceChunker(min_len=4, first_clause_min_len=18, post_first_min_len=6)
+        assert c_num2.feed("今天广州气温20") == []
+        assert c_num2.flush_idle() == []
+        assert c_num2.buf == "今天广州气温20"
+
+        for partial in ("最低气温−", "价格是1,", "气温25°", "大约两～", "气温11–"):
+            c_part = ts.SentenceChunker(min_len=2)
+            assert c_part.feed(partial) == []
+            assert c_part.flush_idle() == [], f"should not split partial token {partial!r}"
+            assert c_part.buf == partial
+
+    def test_from_config_coerces_idle_flush_s_safely(self):
+        c1 = ts.SentenceChunker.from_config({"streaming": {"min_len": 4, "idle_flush_s": 0.8}})
+        assert c1.min_len == 4
+        assert c1.idle_flush_s == 0.8
+
+        c2 = ts.SentenceChunker.from_config({"streaming": {"min_len": 4, "idle_flush_s": None}})
+        assert c2.min_len == 4
+        assert c2.idle_flush_s == 1.0
+
+        c3 = ts.SentenceChunker.from_config({"streaming": {"min_len": 4, "idle_flush_s": False}})
+        assert c3.min_len == 4
+        assert c3.idle_flush_s == 0.0
+
+        c4 = ts.SentenceChunker.from_config({"streaming": {"min_len": 4, "idle_flush_s": "nan"}})
+        assert c4.min_len == 4
+        assert c4.idle_flush_s == 1.0
 
 
 # ── Interruption latch ───────────────────────────────────────────────────
@@ -1654,6 +1800,73 @@ def test_stream_edge_tts_mp3_chunks_acloses_async_stream_on_stop_and_early_break
     assert next(gen2) == b"chunk-1"
     gen2.close()
     assert "提前退出测试" in closed_streams
+
+
+def test_stream_tts_to_speaker_flushes_on_llm_idle_before_eof(monkeypatch):
+    from tools import tts_tool
+    from tools import tts_tool_speaker
+
+    played: list[str] = []
+    displayed: list[str] = []
+    first_played = threading.Event()
+
+    def _on_play(sentence: str) -> None:
+        played.append(sentence)
+        first_played.set()
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_load_tts_config",
+        lambda: {
+            "provider": "edge",
+            "streaming": {
+                "min_len": 4,
+                "first_clause_min_len": 18,
+                "post_first_min_len": 6,
+                "idle_flush_s": 0.08,
+            },
+        },
+    )
+    monkeypatch.setattr(tts_tool, "_get_provider", lambda cfg: "edge")
+    monkeypatch.setattr(tts_tool, "_importable", lambda importer: False)
+    monkeypatch.setattr(
+        tts_tool_speaker._SyncSentencePipeline,
+        "speak",
+        lambda self, s: self._notify_sentence_play(s),
+    )
+
+    text_q: queue.Queue = queue.Queue()
+    stop_evt = threading.Event()
+    done_evt = threading.Event()
+
+    with patch("tools.tts_streaming.resolve_streaming_provider", return_value=None):
+        worker = threading.Thread(
+            target=tts_tool_speaker.stream_tts_to_speaker,
+            args=(text_q, stop_evt, done_evt),
+            kwargs={
+                "display_callback": displayed.append,
+                "on_sentence_play": _on_play,
+            },
+            daemon=True,
+        )
+        worker.start()
+        try:
+            text_q.put("喵——喵 ♪")
+            assert first_played.wait(timeout=2.0), "Expected idle flush before None EOF sentinel"
+            assert displayed == ["喵——喵 ♪"]
+            assert played == ["喵——喵"]
+            assert not done_evt.is_set()
+
+            text_q.put(None)
+            worker.join(timeout=2.0)
+            assert done_evt.is_set()
+            assert displayed == ["喵——喵 ♪"]
+            assert played == ["喵——喵"]
+        finally:
+            stop_evt.set()
+            text_q.put(None)
+            worker.join(timeout=1.0)
+
 
 
 
