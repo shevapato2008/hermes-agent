@@ -549,7 +549,7 @@ export default function SkillsPage() {
                       onClick={openLearn}
                       prefix={<Sparkles />}
                     >
-                      Learn a skill
+                      {sk.learnSkill}
                     </Button>
                     <Button
                       size="sm"
@@ -557,7 +557,7 @@ export default function SkillsPage() {
                       onClick={openCreateEditor}
                       prefix={<Plus />}
                     >
-                      New skill
+                      {sk.newSkill}
                     </Button>
                   </div>
                 </div>
@@ -669,7 +669,7 @@ export default function SkillsPage() {
                                   onClick={() => setConfigToolset(ts)}
                                   prefix={<Wrench />}
                                 >
-                                  Configure
+                                  {sk.configure}
                                 </Button>
                               </div>
                             </div>
@@ -701,66 +701,99 @@ export default function SkillsPage() {
         onClose={() => setEditorOpen(false)}
         onSaved={handleEditorSaved}
       />
-      <Dialog open={learnOpen} onOpenChange={setLearnOpen}>
-        <DialogContent className="max-w-lg">
-          <DialogHeader>
-            <DialogTitle>Learn a skill</DialogTitle>
-            <DialogDescription>
-              Point Hermes at anything and it will distill a reusable skill —
-              following the house authoring standards. Fill in any combination
-              below; the agent gathers the sources and writes the skill in chat.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="grid gap-3 py-2">
-            <div className="grid gap-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
-                Local file or directory
-              </label>
-              <Input
-                placeholder="~/projects/some-sdk  (read with read_file / search_files)"
-                value={learnDir}
-                onChange={(e) => setLearnDir(e.target.value)}
-              />
-            </div>
-            <div className="grid gap-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
-                URL
-              </label>
-              <Input
-                placeholder="https://docs.example.com/api  (fetched with web_extract)"
-                value={learnUrl}
-                onChange={(e) => setLearnUrl(e.target.value)}
-              />
-            </div>
-            <div className="grid gap-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
-                Anything else — describe the workflow, paste notes, or say
-                "what we just did"
-              </label>
-              <textarea
-                className="min-h-[90px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                placeholder="e.g. how I file an expense report: open the portal, …"
-                value={learnText}
-                onChange={(e) => setLearnText(e.target.value)}
-              />
-            </div>
-          </div>
-          <div className="flex justify-end gap-2 pt-1">
-            <Button ghost onClick={() => setLearnOpen(false)}>
-              Cancel
-            </Button>
-            <Button
-              onClick={submitLearn}
-              prefix={<Sparkles />}
-              disabled={!learnDir.trim() && !learnUrl.trim() && !learnText.trim()}
-            >
-              Learn it
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
+      <LearnSkillDialog
+        open={learnOpen}
+        onOpenChange={setLearnOpen}
+        learnDir={learnDir}
+        setLearnDir={setLearnDir}
+        learnUrl={learnUrl}
+        setLearnUrl={setLearnUrl}
+        learnText={learnText}
+        setLearnText={setLearnText}
+        onSubmit={submitLearn}
+      />
       <PluginSlot name="skills:bottom" />
     </div>
+  );
+}
+
+function LearnSkillDialog({
+  open,
+  onOpenChange,
+  learnDir,
+  setLearnDir,
+  learnUrl,
+  setLearnUrl,
+  learnText,
+  setLearnText,
+  onSubmit,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  learnDir: string;
+  setLearnDir: (v: string) => void;
+  learnUrl: string;
+  setLearnUrl: (v: string) => void;
+  learnText: string;
+  setLearnText: (v: string) => void;
+  onSubmit: () => void;
+}) {
+  const { t } = useI18n();
+  const sk = pageStrings(t, "skills");
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{sk.learnSkill}</DialogTitle>
+          <DialogDescription>{sk.learnSkillDesc}</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-3 py-2">
+          <div className="grid gap-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {sk.localFileOrDir}
+            </label>
+            <Input
+              placeholder="~/projects/some-sdk  (read with read_file / search_files)"
+              value={learnDir}
+              onChange={(e) => setLearnDir(e.target.value)}
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {sk.urlLabel}
+            </label>
+            <Input
+              placeholder="https://docs.example.com/api  (fetched with web_extract)"
+              value={learnUrl}
+              onChange={(e) => setLearnUrl(e.target.value)}
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {sk.anythingElseLabel}
+            </label>
+            <textarea
+              className="min-h-[90px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              placeholder="e.g. how I file an expense report: open the portal, …"
+              value={learnText}
+              onChange={(e) => setLearnText(e.target.value)}
+            />
+          </div>
+        </div>
+        <div className="flex justify-end gap-2 pt-1">
+          <Button ghost onClick={() => onOpenChange(false)}>
+            {t.common.cancel}
+          </Button>
+          <Button
+            onClick={onSubmit}
+            prefix={<Sparkles />}
+            disabled={!learnDir.trim() && !learnUrl.trim() && !learnText.trim()}
+          >
+            {sk.learnIt}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -894,6 +927,8 @@ function HubBrowser({
   /** Optional profile scoping installs + installed-state badges. */
   profile?: string;
 }) {
+  const { t } = useI18n();
+  const sk = pageStrings(t, "skills");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SkillHubResult[]>([]);
   const [searching, setSearching] = useState(false);
@@ -1040,7 +1075,7 @@ function HubBrowser({
               <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
               <Input
                 className="h-8 pl-8 text-sm"
-                placeholder="Search the skill hub (GitHub, official, community)…"
+                placeholder={sk.hubSearchPlaceholder}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={(e) => {
@@ -1054,7 +1089,7 @@ function HubBrowser({
               disabled={searching || !query.trim()}
               prefix={searching ? <Spinner /> : <Search className="h-3.5 w-3.5" />}
             >
-              Search
+              {t.common.search}
             </Button>
             <Button
               size="sm"
@@ -1062,7 +1097,7 @@ function HubBrowser({
               onClick={() => void updateAll()}
               prefix={<RefreshCw className="h-3.5 w-3.5" />}
             >
-              Update all
+              {sk.updateAll}
             </Button>
           </div>
 
@@ -1114,10 +1149,10 @@ function HubBrowser({
               <div className="flex items-center gap-2 px-1">
                 <Sparkles className="h-3.5 w-3.5 text-primary" />
                 <span className="font-mondwest text-display text-xs tracking-[0.12em] text-text-secondary uppercase">
-                  Featured skills
+                  {sk.featuredSkills}
                 </span>
                 <span className="text-xs text-text-tertiary">
-                  from the Hermes index — search above for thousands more
+                  {sk.featuredSkillsHint}
                 </span>
               </div>
               {featured.map((r) => (
@@ -1199,6 +1234,8 @@ function ConnectedHubs({
   sources: SkillHubSource[];
   loading: boolean;
 }) {
+  const { t } = useI18n();
+  const sk = pageStrings(t, "skills");
   if (loading) {
     return (
       <p className="text-xs text-muted-foreground">Connecting to skill hubs…</p>
@@ -1216,7 +1253,7 @@ function ConnectedHubs({
     <div className="flex flex-wrap items-center gap-1.5">
       <span className="flex items-center gap-1 text-xs text-text-tertiary">
         <Globe className="h-3 w-3" />
-        Connected hubs:
+        {sk.connectedHubs}
       </span>
       {sources.map((s) => {
         const down =
@@ -1294,6 +1331,8 @@ function HubResultCard({
   onOpen: () => void;
   onInstall: () => void;
 }) {
+  const { t } = useI18n();
+  const sk = pageStrings(t, "skills");
   const trust = trustVisual(result.trust_level);
   return (
     <Card className="rounded-none transition-colors hover:bg-muted/30">
@@ -1316,7 +1355,7 @@ function HubResultCard({
             </Badge>
             {installed && (
               <Badge tone="success" className="text-xs">
-                installed
+                {sk.installed}
               </Badge>
             )}
           </div>
@@ -1344,11 +1383,11 @@ function HubResultCard({
             onClick={onOpen}
             prefix={<FileText className="h-3.5 w-3.5" />}
           >
-            Details
+            {sk.details}
           </Button>
           {installed ? (
             <Button size="sm" ghost disabled prefix={<CheckCircle2 className="h-3.5 w-3.5" />}>
-              Installed
+              {sk.installed}
             </Button>
           ) : (
             <Button
@@ -1356,7 +1395,7 @@ function HubResultCard({
               onClick={onInstall}
               prefix={<Download className="h-3.5 w-3.5" />}
             >
-              Install
+              {sk.install}
             </Button>
           )}
         </div>

@@ -2,10 +2,10 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
-  useMemo,
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { useNavigate } from "react-router";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import {
@@ -43,6 +43,7 @@ import {
 } from "@nous-research/ui/ui/components/select";
 import { Checkbox } from "@nous-research/ui/ui/components/checkbox";
 import { useI18n } from "@/i18n";
+import { pageStrings } from "@/i18n/page-strings";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { cn, themedBody } from "@/lib/utils";
 import { errorMessage } from "@/lib/api-error";
@@ -264,54 +265,8 @@ export default function ProfilesPage() {
   const { setEnd } = usePageHeader();
   const { setProfile } = useProfileScope();
 
-  // Locale strings with English fallbacks. The enriched keys are optional in
-  // the i18n type so untranslated locales don't break the build — they render
-  // the English literal until translated.
-  const L = useMemo(() => {
-    const p = t.profiles;
-    return {
-      activeProfile: p.activeProfile ?? "Active profile",
-      activeBadge: p.activeBadge ?? "active",
-      setActive: p.setActive ?? "Set as active",
-      activeSet: p.activeSet ?? "Active profile set",
-      gatewayRunning: p.gatewayRunning ?? "Gateway running",
-      gatewayStopped: p.gatewayStopped ?? "Gateway stopped",
-      gatewayRunningWarning:
-        p.gatewayRunningWarning ??
-        "This profile's gateway is running — it will be stopped.",
-      aliasBadge: p.aliasBadge ?? "alias",
-      description: p.description ?? "Description",
-      descriptionPlaceholder:
-        p.descriptionPlaceholder ??
-        "What is this profile good at? Used to route kanban tasks by role.",
-      noDescription: p.noDescription ?? "No description",
-      editDescription: p.editDescription ?? "Edit description",
-      descriptionSaved: p.descriptionSaved ?? "Description saved",
-      reviewBadge: p.reviewBadge ?? "review",
-      autoGenerate: p.autoGenerate ?? "Auto-generate",
-      generating: p.generating ?? "Generating…",
-      describeFailed: p.describeFailed ?? "Could not generate description",
-      distribution: p.distribution ?? "Distribution",
-      advancedOptions: p.advancedOptions ?? "Advanced options",
-      cloneAll:
-        p.cloneAll ?? "Clone everything (memories, sessions, skills, state)",
-      noSkillsOption: p.noSkillsOption ?? "Don't seed bundled skills",
-      descriptionOptional: p.descriptionOptional ?? "Description (optional)",
-      modelOptional: p.modelOptional ?? "Model (optional)",
-      modelInherit: p.modelInherit ?? "Inherit from clone / default",
-      modelLoading: p.modelLoading ?? "Loading models…",
-      modelNone:
-        p.modelNone ?? "No model providers are set up yet. Add an API key under Keys or sign in to a provider under Models.",
-      editModel: p.editModel ?? "Change model",
-      modelSaved: p.modelSaved ?? "Model updated",
-      modelSelect: p.modelSelect ?? "Select a model",
-      actions: p.actions ?? "Actions",
-      manageSkills: p.manageSkills ?? "Manage skills & tools",
-      activeSetHint:
-        p.activeSetHint ??
-        "Dashboard switched to manage {name}. New CLI/gateway runs will use this profile too.",
-    };
-  }, [t.profiles]);
+  // Locale strings with English fallbacks via pageStrings helper (0 inline ?? branches).
+  const L = pageStrings(t, "profiles");
 
   // Create modal
   const [createModalOpen, setCreateModalOpen] = useState(false);
@@ -756,7 +711,7 @@ export default function ProfilesPage() {
           outlined
           onClick={() => navigate("/profiles/new")}
         >
-          Build
+          {L.buildBtn}
         </Button>
         <Button
           className="uppercase"
@@ -770,7 +725,7 @@ export default function ProfilesPage() {
     return () => {
       setEnd(null);
     };
-  }, [setEnd, t.common.create, loading, navigate]);
+  }, [setEnd, t.common.create, L.buildBtn, loading, navigate]);
 
   const cloning = cloneFrom !== null;
 
@@ -802,7 +757,7 @@ export default function ProfilesPage() {
       />
 
       {/* Create profile modal */}
-      {createModalOpen && (
+      {createModalOpen && createPortal(
         <div
           ref={createModalRef}
           className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
@@ -816,7 +771,7 @@ export default function ProfilesPage() {
           <div
             className={cn(
               themedBody,
-              "relative w-full max-w-md border border-border bg-card shadow-2xl flex flex-col max-h-[90vh]",
+              "relative w-full max-w-md border border-border bg-card shadow-2xl flex flex-col max-h-[90dvh]",
             )}
           >
             <Button
@@ -980,7 +935,8 @@ export default function ProfilesPage() {
               </div>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
 
       {/* Active profile banner */}
@@ -1229,7 +1185,7 @@ export default function ProfilesPage() {
       </div>
 
       {/* Editor dialog — model / description / SOUL for the selected profile */}
-      {editorName && (
+      {editorName && createPortal(
         <div
           ref={editorModalRef}
           className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
@@ -1241,7 +1197,7 @@ export default function ProfilesPage() {
           <div
             className={cn(
               themedBody,
-              "relative w-full max-w-lg border border-border bg-card shadow-2xl flex flex-col max-h-[90vh]",
+              "relative w-full max-w-lg border border-border bg-card shadow-2xl flex flex-col max-h-[90dvh]",
             )}
           >
             <Button
@@ -1268,12 +1224,7 @@ export default function ProfilesPage() {
               </h2>
             </header>
 
-            <div
-              className={cn(
-                "p-5 grid gap-4",
-                editorKind === "soul" && "min-h-0 overflow-y-auto",
-              )}
-            >
+            <div className="min-h-0 overflow-y-auto p-5 grid gap-4">
               {editorKind === "model" &&
                 (modelChoices !== null && modelChoices.length === 0 ? (
                   <p className="text-xs text-muted-foreground">{L.modelNone}</p>
@@ -1391,7 +1342,8 @@ export default function ProfilesPage() {
               )}
             </div>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

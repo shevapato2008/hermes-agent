@@ -70,7 +70,9 @@ def sample_memory() -> dict[str, Any]:
     swap_total, swap_free = mem.pop("SwapTotal", None), mem.pop("SwapFree", None)
     sample.update(mem)
     if swap_total is not None and swap_free is not None:
-        sample["swap_used_kib"] = swap_total - swap_free
+        sample["swap_used_kib"] = max(swap_total - swap_free, 0)
+        sample["swap_free_kib"] = max(swap_free, 0)
+        sample["swap_total_kib"] = max(swap_total, 0)
     return sample
 
 

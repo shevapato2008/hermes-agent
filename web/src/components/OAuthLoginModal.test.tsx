@@ -119,7 +119,7 @@ describe("OAuthLoginModal local expiry", () => {
     });
     await act(async () => {});
 
-    expect(container.textContent).toContain(
+    expect(document.body.textContent).toContain(
       "Portal sign-in is required",
     );
   });
@@ -139,7 +139,7 @@ describe("OAuthLoginModal local expiry", () => {
     await act(async () => {});
 
     // No error box: the modal is still in the polling phase.
-    expect(container.textContent).toContain("ABCD-EFGH");
+    expect(document.body.textContent).toContain("ABCD-EFGH");
     expect(apiMocks.pollOAuthSession.mock.calls.length).toBeGreaterThan(0);
   });
 
@@ -187,7 +187,7 @@ describe("OAuthLoginModal local expiry", () => {
       vi.advanceTimersByTime(2000);
     });
     await act(async () => {});
-    expect(container.textContent).toContain("expired_token");
+    expect(document.body.textContent).toContain("expired_token");
 
     // Retry: new start response, fresh countdown.
     apiMocks.startOAuthLogin.mockResolvedValueOnce(deviceStart(60));
@@ -195,7 +195,7 @@ describe("OAuthLoginModal local expiry", () => {
       session_id: "sess-1",
       status: "pending",
     });
-    const retry = [...container.querySelectorAll("button")].find((b) =>
+    const retry = [...document.body.querySelectorAll("button")].find((b) =>
       b.textContent?.includes("Retry"),
     );
     expect(retry).toBeTruthy();
@@ -206,6 +206,6 @@ describe("OAuthLoginModal local expiry", () => {
     await act(async () => {
       vi.advanceTimersByTime(5000);
     });
-    expect(container.textContent).toContain("ABCD-EFGH");
+    expect(document.body.textContent).toContain("ABCD-EFGH");
   });
 });

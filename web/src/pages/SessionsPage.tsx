@@ -43,12 +43,12 @@ import type {
 import { timeAgo } from "@/lib/utils";
 import { Markdown } from "@/components/Markdown";
 import {
-  AUTOMATION_SESSION_SOURCES,
-  NO_MATCHING_SESSION_SOURCE,
   SOURCE_CONFIG,
   type SessionFilterCategory,
   type SourceSelectionsByCategory,
-  isAutomationSource,
+  buildSessionQueryOptions,
+  getSourceFilterLabel,
+  getSourceMenuTitle,
   sourceBelongsToCategory,
   sourceLabel,
 } from "./SessionsPage_sources";
@@ -853,35 +853,10 @@ export default function SessionsPage() {
     [allSourceOptions],
   );
 
-  const sessionQueryOptions = useMemo(() => {
-    if (selectedSources !== null) {
-      if (selectedSources.length === 0) {
-        return allSourceNames.length > 0
-          ? { excludeSources: allSourceNames }
-          : { source: NO_MATCHING_SESSION_SOURCE };
-      }
-      if (selectedSources.length === 1) {
-        return { source: selectedSources[0] };
-      }
-      const selected = new Set(selectedSources);
-      const excludedSources = allSourceNames.filter(
-        (source) => !selected.has(source),
-      );
-      return excludedSources.length > 0 ? { excludeSources: excludedSources } : {};
-    }
-    if (sessionCategory === "chats") {
-      return { excludeSources: AUTOMATION_SESSION_SOURCES };
-    }
-    if (sessionCategory === "automation") {
-      const excludedSources = allSourceNames.filter(
-        (source) => !isAutomationSource(source),
-      );
-      return excludedSources.length > 0
-        ? { excludeSources: excludedSources }
-        : { sources: AUTOMATION_SESSION_SOURCES };
-    }
-    return {};
-  }, [selectedSources, sessionCategory, allSourceNames]);
+  const sessionQueryOptions = useMemo(
+    () => buildSessionQueryOptions(selectedSources, sessionCategory, allSourceNames),
+    [selectedSources, sessionCategory, allSourceNames],
+  );
 
   const categoryDefaultSources = useMemo(() => {
     return allSourceNames.filter((source) =>
@@ -904,30 +879,8 @@ export default function SessionsPage() {
     [effectiveSelectedSources],
   );
 
-  const defaultSourceFilterLabel = useMemo(() => {
-    if (sessionCategory === "chats") return "Any chat source";
-    if (sessionCategory === "automation") return "Any automation source";
-    return t.sessions.anySource;
-  }, [sessionCategory, t.sessions.anySource]);
-
-  const sourceMenuTitle = useMemo(() => {
-    if (sessionCategory === "chats") return "Chat sources";
-    if (sessionCategory === "automation") return "Automation sources";
-    return t.sessions.sourceFilter;
-  }, [sessionCategory, t.sessions.sourceFilter]);
-
-  const sourceFilterLabel = useMemo(() => {
-    if (selectedSources === null) {
-      return defaultSourceFilterLabel;
-    }
-    if (selectedSources.length === 0) {
-      return "No sources";
-    }
-    if (selectedSources.length === 1) {
-      return sourceLabel(selectedSources[0]);
-    }
-    return `${selectedSources.length} sources`;
-  }, [defaultSourceFilterLabel, selectedSources]);
+  const sourceMenuTitle = getSourceMenuTitle(sessionCategory, t);
+  const sourceFilterLabel = getSourceFilterLabel(sessionCategory, selectedSources, t);
 
   const refreshEmptyCount = useCallback(() => {
     api
@@ -1654,42 +1607,7 @@ export default function SessionsPage() {
         </DialogContent>
       </Dialog>
 
-      {stats && (
-        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 border border-border bg-background-base/40 px-4 py-3">
-          <div className="flex flex-col">
-            <span className="text-lg font-semibold tabular-nums leading-none">
-              {stats.total}
-            </span>
-            <span className="text-xs text-muted-foreground">{s.statTotal}</span>
-          </div>
-          <div className="flex flex-col">
-            <span className="text-lg font-semibold tabular-nums leading-none text-success">
-              {stats.active_store}
-            </span>
-            <span className="text-xs text-muted-foreground">{s.statActiveInStore}</span>
-          </div>
-          <div className="flex flex-col">
-            <span className="text-lg font-semibold tabular-nums leading-none">
-              {stats.archived}
-            </span>
-            <span className="text-xs text-muted-foreground">{s.statArchived}</span>
-          </div>
-          <div className="flex flex-col">
-            <span className="text-lg font-semibold tabular-nums leading-none">
-              {stats.messages}
-            </span>
-            <span className="text-xs text-muted-foreground">{s.statMessages}</span>
-          </div>
-          {Object.keys(stats.by_source).length > 0 && (
-            <div className="flex flex-col">
-              <span className="text-lg font-semibold tabular-nums leading-none">
-                {Object.keys(stats.by_source).length}
-              </span>
-              <span className="text-xs text-muted-foreground">{s.statSources}</span>
-            </div>
-          )}
-        </div>
-      )}
+      {stats && <SessionStoreStatsBar stats={stats} s={s} />}
 
       {alerts.length > 0 && (
         <div className="border border-destructive/30 bg-destructive/[0.06] p-4">
@@ -2121,6 +2039,42 @@ export default function SessionsPage() {
       )}
 
       <PluginSlot name="sessions:bottom" />
+    </div>
+  );
+}
+
+function SessionStoreStatsBar({
+  stats,
+  s,
+}: {
+  stats: SessionStoreStats;
+  s: ReturnType<typeof pageStrings<"sessionsExtra">>;
+}) {
+  const sourceCount = Object.keys(stats.by_source).length;
+  return (
+    <div className="flex flex-wrap items-center gap-x-6 gap-y-2 border border-border bg-background-base/40 px-4 py-3">
+      <div className="flex flex-col">
+        <span className="text-lg font-semibold tabular-nums leading-none">{stats.total}</span>
+        <span className="text-xs text-muted-foreground">{s.statTotal}</span>
+      </div>
+      <div className="flex flex-col">
+        <span className="text-lg font-semibold tabular-nums leading-none text-success">{stats.active_store}</span>
+        <span className="text-xs text-muted-foreground">{s.statActiveInStore}</span>
+      </div>
+      <div className="flex flex-col">
+        <span className="text-lg font-semibold tabular-nums leading-none">{stats.archived}</span>
+        <span className="text-xs text-muted-foreground">{s.statArchived}</span>
+      </div>
+      <div className="flex flex-col">
+        <span className="text-lg font-semibold tabular-nums leading-none">{stats.messages}</span>
+        <span className="text-xs text-muted-foreground">{s.statMessages}</span>
+      </div>
+      {sourceCount > 0 && (
+        <div className="flex flex-col">
+          <span className="text-lg font-semibold tabular-nums leading-none">{sourceCount}</span>
+          <span className="text-xs text-muted-foreground">{s.statSources}</span>
+        </div>
+      )}
     </div>
   );
 }

@@ -13,6 +13,14 @@ import { api } from "@/lib/api";
 import type { AutomationBlueprint, AutomationBlueprintField } from "@/lib/automation-blueprints";
 import { cn, themedBody } from "@/lib/utils";
 import { errorMessage } from "@/lib/api-error";
+import { useI18n } from "@/i18n";
+import {
+  effectiveLocale,
+  getBlueprintStrings,
+  localizeBlueprint,
+  localizeBlueprintOptionLabel,
+  localizeBlueprintTag,
+} from "@/i18n/catalog-zh";
 
 interface AutomationBlueprintsProps {
   profile: string;
@@ -29,10 +37,12 @@ function initialValues(blueprint: AutomationBlueprint): Record<string, string> {
 
 function FieldInput({
   field,
+  locale,
   value,
   onChange,
 }: {
   field: AutomationBlueprintField;
+  locale: string;
   value: string;
   onChange: (v: string) => void;
 }) {
@@ -41,7 +51,7 @@ function FieldInput({
       <Select value={value} onValueChange={(v) => onChange(v)}>
         {field.options.map((opt) => (
           <SelectOption key={opt} value={opt}>
-            {opt}
+            {localizeBlueprintOptionLabel(opt, locale)}
           </SelectOption>
         ))}
       </Select>
@@ -68,16 +78,20 @@ function FieldInput({
 }
 
 function BlueprintCard({
-  blueprint,
+  blueprint: rawBlueprint,
+  locale,
   profile,
   showToast,
   onCreated,
 }: {
   blueprint: AutomationBlueprint;
+  locale: string;
   profile: string;
   showToast: (message: string, type: "error" | "success") => void;
   onCreated?: () => void;
 }) {
+  const blueprint = localizeBlueprint(rawBlueprint, locale);
+  const strings = getBlueprintStrings(locale);
   const [open, setOpen] = useState(false);
   const [values, setValues] = useState<Record<string, string>>(() => initialValues(blueprint));
   const [submitting, setSubmitting] = useState(false);
@@ -89,7 +103,7 @@ function BlueprintCard({
     try {
       const job = await api.instantiateAutomationBlueprint({ blueprint: blueprint.key, values }, profile);
       const when = job.schedule_display ? ` — ${job.schedule_display}` : "";
-      showToast(`${blueprint.title} scheduled${when}`, "success");
+      showToast(strings.scheduledToast(blueprint.title, when), "success");
       setOpen(false);
       setValues(initialValues(blueprint));
       onCreated?.();
@@ -100,7 +114,7 @@ function BlueprintCard({
     } finally {
       setSubmitting(false);
     }
-  }, [blueprint, values, profile, showToast, onCreated]);
+  }, [blueprint, values, profile, showToast, onCreated, strings]);
 
   return (
     <Card className={cn("overflow-hidden", themedBody)}>
@@ -114,11 +128,11 @@ function BlueprintCard({
             <p className="mt-1 text-sm opacity-70">{blueprint.description}</p>
             <div className="mt-2 flex flex-wrap gap-1">
               {blueprint.plugin ? (
-                <Badge tone="outline">plugin: {blueprint.plugin}</Badge>
+                <Badge tone="outline">{strings.pluginPrefix}{blueprint.plugin}</Badge>
               ) : null}
               {blueprint.tags.map((t) => (
                 <Badge key={t} tone="secondary">
-                  {t}
+                  {localizeBlueprintTag(t, locale)}
                 </Badge>
               ))}
             </div>
@@ -128,7 +142,7 @@ function BlueprintCard({
             size="sm"
             onClick={() => setOpen((o) => !o)}
           >
-            {open ? "Cancel" : "Set up"}
+            {open ? strings.cancel : strings.setUp}
           </Button>
         </div>
 
@@ -139,6 +153,7 @@ function BlueprintCard({
                 <Label htmlFor={`${blueprint.key}-${f.name}`}>{f.label}</Label>
                 <FieldInput
                   field={f}
+                  locale={locale}
                   value={values[f.name] ?? ""}
                   onChange={(v) => setValues((prev) => ({ ...prev, [f.name]: v }))}
                 />
@@ -158,7 +173,7 @@ function BlueprintCard({
                 disabled={submitting}
                 prefix={submitting ? <Spinner /> : <Clock />}
               >
-                Schedule it
+                {strings.scheduleIt}
               </Button>
             </div>
           </div>
@@ -175,6 +190,9 @@ function BlueprintCard({
  * via the same create_job path as everything else.
  */
 export function AutomationBlueprints({ profile, onCreated }: AutomationBlueprintsProps) {
+  const { locale: rawLocale } = useI18n();
+  const locale = effectiveLocale(rawLocale);
+  const strings = getBlueprintStrings(locale);
   const { toast, showToast } = useToast();
   const [blueprints, setBlueprints] = useState<AutomationBlueprint[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -198,17 +216,17 @@ export function AutomationBlueprints({ profile, onCreated }: AutomationBlueprint
   }, [profile]);
 
   if (loadError) {
-    return <p className="text-sm text-red-500">Couldn't load blueprints: {loadError}</p>;
+    return <p className="text-sm text-red-500">{strings.loadErrorPrefix}{loadError}</p>;
   }
   if (blueprints === null) {
     return (
       <div className="flex items-center gap-2 opacity-70">
-        <Spinner className="h-4 w-4" /> Loading blueprints…
+        <Spinner className="h-4 w-4" /> {strings.loading}
       </div>
     );
   }
   if (blueprints.length === 0) {
-    return <p className="opacity-70">No automation blueprints available.</p>;
+    return <p className="opacity-70">{strings.empty}</p>;
   }
 
   return (
@@ -219,6 +237,7 @@ export function AutomationBlueprints({ profile, onCreated }: AutomationBlueprint
           <BlueprintCard
             key={r.key}
             blueprint={r}
+            locale={locale}
             profile={profile}
             showToast={showToast}
             onCreated={onCreated}

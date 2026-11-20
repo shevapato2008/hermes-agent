@@ -64,6 +64,9 @@ function maybeFocusTerminalOnTap(
   if (!endTouch || exceedsTapDistance(state, endTouch.clientX, endTouch.clientY)) {
     return;
   }
+  if (ev.cancelable) {
+    ev.preventDefault();
+  }
   if (typeof term.focus === "function" && (!term.textarea || activeElement() !== term.textarea)) {
     term.focus();
   }
@@ -170,12 +173,12 @@ export function installTerminalTouchScroll(host: HTMLElement, term: ScrollableTe
   host.addEventListener("touchstart", onTouchStart, PASSIVE_CAPTURE);
   host.addEventListener("touchmove", onTouchMove, ACTIVE_CAPTURE);
   host.addEventListener("touchcancel", reset, CAPTURE);
-  host.addEventListener("touchend", onTouchEnd, CAPTURE);
+  host.addEventListener("touchend", onTouchEnd, ACTIVE_CAPTURE);
 
   return () => {
     host.removeEventListener("touchstart", onTouchStart, PASSIVE_CAPTURE);
     host.removeEventListener("touchmove", onTouchMove, ACTIVE_CAPTURE);
     host.removeEventListener("touchcancel", reset, CAPTURE);
-    host.removeEventListener("touchend", onTouchEnd, CAPTURE);
+    host.removeEventListener("touchend", onTouchEnd, ACTIVE_CAPTURE);
   };
 }

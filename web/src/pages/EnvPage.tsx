@@ -37,6 +37,7 @@ import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
 import { useI18n } from "@/i18n";
+import { pageStrings } from "@/i18n/page-strings";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { errorMessage } from "@/lib/api-error";
@@ -627,16 +628,17 @@ export default function EnvPage() {
 
   // Scroll-to sub-nav in the page header
   const sections = useMemo(() => {
+    const es = pageStrings(t, "env");
     const items: { id: string; label: string }[] = [
       { id: "section-oauth", label: "OAuth" },
-      { id: "section-providers", label: "Providers" },
+      { id: "section-providers", label: es.providersNav },
     ];
     if (vars) {
       const categories = ["tool", "messaging", "setting"];
       const CATEGORY_LABELS: Record<string, string> = {
-        tool: "Tools",
+        tool: es.toolsNav,
         messaging: t.common.gateway ?? "Gateway",
-        setting: "Settings",
+        setting: es.settingsNav,
       };
       for (const cat of categories) {
         const hasEntries = Object.values(vars).some(

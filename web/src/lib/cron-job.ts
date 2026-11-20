@@ -192,7 +192,15 @@ export function cronSchedulerStaleAgeS(
 
 /** "7h ago"-style label for an elapsed duration in seconds (no clock read, so it renders pure). */
 export function cronAgoLabel(seconds: number): string {
-  if (seconds < 3600) return `${Math.max(1, Math.floor(seconds / 60))}m ago`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-  return `${Math.floor(seconds / 86400)}d ago`;
+  const zh = typeof document !== "undefined" && /^zh\b/i.test(document.documentElement.lang);
+  if (seconds < 3600) {
+    const m = Math.max(1, Math.floor(seconds / 60));
+    return zh ? `${m} 分钟前` : `${m}m ago`;
+  }
+  if (seconds < 86400) {
+    const h = Math.floor(seconds / 3600);
+    return zh ? `${h} 小时前` : `${h}h ago`;
+  }
+  const d = Math.floor(seconds / 86400);
+  return zh ? `${d} 天前` : `${d}d ago`;
 }

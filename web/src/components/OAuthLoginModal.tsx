@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ExternalLink, X, Check, Copy } from "lucide-react";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
@@ -218,7 +219,7 @@ export function OAuthLoginModal({ provider, onClose, onSuccess }: Props) {
   const verificationUrl =
     start?.flow === "device_code" ? start.verification_url : "";
 
-  return (
+  return createPortal(
     <div
       className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
       onClick={handleBackdrop}
@@ -423,6 +424,7 @@ export function OAuthLoginModal({ provider, onClose, onSuccess }: Props) {
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

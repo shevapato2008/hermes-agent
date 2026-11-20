@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Plus, X } from 'lucide-react'
 import { Button } from '@nous-research/ui/ui/components/button'
 import { Input } from '@nous-research/ui/ui/components/input'
+import { isZhDocument } from '@/i18n/catalog-zh'
 
 interface Row {
   id: number
@@ -72,6 +73,8 @@ export function AllowlistInput({
   }
 
   const lone = rows.length === 1 && !rows[0].value
+  const zh = isZhDocument()
+  const removeLabel = zh ? '移除' : 'Remove'
 
   return (
     <div className="grid gap-1.5" data-slot="allowlist-input">
@@ -84,7 +87,7 @@ export function AllowlistInput({
             autoFocus={row.id === focusId}
             type="text"
             className="text-base leading-6 sm:text-xs sm:leading-4"
-            placeholder="Enter an ID"
+            placeholder={zh ? '输入用户或群组 ID' : 'Enter an ID'}
             value={row.value}
             onChange={e => change(row.id, e.target.value)}
             onKeyDown={e => {
@@ -94,14 +97,14 @@ export function AllowlistInput({
               }
             }}
           />
-          <Button ghost size="icon" aria-label="Remove" title="Remove" disabled={lone} onClick={() => remove(row.id)}>
+          <Button ghost size="icon" aria-label={removeLabel} title={removeLabel} disabled={lone} onClick={() => remove(row.id)}>
             <X className="h-3.5 w-3.5" />
           </Button>
         </div>
       ))}
       <div>
         <Button ghost size="sm" onClick={add} prefix={<Plus className="h-3.5 w-3.5" />}>
-          Add another
+          {zh ? '添加一项' : 'Add another'}
         </Button>
       </div>
     </div>

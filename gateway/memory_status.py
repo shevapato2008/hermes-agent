@@ -47,16 +47,28 @@ def _parse_iso(value: Any) -> Optional[datetime]:
     return parsed.replace(tzinfo=UTC) if parsed is not None and parsed.tzinfo is None else parsed
 
 
-def classify_pressure(available_kib: Any, total_kib: Any) -> str:
+def classify_pressure(
+    available_kib: Any,
+    total_kib: Any,
+    *,
+    swap_free_kib: Any = None,
+) -> str:
     """``ok``/``elevated``/``critical`` from MemAvailable/MemTotal; ``unknown`` when the
     sample is missing/malformed — "could not read it" must never read as "fine"."""
     available, total = _nonneg_int(available_kib), _nonneg_int(total_kib)
+    swap_free = _nonneg_int(swap_free_kib)
     if available is None:
         return "unknown"
-    fraction = available / total if total else None
-    for level, kib_floor, frac_floor in _PRESSURE_TIERS:
-        if available < kib_floor or (fraction is not None and fraction < frac_floor):
-            return level
+    if available < _CRITICAL_AVAILABLE_KIB:
+        return "critical"
+    if total and (available / total) < _CRITICAL_AVAILABLE_FRACTION:
+        return "critical"
+    if available < _ELEVATED_AVAILABLE_KIB:
+        return "elevated"
+    if total and (available / total) < _ELEVATED_AVAILABLE_FRACTION:
+        if swap_free is not None and swap_free >= total * 0.5:
+            return "ok"
+        return "elevated"
     return "ok"
 
 
@@ -101,7 +113,11 @@ def collect_memory_status(
                 # pressure stays "unknown" so a dead gateway's final gasp cannot
                 # render a live "critical" banner forever.
                 if 0 <= (moment - sampled_at).total_seconds() <= _HEARTBEAT_FRESH_TTL_S:
-                    status["pressure"] = classify_pressure(mem.get("mem_available_kib"), mem.get("mem_total_kib"))
+                    status["pressure"] = classify_pressure(
+                        mem.get("mem_available_kib"),
+                        mem.get("mem_total_kib"),
+                        swap_free_kib=mem.get("swap_free_kib"),
+                    )
 
     if sentinel:
         status["last_boot_unclean"] = bool(sentinel.get("prior_unclean_exit"))

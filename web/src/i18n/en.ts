@@ -193,6 +193,12 @@ export const en: Translations = {
     filterAll: "All",
     sourceFilter: "Session source",
     anySource: "Any source",
+    anyChatSource: "Any chat source",
+    anyAutomationSource: "Any automation source",
+    chatSources: "Chat sources",
+    automationSources: "Automation sources",
+    noSources: "No sources",
+    sourcesCount: "{count} sources",
     searchPlaceholder: "Search message content...",
     noSessions: "No sessions yet",
     noSessionsInFilter: "No sessions in this filter",
@@ -276,6 +282,22 @@ export const en: Translations = {
     toolCalls: "tool calls",
     noModelsData: "No model usage data for this period",
     startSession: "Start a session to see model data here",
+    modelSettings: "Model Settings",
+    appliesToNewSessions: "applies to new sessions",
+    mainModel: "Main model",
+    change: "Change",
+    auxiliaryTasks: "Auxiliary tasks",
+    configure: "Configure",
+    mixtureOfAgents: "Mixture of Agents",
+    unset: "(unset)",
+    notLoaded: "not loaded",
+    useAs: "Use as",
+    current: "current",
+    auxiliaryTaskHeading: "Auxiliary task",
+    allAuxiliaryTasks: "All auxiliary tasks",
+    resetAllToAuto: "Reset all to auto",
+    auxModalDesc:
+      "Auxiliary tasks handle side-jobs like vision, session search, and compression. auto means \"use the main model\". Override per-task when you want a cheap/fast model for a specific job.",
   },
 
   logs: {
@@ -294,6 +316,31 @@ export const en: Translations = {
     // user has seen; name the field they must fill instead.
     scriptRequired:
       "Script-only jobs need a script path. Fill in the Script field or switch the job back to prompt mode.",
+    jobsTab: "Jobs",
+    blueprintsTab: "Blueprints",
+    editJob: "Edit job",
+    saveChanges: "Save changes",
+    skillsOptional: "Skills (optional)",
+    noSkillsInstalled: "No skills installed for this profile.",
+    skillsHint:
+      "Selected skills are loaded before the prompt runs — the cron sets when, the skill sets how.",
+    advancedFields: "Advanced fields",
+    provider: "Provider",
+    model: "Model",
+    defaultOption: "Default",
+    baseUrlOverride: "Base URL override",
+    noAgentLabel: "no_agent: run the script only and deliver stdout verbatim",
+    scriptLabel: "Script",
+    workdirLabel: "Workdir",
+    continuityLabel:
+      "continuity: each run sees the previous run's output (dedupe, pick up where it left off)",
+    contextFromLabel: "context_from job IDs",
+    contextFromPlaceholder: "one job id per line",
+    enabledToolsetsLabel: "enabled_toolsets",
+    noToolsetsAvailable: "No toolsets available.",
+    profileLabel: "Profile",
+    allProfiles: "All profiles",
+    repeatLabel: "repeat:",
     confirmDeleteMessage:
       "This removes the job from the schedule. This cannot be undone.",
     confirmDeleteTitle: "Delete scheduled job?",
@@ -426,6 +473,10 @@ export const en: Translations = {
     modelSaved: "Model updated",
     modelSelect: "Select a model",
     actions: "Actions",
+    manageSkills: "Manage skills & tools",
+    activeSetHint:
+      "Dashboard switched to manage {name}. New CLI/gateway runs will use this profile too.",
+    buildBtn: "Build",
   },
 
   pluginsPage: {
@@ -497,6 +548,12 @@ export const en: Translations = {
       "Plugins install disabled; enable it after install to activate.",
     catalogRequiresEnv: "Requires env",
     removedFromCatalog: "Removed from catalog",
+    providersSubheading:
+      "Configure memory providers and runtime context engine selection.",
+    builtinMemoryHint:
+      "Hermes will use the built-in MEMORY.md and USER.md files.",
+    saveMemoryProvider: "Save memory provider",
+    saveContextEngine: "Save context engine",
   },
 
   skills: {
@@ -505,6 +562,25 @@ export const en: Translations = {
     loadWhat: "skills",
     browseHub: "Browse skills hub",
     createSkill: "Create skill",
+    learnSkill: "Learn a skill",
+    newSkill: "New skill",
+    configure: "Configure",
+    learnSkillDesc:
+      "Point Hermes at anything and it will distill a reusable skill — following the house authoring standards. Fill in any combination below; the agent gathers the sources and writes the skill in chat.",
+    localFileOrDir: "Local file or directory",
+    urlLabel: "URL",
+    anythingElseLabel:
+      "Anything else — describe the workflow, paste notes, or say \"what we just did\"",
+    learnIt: "Learn it",
+    hubSearchPlaceholder: "Search the skill hub (GitHub, official, community)…",
+    updateAll: "Update all",
+    featuredSkills: "Featured skills",
+    featuredSkillsHint:
+      "from the Hermes index — search above for thousands more",
+    connectedHubs: "Connected hubs:",
+    details: "Details",
+    install: "Install",
+    installed: "Installed",
     enabledOf: "{enabled}/{total} enabled",
     all: "All",
     categories: "Categories",
@@ -594,6 +670,9 @@ export const en: Translations = {
     customKeyNamePlaceholder: "e.g. MY_SERVICE_API_KEY",
     add: "Add",
     invalidKeyName: "Use letters, numbers and underscores only (must start with a letter or underscore).",
+    providersNav: "Providers",
+    toolsNav: "Tools",
+    settingsNav: "Settings",
   },
 
   oauth: {
@@ -1020,6 +1099,12 @@ export const en: Translations = {
     cancel: "Cancel",
     saving: "Saving…",
     saveAndEnable: "Save & enable",
+    configureTitle: "Configure {name}",
+    useOwnTelegramBot: "Use your own Telegram bot",
+    botFatherGuide: "BotFather guide",
+    setupGuide: "Setup guide",
+    secretSetPlaceholder: "•••••• (set — leave blank to keep)",
+    callbackUrlLabel: "Callback URL (shared listener):",
   },
 
   pairingPage: {
@@ -1088,6 +1173,35 @@ export const en: Translations = {
     installing: "Installing...",
     install: "Install",
     installed: "Installed",
+    nameLabel: "Name",
+    transportLabel: "Transport",
+    urlLabel: "URL",
+    authLabel: "Authentication",
+    authNone: "None",
+    authBearer: "Bearer token",
+    authOauth: "OAuth",
+    bearerHint:
+      "Stored in this profile's .env; config.yaml keeps only an environment-variable reference.",
+    oauthHint:
+      "Add the server, then use Authenticate. Hermes opens the OAuth browser on the machine running the Dashboard backend.",
+    commandLabel: "Command",
+    argsLabel: "Args",
+    envLabel: "Environment (KEY=VALUE per line)",
+    adding: "Adding...",
+    add: "Add",
+    installTitle: "Install {name}",
+    installModalDesc:
+      "This MCP requires the following values to be configured.",
+    authenticate: "Authenticate",
+    enable: "Enable",
+    disable: "Disable",
+    testConnection: "Test connection",
+    delete: "Delete",
+    endpointLabel: "Endpoint:",
+    runsLabel: "Runs:",
+    installsFromLabel: "Installs from:",
+    bootstrapCommands: "Bootstrap commands ({count})",
+    setupNotes: "Setup notes",
   },
 
   systemPage: {
@@ -1114,5 +1228,18 @@ export const en: Translations = {
     migrateConfig: "Migrate config",
     prune: "Prune",
     newHook: "New hook",
+    newShellHookTitle: "New shell hook",
+    eventLabel: "Event",
+    commandLabel: "Command (absolute path)",
+    matcherLabel: "Matcher (optional)",
+    timeoutLabel: "Timeout (s)",
+    approveNowLabel:
+      "Approve now (grant consent so it fires; otherwise it stays configured but inactive)",
+    hookSecurityWarning:
+      "Shell hooks run arbitrary commands on this host. Only add scripts you trust. Takes effect on the next gateway/session restart.",
+    createHookBtn: "Create hook",
+    creatingHookBtn: "Creating",
+    noShellHooks: "No shell hooks configured.",
+    changeInPlugins: "Change in Plugins →",
   },
 };

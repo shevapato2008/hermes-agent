@@ -67,6 +67,20 @@ class TestClassifyPressure:
         # 1 GiB available, unknown total: passes both absolute floors → ok.
         assert classify_pressure(1024 * 1024, None) == "ok"
 
+    def test_2gib_device_with_plentiful_swap_headroom(self) -> None:
+        # 2 GiB board (2,010,440 KiB) with ~273 MiB MemAvailable (280,000 KiB > 128 MiB floor,
+        # ~13.9% < 15% ratio) and ~4 GiB free zram/swap (4,133,888 KiB >= 50% of MemTotal).
+        assert (
+            classify_pressure(280000, 2010440, swap_free_kib=4133888) == "ok"
+        )
+        # Below the 128 MiB absolute floor (131,072 KiB) but >= 5% critical floor still reports "elevated" even with abundant swap.
+        assert (
+            classify_pressure(120000, 2010440, swap_free_kib=4133888)
+            == "elevated"
+        )
+        # 2-arg call without swap_free_kib remains "elevated" for backward compatibility.
+        assert classify_pressure(280000, 2010440) == "elevated"
+
 
 class TestCollectMemoryStatus:
     def test_no_files_yields_unknown(self, tmp_path: Path) -> None:

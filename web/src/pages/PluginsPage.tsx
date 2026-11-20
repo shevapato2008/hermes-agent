@@ -571,7 +571,7 @@ export default function PluginsPage() {
             <CardHeader>
               <CardTitle>{t.pluginsPage.providersHeading}</CardTitle>
               <p className="text-xs tracking-[0.08em] text-text-tertiary">
-                Configure memory providers and runtime context engine selection.
+                {t.pluginsPage.providersSubheading}
               </p>
             </CardHeader>
 
@@ -614,7 +614,7 @@ export default function PluginsPage() {
 
                   {!selectedMemoryName && (
                     <p className="text-xs text-muted-foreground">
-                      Hermes will use the built-in MEMORY.md and USER.md files.
+                      {t.pluginsPage.builtinMemoryHint}
                     </p>
                   )}
 
@@ -771,7 +771,7 @@ export default function PluginsPage() {
                     onClick={() => void onSaveMemoryProvider()}
                     prefix={memoryBusy ? <Spinner /> : undefined}
                   >
-                    Save memory provider
+                    {t.pluginsPage.saveMemoryProvider}
                   </Button>
                 </div>
 
@@ -802,7 +802,7 @@ export default function PluginsPage() {
                     onClick={() => void onSaveContextEngine()}
                     prefix={contextBusy ? <Spinner /> : undefined}
                   >
-                    Save context engine
+                    {t.pluginsPage.saveContextEngine}
                   </Button>
                 </div>
               </div>

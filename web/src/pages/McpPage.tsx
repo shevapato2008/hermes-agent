@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useState, type RefObject } from "react";
+import { createPortal } from "react-dom";
 import { KeyRound, Package, Power, Server, Trash2, X, Zap } from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
@@ -30,6 +31,7 @@ import {
 import { completeMcpDashboardOAuth } from "@/lib/mcp-dashboard-oauth";
 import { errorMessage } from "@/lib/api-error";
 import { usePageStrings } from "@/i18n/page-strings";
+import type { Translations } from "@/i18n/types";
 
 function isHttpUrl(value: string): boolean {
   return /^https?:\/\//i.test(value.trim());
@@ -44,6 +46,298 @@ const TRANSPORT_TONE: Record<string, "success" | "warning" | "secondary"> = {
   stdio: "warning",
   unknown: "secondary",
 };
+
+function AddMcpServerModal({
+  modalRef,
+  s,
+  name,
+  setName,
+  transport,
+  setTransport,
+  url,
+  setUrl,
+  httpAuth,
+  setHttpAuth,
+  bearerToken,
+  setBearerToken,
+  command,
+  setCommand,
+  args,
+  setArgs,
+  env,
+  setEnv,
+  creating,
+  onClose,
+  onCreate,
+}: {
+  modalRef: RefObject<HTMLDivElement | null>;
+  s: Required<NonNullable<Translations["mcpPage"]>>;
+  name: string;
+  setName: (v: string) => void;
+  transport: McpTransport;
+  setTransport: (v: McpTransport) => void;
+  url: string;
+  setUrl: (v: string) => void;
+  httpAuth: McpHttpAuth;
+  setHttpAuth: (v: McpHttpAuth) => void;
+  bearerToken: string;
+  setBearerToken: (v: string) => void;
+  command: string;
+  setCommand: (v: string) => void;
+  args: string;
+  setArgs: (v: string) => void;
+  env: string;
+  setEnv: (v: string) => void;
+  creating: boolean;
+  onClose: () => void;
+  onCreate: () => void;
+}) {
+  return createPortal(
+    <div
+      ref={modalRef}
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
+      onClick={(e) => e.target === e.currentTarget && onClose()}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="create-mcp-title"
+    >
+      <div className={cn(themedBody, "relative w-full max-w-lg max-h-[90dvh] border border-border bg-card shadow-2xl flex flex-col")}>
+        <Button
+          ghost
+          size="icon"
+          onClick={onClose}
+          className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
+          aria-label="Close"
+        >
+          <X />
+        </Button>
+
+        <header className="p-5 pb-3 border-b border-border">
+          <h2 id="create-mcp-title" className="font-mondwest text-display text-base tracking-wider">
+            {s.addMcpServerTitle}
+          </h2>
+        </header>
+
+        <div className="min-h-0 overflow-y-auto p-5 grid gap-4">
+          <div className="grid gap-2">
+            <Label htmlFor="mcp-name">{s.nameLabel}</Label>
+            <Input
+              id="mcp-name"
+              autoFocus
+              placeholder="my-server"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+          </div>
+
+          <div className="grid gap-2">
+            <Label htmlFor="mcp-transport">{s.transportLabel}</Label>
+            <Select
+              id="mcp-transport"
+              value={transport}
+              onValueChange={(value) => {
+                const nextTransport = value as McpTransport;
+                setTransport(nextTransport);
+                if (nextTransport === "stdio") setBearerToken("");
+              }}
+            >
+              <SelectOption value="http">HTTP/SSE</SelectOption>
+              <SelectOption value="stdio">stdio</SelectOption>
+            </Select>
+          </div>
+
+          {transport === "http" ? (
+            <>
+              <div className="grid gap-2">
+                <Label htmlFor="mcp-url">{s.urlLabel}</Label>
+                <Input
+                  id="mcp-url"
+                  placeholder="https://example.com/mcp"
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="mcp-auth">{s.authLabel}</Label>
+                <Select
+                  id="mcp-auth"
+                  value={httpAuth}
+                  onValueChange={(value) => {
+                    const nextAuth = value as McpHttpAuth;
+                    setHttpAuth(nextAuth);
+                    if (nextAuth !== "header") setBearerToken("");
+                  }}
+                >
+                  <SelectOption value="none">{s.authNone}</SelectOption>
+                  <SelectOption value="header">{s.authBearer}</SelectOption>
+                  <SelectOption value="oauth">{s.authOauth}</SelectOption>
+                </Select>
+              </div>
+              {httpAuth === "header" && (
+                <div className="grid gap-2">
+                  <Label htmlFor="mcp-bearer-token">{s.authBearer}</Label>
+                  <Input
+                    id="mcp-bearer-token"
+                    type="password"
+                    autoComplete="new-password"
+                    placeholder="Token or Bearer token"
+                    value={bearerToken}
+                    onChange={(e) => setBearerToken(e.target.value)}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {s.bearerHint}
+                  </p>
+                </div>
+              )}
+              {httpAuth === "oauth" && (
+                <p className="text-xs text-muted-foreground">
+                  {s.oauthHint}
+                </p>
+              )}
+            </>
+          ) : (
+            <>
+              <div className="grid gap-2">
+                <Label htmlFor="mcp-command">{s.commandLabel}</Label>
+                <Input
+                  id="mcp-command"
+                  placeholder="npx"
+                  value={command}
+                  onChange={(e) => setCommand(e.target.value)}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="mcp-args">{s.argsLabel}</Label>
+                <Input
+                  id="mcp-args"
+                  placeholder="-y @modelcontextprotocol/server-foo"
+                  value={args}
+                  onChange={(e) => setArgs(e.target.value)}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="mcp-env">
+                  {s.envLabel}
+                </Label>
+                <textarea
+                  id="mcp-env"
+                  className="flex min-h-[80px] w-full border border-border bg-background/40 px-3 py-2 text-sm font-courier shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30 focus-visible:border-foreground/25"
+                  placeholder={"API_KEY=secret\nDEBUG=1"}
+                  value={env}
+                  onChange={(e) => setEnv(e.target.value)}
+                />
+              </div>
+            </>
+          )}
+
+          <div className="flex justify-end">
+            <Button
+              className="uppercase"
+              size="sm"
+              onClick={onCreate}
+              disabled={creating}
+              prefix={creating ? <Spinner /> : undefined}
+            >
+              {creating ? s.adding : s.add}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+function InstallMcpModal({
+  modalRef,
+  s,
+  installEntry,
+  installEnv,
+  onEnvChange,
+  installing,
+  onClose,
+  onSubmit,
+}: {
+  modalRef: RefObject<HTMLDivElement | null>;
+  s: Required<NonNullable<Translations["mcpPage"]>>;
+  installEntry: McpCatalogEntry;
+  installEnv: Record<string, string>;
+  onEnvChange: (key: string, value: string) => void;
+  installing: boolean;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  return createPortal(
+    <div
+      ref={modalRef}
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
+      onClick={(e) => e.target === e.currentTarget && onClose()}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="install-mcp-title"
+    >
+      <div
+        className={cn(
+          themedBody,
+          "relative w-full max-w-lg max-h-[90dvh] border border-border bg-card shadow-2xl flex flex-col",
+        )}
+      >
+        <Button
+          ghost
+          size="icon"
+          onClick={onClose}
+          className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
+          aria-label="Close"
+        >
+          <X />
+        </Button>
+
+        <header className="p-5 pb-3 border-b border-border">
+          <h2
+            id="install-mcp-title"
+            className="font-mondwest text-display text-base tracking-wider"
+          >
+            {s.installTitle.replace("{name}", installEntry.name)}
+          </h2>
+        </header>
+
+        <div className="min-h-0 overflow-y-auto p-5 grid gap-4">
+          <p className="text-xs text-muted-foreground">
+            {s.installModalDesc}
+          </p>
+          {installEntry.required_env.map((item) => (
+            <div className="grid gap-2" key={item.name}>
+              <Label htmlFor={`install-env-${item.name}`}>
+                {item.prompt}
+                {item.required ? " *" : ""}
+              </Label>
+              <Input
+                id={`install-env-${item.name}`}
+                type="password"
+                placeholder={item.name}
+                value={installEnv[item.name] ?? ""}
+                onChange={(e) => onEnvChange(item.name, e.target.value)}
+              />
+            </div>
+          ))}
+
+          <div className="flex justify-end">
+            <Button
+              className="uppercase"
+              size="sm"
+              onClick={onSubmit}
+              disabled={installing}
+              prefix={installing ? <Spinner /> : undefined}
+            >
+              {installing ? s.installing : s.install}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
 
 export default function McpPage() {
   const s = usePageStrings("mcpPage");
@@ -338,242 +632,45 @@ export default function McpPage() {
 
       {/* Add server modal */}
       {createModalOpen && (
-        <div
-          ref={createModalRef}
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
-          onClick={(e) => e.target === e.currentTarget && closeCreateModal()}
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="create-mcp-title"
-        >
-          <div className={cn(themedBody, "relative w-full max-w-lg border border-border bg-card shadow-2xl flex flex-col")}>
-            <Button
-              ghost
-              size="icon"
-              onClick={closeCreateModal}
-              className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
-              aria-label="Close"
-            >
-              <X />
-            </Button>
-
-            <header className="p-5 pb-3 border-b border-border">
-              <h2 id="create-mcp-title" className="font-mondwest text-display text-base tracking-wider">
-                {s.addMcpServerTitle}
-              </h2>
-            </header>
-
-            <div className="p-5 grid gap-4">
-              <div className="grid gap-2">
-                <Label htmlFor="mcp-name">Name</Label>
-                <Input
-                  id="mcp-name"
-                  autoFocus
-                  placeholder="my-server"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                />
-              </div>
-
-              <div className="grid gap-2">
-                <Label htmlFor="mcp-transport">Transport</Label>
-                <Select
-                  id="mcp-transport"
-                  value={transport}
-                  onValueChange={(value) => {
-                    const nextTransport = value as McpTransport;
-                    setTransport(nextTransport);
-                    if (nextTransport === "stdio") setBearerToken("");
-                  }}
-                >
-                  <SelectOption value="http">HTTP/SSE</SelectOption>
-                  <SelectOption value="stdio">stdio</SelectOption>
-                </Select>
-              </div>
-
-              {transport === "http" ? (
-                <>
-                  <div className="grid gap-2">
-                    <Label htmlFor="mcp-url">URL</Label>
-                    <Input
-                      id="mcp-url"
-                      placeholder="https://example.com/mcp"
-                      value={url}
-                      onChange={(e) => setUrl(e.target.value)}
-                    />
-                  </div>
-                  <div className="grid gap-2">
-                    <Label htmlFor="mcp-auth">Authentication</Label>
-                    <Select
-                      id="mcp-auth"
-                      value={httpAuth}
-                      onValueChange={(value) => {
-                        const nextAuth = value as McpHttpAuth;
-                        setHttpAuth(nextAuth);
-                        if (nextAuth !== "header") setBearerToken("");
-                      }}
-                    >
-                      <SelectOption value="none">None</SelectOption>
-                      <SelectOption value="header">Bearer token</SelectOption>
-                      <SelectOption value="oauth">OAuth</SelectOption>
-                    </Select>
-                  </div>
-                  {httpAuth === "header" && (
-                    <div className="grid gap-2">
-                      <Label htmlFor="mcp-bearer-token">Bearer token</Label>
-                      <Input
-                        id="mcp-bearer-token"
-                        type="password"
-                        autoComplete="new-password"
-                        placeholder="Token or Bearer token"
-                        value={bearerToken}
-                        onChange={(e) => setBearerToken(e.target.value)}
-                      />
-                      <p className="text-xs text-muted-foreground">
-                        Stored in this profile&apos;s .env; config.yaml keeps
-                        only an environment-variable reference.
-                      </p>
-                    </div>
-                  )}
-                  {httpAuth === "oauth" && (
-                    <p className="text-xs text-muted-foreground">
-                      Add the server, then use Authenticate. Hermes opens the
-                      OAuth browser on the machine running the Dashboard
-                      backend.
-                    </p>
-                  )}
-                </>
-              ) : (
-                <>
-                  <div className="grid gap-2">
-                    <Label htmlFor="mcp-command">Command</Label>
-                    <Input
-                      id="mcp-command"
-                      placeholder="npx"
-                      value={command}
-                      onChange={(e) => setCommand(e.target.value)}
-                    />
-                  </div>
-                  <div className="grid gap-2">
-                    <Label htmlFor="mcp-args">Args</Label>
-                    <Input
-                      id="mcp-args"
-                      placeholder="-y @modelcontextprotocol/server-foo"
-                      value={args}
-                      onChange={(e) => setArgs(e.target.value)}
-                    />
-                  </div>
-                  <div className="grid gap-2">
-                    <Label htmlFor="mcp-env">
-                      Environment (KEY=VALUE per line)
-                    </Label>
-                    <textarea
-                      id="mcp-env"
-                      className="flex min-h-[80px] w-full border border-border bg-background/40 px-3 py-2 text-sm font-courier shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30 focus-visible:border-foreground/25"
-                      placeholder={"API_KEY=secret\nDEBUG=1"}
-                      value={env}
-                      onChange={(e) => setEnv(e.target.value)}
-                    />
-                  </div>
-                </>
-              )}
-
-              <div className="flex justify-end">
-                <Button
-                  className="uppercase"
-                  size="sm"
-                  onClick={handleCreate}
-                  disabled={creating}
-                  prefix={creating ? <Spinner /> : undefined}
-                >
-                  {creating ? "Adding..." : "Add"}
-                </Button>
-              </div>
-            </div>
-          </div>
-        </div>
+        <AddMcpServerModal
+          modalRef={createModalRef}
+          s={s}
+          name={name}
+          setName={setName}
+          transport={transport}
+          setTransport={setTransport}
+          url={url}
+          setUrl={setUrl}
+          httpAuth={httpAuth}
+          setHttpAuth={setHttpAuth}
+          bearerToken={bearerToken}
+          setBearerToken={setBearerToken}
+          command={command}
+          setCommand={setCommand}
+          args={args}
+          setArgs={setArgs}
+          env={env}
+          setEnv={setEnv}
+          creating={creating}
+          onClose={closeCreateModal}
+          onCreate={() => void handleCreate()}
+        />
       )}
 
       {/* Catalog install modal (required env vars) */}
       {installEntry && (
-        <div
-          ref={installModalRef}
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
-          onClick={(e) => e.target === e.currentTarget && setInstallEntry(null)}
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="install-mcp-title"
-        >
-          <div
-            className={cn(
-              themedBody,
-              "relative w-full max-w-lg border border-border bg-card shadow-2xl flex flex-col",
-            )}
-          >
-            <Button
-              ghost
-              size="icon"
-              onClick={() => setInstallEntry(null)}
-              className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
-              aria-label="Close"
-            >
-              <X />
-            </Button>
-
-            <header className="p-5 pb-3 border-b border-border">
-              <h2
-                id="install-mcp-title"
-                className="font-mondwest text-display text-base tracking-wider"
-              >
-                Install {installEntry.name}
-              </h2>
-            </header>
-
-            <div className="p-5 grid gap-4">
-              <p className="text-xs text-muted-foreground">
-                This MCP requires the following values to be configured.
-              </p>
-              {installEntry.required_env.map((item) => (
-                <div className="grid gap-2" key={item.name}>
-                  <Label htmlFor={`install-env-${item.name}`}>
-                    {item.prompt}
-                    {item.required ? " *" : ""}
-                  </Label>
-                  <Input
-                    id={`install-env-${item.name}`}
-                    type="password"
-                    placeholder={item.name}
-                    value={installEnv[item.name] ?? ""}
-                    onChange={(e) =>
-                      setInstallEnv((prev) => ({
-                        ...prev,
-                        [item.name]: e.target.value,
-                      }))
-                    }
-                  />
-                </div>
-              ))}
-
-              <div className="flex justify-end">
-                <Button
-                  className="uppercase"
-                  size="sm"
-                  onClick={handleInstallSubmit}
-                  disabled={installingName === installEntry.name}
-                  prefix={
-                    installingName === installEntry.name ? (
-                      <Spinner />
-                    ) : undefined
-                  }
-                >
-                  {installingName === installEntry.name
-                    ? "Installing..."
-                    : "Install"}
-                </Button>
-              </div>
-            </div>
-          </div>
-        </div>
+        <InstallMcpModal
+          modalRef={installModalRef}
+          s={s}
+          installEntry={installEntry}
+          installEnv={installEnv}
+          onEnvChange={(key, val) =>
+            setInstallEnv((prev) => ({ ...prev, [key]: val }))
+          }
+          installing={installingName === installEntry.name}
+          onClose={() => setInstallEntry(null)}
+          onSubmit={handleInstallSubmit}
+        />
       )}
 
       {/* ── Your MCP servers ── */}
@@ -678,7 +775,7 @@ export default function McpPage() {
                     <Button
                       ghost
                       size="sm"
-                      title="Authenticate with OAuth"
+                      title={s.authenticate}
                       onClick={() => handleAuthenticate(server)}
                       disabled={authenticating === server.name}
                       prefix={
@@ -689,15 +786,15 @@ export default function McpPage() {
                         )
                       }
                     >
-                      Authenticate
+                      {s.authenticate}
                     </Button>
                   )}
 
                   <Button
                     ghost
                     size="sm"
-                    title={server.enabled ? "Disable" : "Enable"}
-                    aria-label={server.enabled ? "Disable" : "Enable"}
+                    title={server.enabled ? s.disable : s.enable}
+                    aria-label={server.enabled ? s.disable : s.enable}
                     onClick={() => handleToggleEnabled(server)}
                     disabled={togglingName === server.name}
                     prefix={
@@ -705,14 +802,14 @@ export default function McpPage() {
                     }
                     className={server.enabled ? "text-success" : undefined}
                   >
-                    {server.enabled ? "Disable" : "Enable"}
+                    {server.enabled ? s.disable : s.enable}
                   </Button>
 
                   <Button
                     ghost
                     size="icon"
-                    title="Test connection"
-                    aria-label="Test connection"
+                    title={s.testConnection}
+                    aria-label={s.testConnection}
                     onClick={() => handleTest(server)}
                     disabled={testing === server.name}
                   >
@@ -723,8 +820,8 @@ export default function McpPage() {
                     ghost
                     destructive
                     size="icon"
-                    title="Delete"
-                    aria-label="Delete"
+                    title={s.delete}
+                    aria-label={s.delete}
                     onClick={() => serverDelete.requestDelete(server.name)}
                   >
                     <Trash2 />
@@ -800,13 +897,13 @@ export default function McpPage() {
                   {/* Connection detail: what the agent actually talks to. */}
                   {entry.transport === "http" && entry.url && (
                     <p className="mt-1 text-xs text-muted-foreground">
-                      <span className="font-medium">Endpoint:</span>{" "}
+                      <span className="font-medium">{s.endpointLabel}</span>{" "}
                       <code className="font-mono">{entry.url}</code>
                     </p>
                   )}
                   {entry.transport === "stdio" && entry.command && (
                     <p className="mt-1 text-xs text-muted-foreground break-all">
-                      <span className="font-medium">Runs:</span>{" "}
+                      <span className="font-medium">{s.runsLabel}</span>{" "}
                       <code className="font-mono">
                         {[entry.command, ...entry.args].join(" ")}
                       </code>
@@ -816,7 +913,7 @@ export default function McpPage() {
                       before they install (matches the docs trust model). */}
                   {entry.install_url && (
                     <p className="mt-1 text-xs text-muted-foreground break-all">
-                      <span className="font-medium">Installs from:</span>{" "}
+                      <span className="font-medium">{s.installsFromLabel}</span>{" "}
                       {isHttpUrl(entry.install_url) ? (
                         <a
                           href={entry.install_url}
@@ -835,7 +932,7 @@ export default function McpPage() {
                   {entry.bootstrap.length > 0 && (
                     <details className="mt-1 text-xs text-muted-foreground">
                       <summary className="cursor-pointer select-none">
-                        Bootstrap commands ({entry.bootstrap.length})
+                        {s.bootstrapCommands.replace("{count}", String(entry.bootstrap.length))}
                       </summary>
                       <ul className="mt-1 ml-3 list-disc space-y-0.5">
                         {entry.bootstrap.map((cmd, i) => (
@@ -852,7 +949,7 @@ export default function McpPage() {
                   {entry.post_install && (
                     <details className="mt-1 text-xs text-muted-foreground">
                       <summary className="cursor-pointer select-none">
-                        Setup notes
+                        {s.setupNotes}
                       </summary>
                       <p className="mt-1 whitespace-pre-wrap">
                         {entry.post_install.trim()}
@@ -871,7 +968,7 @@ export default function McpPage() {
 
                 <div className="flex items-center gap-1 shrink-0">
                   {entry.installed ? (
-                    <Badge tone="success">Installed</Badge>
+                    <Badge tone="success">{s.installed}</Badge>
                   ) : (
                     <Button
                       className="uppercase"
@@ -880,7 +977,7 @@ export default function McpPage() {
                       disabled={isInstalling}
                       prefix={isInstalling ? <Spinner /> : undefined}
                     >
-                      {isInstalling ? "Installing..." : "Install"}
+                      {isInstalling ? s.installing : s.install}
                     </Button>
                   )}
                 </div>

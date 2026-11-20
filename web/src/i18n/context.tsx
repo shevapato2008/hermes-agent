@@ -82,9 +82,11 @@ export function I18nProvider({
   children: ReactNode;
   initialLocale?: Locale;
 }) {
-  const [locale, setLocaleState] = useState<Locale>(
-    () => initialLocale ?? getInitialLocale(),
-  );
+  const [locale, setLocaleState] = useState<Locale>(() => {
+    const init = initialLocale ?? getInitialLocale();
+    applyDocumentLocale(init);
+    return init;
+  });
 
   const setLocale = useCallback((l: Locale) => {
     setLocaleState(l);

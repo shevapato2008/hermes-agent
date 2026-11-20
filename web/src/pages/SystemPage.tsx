@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Link } from "react-router";
 import {
   Activity,
@@ -794,108 +795,24 @@ export default function SystemPage() {
       />
 
       {/* Create-hook modal */}
-      {hookModalOpen && (
-        <div
-          ref={hookModalRef}
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
-          onClick={(e) => e.target === e.currentTarget && setHookModalOpen(false)}
-          role="dialog"
-          aria-modal="true"
-        >
-          <div className={cn(themedBody, "relative w-full max-w-lg border border-border bg-card shadow-2xl flex flex-col")}>
-            <Button
-              ghost
-              size="icon"
-              onClick={() => setHookModalOpen(false)}
-              className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
-              aria-label="Close"
-            >
-              <X />
-            </Button>
-            <header className="p-5 pb-3 border-b border-border">
-              <h2 className="font-mondwest text-display text-base tracking-wider">
-                New shell hook
-              </h2>
-            </header>
-            <div className="p-5 grid gap-4">
-              <div className="grid gap-2">
-                <Label htmlFor="hook-event">Event</Label>
-                <Select
-                  id="hook-event"
-                  value={hookEvent}
-                  onValueChange={(v) => setHookEvent(v)}
-                >
-                  {validEvents.map((ev) => (
-                    <SelectOption key={ev} value={ev}>
-                      {ev}
-                    </SelectOption>
-                  ))}
-                </Select>
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="hook-command">Command (absolute path)</Label>
-                <Input
-                  id="hook-command"
-                  autoFocus
-                  placeholder="/usr/local/bin/my-hook.sh"
-                  value={hookCommand}
-                  onChange={(e) => setHookCommand(e.target.value)}
-                />
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="grid gap-2">
-                  <Label htmlFor="hook-matcher">Matcher (optional)</Label>
-                  <Input
-                    id="hook-matcher"
-                    placeholder="e.g. terminal"
-                    value={hookMatcher}
-                    onChange={(e) => setHookMatcher(e.target.value)}
-                  />
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="hook-timeout">Timeout (s)</Label>
-                  <Input
-                    id="hook-timeout"
-                    placeholder="10"
-                    value={hookTimeout}
-                    onChange={(e) => setHookTimeout(e.target.value)}
-                  />
-                </div>
-              </div>
-              <div className="flex items-center gap-2.5">
-                <Checkbox
-                  checked={hookApprove}
-                  id="hook-approve"
-                  onCheckedChange={(checked) => setHookApprove(checked === true)}
-                />
-
-                <Label
-                  className="cursor-pointer text-sm font-normal normal-case tracking-normal text-muted-foreground"
-                  htmlFor="hook-approve"
-                >
-                  Approve now (grant consent so it fires; otherwise it stays
-                  configured but inactive)
-                </Label>
-              </div>
-              <p className="text-xs text-warning">
-                Shell hooks run arbitrary commands on this host. Only add scripts
-                you trust. Takes effect on the next gateway/session restart.
-              </p>
-              <div className="flex justify-end">
-                <Button
-                  className="uppercase"
-                  size="sm"
-                  onClick={createHook}
-                  disabled={creatingHook}
-                  prefix={creatingHook ? <Spinner /> : undefined}
-                >
-                  {creatingHook ? "Creating" : "Create hook"}
-                </Button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+      <CreateHookModal
+        open={hookModalOpen}
+        modalRef={hookModalRef}
+        onClose={() => setHookModalOpen(false)}
+        hookEvent={hookEvent}
+        setHookEvent={setHookEvent}
+        validEvents={validEvents}
+        hookCommand={hookCommand}
+        setHookCommand={setHookCommand}
+        hookMatcher={hookMatcher}
+        setHookMatcher={setHookMatcher}
+        hookTimeout={hookTimeout}
+        setHookTimeout={setHookTimeout}
+        hookApprove={hookApprove}
+        setHookApprove={setHookApprove}
+        creatingHook={creatingHook}
+        onCreate={createHook}
+      />
 
       {/* Live action log */}
       {activeAction && (
@@ -1526,7 +1443,7 @@ export default function SystemPage() {
         {(!hooks || hooks.hooks.length === 0) && (
           <Card>
             <CardContent className="py-6 text-center text-sm text-muted-foreground">
-              No shell hooks configured.
+              {s.noShellHooks}
             </CardContent>
           </Card>
         )}
@@ -1560,6 +1477,147 @@ export default function SystemPage() {
         ))}
       </section>
     </div>
+  );
+}
+
+function CreateHookModal({
+  open,
+  modalRef,
+  onClose,
+  hookEvent,
+  setHookEvent,
+  validEvents,
+  hookCommand,
+  setHookCommand,
+  hookMatcher,
+  setHookMatcher,
+  hookTimeout,
+  setHookTimeout,
+  hookApprove,
+  setHookApprove,
+  creatingHook,
+  onCreate,
+}: {
+  open: boolean;
+  modalRef: React.RefObject<HTMLDivElement | null>;
+  onClose: () => void;
+  hookEvent: string;
+  setHookEvent: (v: string) => void;
+  validEvents: string[];
+  hookCommand: string;
+  setHookCommand: (v: string) => void;
+  hookMatcher: string;
+  setHookMatcher: (v: string) => void;
+  hookTimeout: string;
+  setHookTimeout: (v: string) => void;
+  hookApprove: boolean;
+  setHookApprove: (v: boolean) => void;
+  creatingHook: boolean;
+  onCreate: () => void;
+}) {
+  const { t } = useI18n();
+  const s = pageStrings(t, "systemPage");
+  if (!open) return null;
+  return createPortal(
+    <div
+      ref={modalRef}
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
+      onClick={(e) => e.target === e.currentTarget && onClose()}
+      role="dialog"
+      aria-modal="true"
+    >
+      <div className={cn(themedBody, "relative w-full max-w-lg max-h-[90dvh] overflow-y-auto border border-border bg-card shadow-2xl flex flex-col")}>
+        <Button
+          ghost
+          size="icon"
+          onClick={onClose}
+          className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
+          aria-label="Close"
+        >
+          <X />
+        </Button>
+        <header className="p-5 pb-3 border-b border-border">
+          <h2 className="font-mondwest text-display text-base tracking-wider">
+            {s.newShellHookTitle}
+          </h2>
+        </header>
+        <div className="p-5 grid gap-4">
+          <div className="grid gap-2">
+            <Label htmlFor="hook-event">{s.eventLabel}</Label>
+            <Select
+              id="hook-event"
+              value={hookEvent}
+              onValueChange={(v) => setHookEvent(v)}
+            >
+              {validEvents.map((ev) => (
+                <SelectOption key={ev} value={ev}>
+                  {ev}
+                </SelectOption>
+              ))}
+            </Select>
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="hook-command">{s.commandLabel}</Label>
+            <Input
+              id="hook-command"
+              autoFocus
+              placeholder="/usr/local/bin/my-hook.sh"
+              value={hookCommand}
+              onChange={(e) => setHookCommand(e.target.value)}
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="grid gap-2">
+              <Label htmlFor="hook-matcher">{s.matcherLabel}</Label>
+              <Input
+                id="hook-matcher"
+                placeholder="e.g. terminal"
+                value={hookMatcher}
+                onChange={(e) => setHookMatcher(e.target.value)}
+              />
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="hook-timeout">{s.timeoutLabel}</Label>
+              <Input
+                id="hook-timeout"
+                placeholder="10"
+                value={hookTimeout}
+                onChange={(e) => setHookTimeout(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="flex items-center gap-2.5">
+            <Checkbox
+              checked={hookApprove}
+              id="hook-approve"
+              onCheckedChange={(checked) => setHookApprove(checked === true)}
+            />
+
+            <Label
+              className="cursor-pointer text-sm font-normal normal-case tracking-normal text-muted-foreground"
+              htmlFor="hook-approve"
+            >
+              {s.approveNowLabel}
+            </Label>
+          </div>
+          <p className="text-xs text-warning">
+            {s.hookSecurityWarning}
+          </p>
+          <div className="flex justify-end">
+            <Button
+              className="uppercase"
+              size="sm"
+              onClick={onCreate}
+              disabled={creatingHook}
+              prefix={creatingHook ? <Spinner /> : undefined}
+            >
+              {creatingHook ? s.creatingHookBtn : s.createHookBtn}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -1597,7 +1655,7 @@ function MemorySection({
                 </Badge>
               )}
               <Link to="/plugins" className="underline">
-                Change in Plugins →
+                {s.changeInPlugins}
               </Link>
               <span className="ml-auto">
                 Provider setup:{" "}

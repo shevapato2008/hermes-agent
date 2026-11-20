@@ -4,13 +4,19 @@ import type { Translations } from "./types";
 
 export type PageSectionKey =
   | "skills"
+  | "sessions"
   | "sessionsExtra"
   | "filesPage"
   | "channelsPage"
   | "pairingPage"
   | "webhooksPage"
   | "mcpPage"
-  | "systemPage";
+  | "systemPage"
+  | "cron"
+  | "models"
+  | "profiles"
+  | "pluginsPage"
+  | "env";
 
 export function pageStrings<K extends PageSectionKey>(
   t: Translations,

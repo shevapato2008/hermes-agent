@@ -80,16 +80,20 @@ describe("installTerminalTouchScroll", () => {
 
     host.dispatchEvent(touchEvent("touchstart", 100, 100));
     host.dispatchEvent(touchEvent("touchmove", 103, 104));
-    host.dispatchEvent(touchEvent("touchend", 103, 104));
+    const firstTapEnd = touchEvent("touchend", 103, 104);
+    host.dispatchEvent(firstTapEnd);
 
     expect(terminal.scrollLines).not.toHaveBeenCalled();
     expect(terminal.focus).toHaveBeenCalledTimes(1);
+    expect(firstTapEnd.defaultPrevented).toBe(true);
 
-    // When textarea is already focused, tap does not redundantly re-focus.
+    // When textarea is already focused, tap does not redundantly re-focus but still prevents synthesized mousedown blur.
     textarea.focus();
     host.dispatchEvent(touchEvent("touchstart", 100, 100));
-    host.dispatchEvent(touchEvent("touchend", 102, 101));
+    const secondTapEnd = touchEvent("touchend", 102, 101);
+    host.dispatchEvent(secondTapEnd);
     expect(terminal.focus).toHaveBeenCalledTimes(1);
+    expect(secondTapEnd.defaultPrevented).toBe(true);
 
     cleanup();
     textarea.remove();
@@ -105,24 +109,30 @@ describe("installTerminalTouchScroll", () => {
     // 1. Gesture that scrolls the terminal (even if finger returns near start).
     host.dispatchEvent(touchEvent("touchstart", 200, 100));
     host.dispatchEvent(touchEvent("touchmove", 164, 100));
-    host.dispatchEvent(touchEvent("touchend", 200, 100));
+    const scrollEnd = touchEvent("touchend", 200, 100);
+    host.dispatchEvent(scrollEnd);
     expect(terminal.scrollLines).toHaveBeenCalled();
     expect(terminal.focus).not.toHaveBeenCalled();
+    expect(scrollEnd.defaultPrevented).toBe(false);
 
     // 2. Gesture that moves >= 10px without scrolling (e.g. horizontal drag or at boundary).
     const boundaryTerminal = term(0, 100, textarea);
     const cleanupBoundary = installTerminalTouchScroll(host, boundaryTerminal);
     host.dispatchEvent(touchEvent("touchstart", 100, 100));
-    host.dispatchEvent(touchEvent("touchend", 100, 112));
+    const dragEnd = touchEvent("touchend", 100, 112);
+    host.dispatchEvent(dragEnd);
     expect(boundaryTerminal.focus).not.toHaveBeenCalled();
+    expect(dragEnd.defaultPrevented).toBe(false);
 
     // 3. Out-and-back drag (>= 10px away then back within 10px of start) on empty terminal.
     const emptyTerminal = term(0, 0, textarea);
     const cleanupEmpty = installTerminalTouchScroll(host, emptyTerminal);
     host.dispatchEvent(touchEvent("touchstart", 100, 100));
     host.dispatchEvent(touchEvent("touchmove", 150, 100));
-    host.dispatchEvent(touchEvent("touchend", 102, 101));
+    const outAndBackEnd = touchEvent("touchend", 102, 101);
+    host.dispatchEvent(outAndBackEnd);
     expect(emptyTerminal.focus).not.toHaveBeenCalled();
+    expect(outAndBackEnd.defaultPrevented).toBe(false);
 
     cleanupEmpty();
     cleanupBoundary();

@@ -206,6 +206,12 @@ export interface Translations {
     filterAll: string;
     sourceFilter: string;
     anySource: string;
+    anyChatSource?: string;
+    anyAutomationSource?: string;
+    chatSources?: string;
+    automationSources?: string;
+    noSources?: string;
+    sourcesCount?: string;
     searchPlaceholder: string;
     noSessions: string;
     noSessionsInFilter: string;
@@ -287,6 +293,21 @@ export interface Translations {
     toolCalls: string;
     noModelsData: string;
     startSession: string;
+    modelSettings?: string;
+    appliesToNewSessions?: string;
+    mainModel?: string;
+    change?: string;
+    auxiliaryTasks?: string;
+    configure?: string;
+    mixtureOfAgents?: string;
+    unset?: string;
+    notLoaded?: string;
+    useAs?: string;
+    current?: string;
+    auxiliaryTaskHeading?: string;
+    allAuxiliaryTasks?: string;
+    resetAllToAuto?: string;
+    auxModalDesc?: string;
   };
 
   // ── Logs page ──
@@ -305,6 +326,29 @@ export interface Translations {
     /** Optional — English fallback until translated. */
     loadWhat?: string;
     scriptRequired?: string;
+    jobsTab?: string;
+    blueprintsTab?: string;
+    editJob?: string;
+    saveChanges?: string;
+    skillsOptional?: string;
+    noSkillsInstalled?: string;
+    skillsHint?: string;
+    advancedFields?: string;
+    provider?: string;
+    model?: string;
+    defaultOption?: string;
+    baseUrlOverride?: string;
+    noAgentLabel?: string;
+    scriptLabel?: string;
+    workdirLabel?: string;
+    continuityLabel?: string;
+    contextFromLabel?: string;
+    contextFromPlaceholder?: string;
+    enabledToolsetsLabel?: string;
+    noToolsetsAvailable?: string;
+    profileLabel?: string;
+    allProfiles?: string;
+    repeatLabel?: string;
     confirmDeleteMessage: string;
     confirmDeleteTitle: string;
     newJob: string;
@@ -433,6 +477,10 @@ export interface Translations {
     catalogConfirmInstallNote?: string;
     catalogRequiresEnv?: string;
     removedFromCatalog?: string;
+    providersSubheading?: string;
+    builtinMemoryHint?: string;
+    saveMemoryProvider?: string;
+    saveContextEngine?: string;
   };
 
   // ── Profiles page ──
@@ -500,6 +548,7 @@ export interface Translations {
     actions?: string;
     manageSkills?: string;
     activeSetHint?: string;
+    buildBtn?: string;
   };
 
   // ── Skills page ──
@@ -510,6 +559,22 @@ export interface Translations {
     loadWhat?: string;
     browseHub?: string;
     createSkill?: string;
+    learnSkill?: string;
+    newSkill?: string;
+    configure?: string;
+    learnSkillDesc?: string;
+    localFileOrDir?: string;
+    urlLabel?: string;
+    anythingElseLabel?: string;
+    learnIt?: string;
+    hubSearchPlaceholder?: string;
+    updateAll?: string;
+    featuredSkills?: string;
+    featuredSkillsHint?: string;
+    connectedHubs?: string;
+    details?: string;
+    install?: string;
+    installed?: string;
     enabledOf: string;
     all: string;
     categories: string;
@@ -600,6 +665,9 @@ export interface Translations {
     customKeyNamePlaceholder: string;
     add: string;
     invalidKeyName: string;
+    providersNav?: string;
+    toolsNav?: string;
+    settingsNav?: string;
   };
 
   // ── OAuth ──
@@ -1000,6 +1068,12 @@ export interface Translations {
     cancel: string;
     saving: string;
     saveAndEnable: string;
+    configureTitle?: string;
+    useOwnTelegramBot?: string;
+    botFatherGuide?: string;
+    setupGuide?: string;
+    secretSetPlaceholder?: string;
+    callbackUrlLabel?: string;
   };
 
   pairingPage?: {
@@ -1061,6 +1135,32 @@ export interface Translations {
     installing: string;
     install: string;
     installed: string;
+    nameLabel?: string;
+    transportLabel?: string;
+    urlLabel?: string;
+    authLabel?: string;
+    authNone?: string;
+    authBearer?: string;
+    authOauth?: string;
+    bearerHint?: string;
+    oauthHint?: string;
+    commandLabel?: string;
+    argsLabel?: string;
+    envLabel?: string;
+    adding?: string;
+    add?: string;
+    installTitle?: string;
+    installModalDesc?: string;
+    authenticate?: string;
+    enable?: string;
+    disable?: string;
+    testConnection?: string;
+    delete?: string;
+    endpointLabel?: string;
+    runsLabel?: string;
+    installsFromLabel?: string;
+    bootstrapCommands?: string;
+    setupNotes?: string;
   };
 
   systemPage?: {
@@ -1087,5 +1187,16 @@ export interface Translations {
     migrateConfig: string;
     prune: string;
     newHook: string;
+    newShellHookTitle?: string;
+    eventLabel?: string;
+    commandLabel?: string;
+    matcherLabel?: string;
+    timeoutLabel?: string;
+    approveNowLabel?: string;
+    hookSecurityWarning?: string;
+    createHookBtn?: string;
+    creatingHookBtn?: string;
+    noShellHooks?: string;
+    changeInPlugins?: string;
   };
 }

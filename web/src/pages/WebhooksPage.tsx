@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   AlertTriangle,
   Check,
@@ -292,7 +293,7 @@ export default function WebhooksPage() {
       />
 
       {/* Create subscription modal */}
-      {createModalOpen && (
+      {createModalOpen && createPortal(
         <div
           ref={createModalRef}
           className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
@@ -301,7 +302,7 @@ export default function WebhooksPage() {
           aria-modal="true"
           aria-labelledby="create-webhook-title"
         >
-          <div className={cn(themedBody, "relative w-full max-w-lg border border-border bg-card shadow-2xl flex flex-col max-h-[90vh] overflow-y-auto")}>
+          <div className={cn(themedBody, "relative w-full max-w-lg border border-border bg-card shadow-2xl flex flex-col max-h-[90dvh] overflow-y-auto")}>
             <Button
               ghost
               size="icon"
@@ -439,7 +440,8 @@ export default function WebhooksPage() {
               </div>
             )}
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
 
       {!enabled && (
