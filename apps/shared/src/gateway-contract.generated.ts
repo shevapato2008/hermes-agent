@@ -4843,15 +4843,18 @@ export interface SessionMutateResult {
   revision?: number | null
   [key: string]: unknown
 }
-/** Exactly one of ``filters`` (``SessionDB.prune_sessions`` keyword filters, as ``hermes sessions prune`` builds them) or ``never_active_days`` (``--never-active``). */
+/** Exactly one of ``filters`` (``SessionDB.prune_sessions`` keyword filters, as ``hermes sessions prune`` builds them), ``never_active_days`` (``--never-active``), ``empty`` (empty-session sweep), or ``ids`` (bulk session delete). */
 export interface SessionPruneParams {
   filters?: Record<string, unknown> | null
   never_active_days?: number | null
+  empty?: boolean | null
+  ids?: string[] | null
 }
 export interface SessionPruneResult {
   deleted: number
   routing_deleted?: number | null
   skipped?: number | null
+  skipped_active?: string[] | null
 }
 export interface CommandObserveParams {
   session_id: string

@@ -268,6 +268,72 @@ _MUTATION_REFUSAL_STATUS = {'permission_denied': 403, 'profile_mismatch': 403, '
                             'invalid_params': 400, 'runtime_draining': 503, 'storage_unavailable': 503}
 
 
+def _composed_authority_for_home(request, home: Path):
+    """Return the composed in-process SessionAuthority for *home* when mounted on *request*."""
+    state = getattr(getattr(request, 'app', None), 'state', None)
+    if state is None:
+        return None
+    runner = getattr(state, 'gateway_runner', None)
+    if runner is not None:
+        from gateway.session_authorities import authority_for_home
+        owner = authority_for_home(runner, home)
+        if owner is not None:
+            return owner
+    authority = getattr(state, 'session_authority', None)
+    if authority is not None and home.resolve() == Path(authority.db.db_path).parent.resolve():
+        return authority
+    return None
+
+
+async def _prune_via_gateway_owner(request, profile, rpc_params, offline_fn):
+    """Run store-wide session deletion through the composed authority, live gateway owner, or offline lock."""
+    from fastapi import HTTPException
+    from gateway.runtime_ownership import OwnershipConflict
+    from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError, connect_gateway
+    from hermes_cli.gateway_runtime import discover_gateway_endpoint
+    from hermes_cli.gateway_runtime_discovery import DiscoveryError
+    from hermes_cli.sessions_owner import PRUNE_RPC_TIMEOUT
+    from hermes_cli.web_server_cron import _cron_profile_home
+    from hermes_state import _default_db_path
+
+    home = Path(_cron_profile_home(profile)[1]) if profile else Path(_default_db_path()).parent
+    authority = _composed_authority_for_home(request, home)
+    if authority is not None:
+        from gateway.session_prune import _apply as apply_prune
+        from gateway.session_runtime_workers import track_mutation
+        from hermes_state_runtime import RuntimeStoreError
+        try:
+            authority._require_admission_open()
+            task = track_mutation(
+                authority,
+                apply_prune(authority, rpc_params.get('filters'), rpc_params.get('never_active_days'),
+                            empty=bool(rpc_params.get('empty')), ids=rpc_params.get('ids')))
+            return await asyncio.shield(task)
+        except RuntimeStoreError as exc:
+            raise HTTPException(status_code=_MUTATION_REFUSAL_STATUS.get(exc.reason, 400), detail=exc.reason) from exc
+
+    discovery = await asyncio.to_thread(discover_gateway_endpoint, home, timeout=1.5)
+    endpoint = discovery.endpoint
+    if endpoint is None:
+        try:
+            return await asyncio.to_thread(_with_session_maintenance, profile, offline_fn)
+        except HTTPException as exc:
+            if discovery.state in ('absent', 'starting') or not isinstance(exc.__cause__, OwnershipConflict):
+                raise
+            reason = discovery.reason_code or discovery.state
+            raise HTTPException(status_code=503, detail=f'owner_unavailable: {reason}: {exc.detail}') from exc
+    if not getattr(endpoint, 'control_home', True):
+        from dataclasses import replace
+        endpoint = replace(endpoint, control_home=str(home.expanduser().resolve()))
+    try:
+        async with connect_gateway(endpoint=endpoint) as client:
+            return await client.rpc('session.prune', _timeout=PRUNE_RPC_TIMEOUT, **rpc_params)
+    except GatewayRPCError as exc:
+        raise HTTPException(status_code=_MUTATION_REFUSAL_STATUS.get(str(exc), 400), detail=str(exc)) from exc
+    except (GatewayClientError, DiscoveryError, OSError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail='owner_unreachable') from exc
+
+
 async def _mutate_session_request(request, profile, session_id, *, request_id,
                                   expected_revision, operation, payload, expected_generation=None):
     """Resolve the authenticated principal and owner; never open a second writer."""

@@ -21,6 +21,13 @@ def _filters(raw):
     return dict(raw)
 
 
+def _ids(raw):
+    if (not isinstance(raw, list) or len(raw) > 500
+            or not all(isinstance(sid, str) and sid for sid in raw)):
+        raise RuntimeStoreError('invalid_params')
+    return list(raw)
+
+
 async def prune(connection, ref, params):
     authority, actor = connection.authority, connection.actor
     # Store-wide deletion across every principal's rows: the local operator only (a ticket from
@@ -29,25 +36,41 @@ async def prune(connection, ref, params):
         raise RuntimeStoreError('permission_denied')
     if actor.profile_id != authority.profile_id:
         raise RuntimeStoreError('profile_mismatch')
+    has_filters = params.get('filters') is not None
     never_active = params.get('never_active_days')
-    if ('filters' in params) == (never_active is not None) or (
-            never_active is not None and (isinstance(never_active, bool) or not isinstance(never_active, (int, float))
-                                          or never_active < 0)):
+    empty = params.get('empty')
+    has_ids = params.get('ids') is not None
+    if (empty not in (None, True)
+            or sum((has_filters, never_active is not None, empty is True, has_ids)) != 1
+            or (never_active is not None and (isinstance(never_active, bool)
+                                              or not isinstance(never_active, (int, float))
+                                              or never_active < 0))):
         raise RuntimeStoreError('invalid_params')
-    filters = _filters(params['filters']) if 'filters' in params else None
+    filters = _filters(params['filters']) if has_filters else None
+    ids = _ids(params['ids']) if has_ids else None
     authority._require_admission_open()
     from gateway.session_runtime_workers import track_mutation
-    task = track_mutation(authority, _apply(authority, filters, never_active))
+    task = track_mutation(authority, _apply(authority, filters, never_active, empty=bool(empty), ids=ids))
     return await asyncio.shield(task)
 
 
-async def _apply(authority, filters, never_active):
-    from hermes_constants import get_hermes_home
+async def _apply(authority, filters=None, never_active=None, *, empty=False, ids=None):
     from gateway.session_mutations import retire_live_sessions
-    # Same transcript dir the CLI's local prune unlinks under (dispatch runs in the owner's scope).
-    sessions_dir = Path(get_hermes_home()) / 'sessions'
+    # Resolve from the profile authority's own db_path so any served profile unlinks its own transcripts.
+    sessions_dir = Path(authority.db.db_path).parent / 'sessions'
     deleted_ids = []
-    if filters is None:
+    if empty:
+        deleted = await asyncio.to_thread(
+            authority.db.delete_empty_sessions, sessions_dir=sessions_dir, deleted_ids=deleted_ids)
+        result = {'deleted': deleted}
+    elif ids is not None:
+        skipped_active = []
+        deleted = await asyncio.to_thread(
+            authority.db.delete_sessions, ids, sessions_dir=sessions_dir,
+            exclude_active_write_guards=True, skipped_ids=skipped_active,
+            include_compression_chain=True, deleted_ids=deleted_ids)
+        result = {'deleted': deleted, 'skipped_active': skipped_active}
+    elif filters is None:
         deleted, routing, skipped = await asyncio.to_thread(
             authority.db.prune_never_active_keyed_sessions, older_than_days=float(never_active),
             sessions_dir=sessions_dir, deleted_ids=deleted_ids)

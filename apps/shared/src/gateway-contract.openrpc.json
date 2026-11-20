@@ -39519,7 +39519,7 @@
       },
       "SessionPruneParams": {
         "additionalProperties": false,
-        "description": "Exactly one of ``filters`` (``SessionDB.prune_sessions`` keyword filters, as\n``hermes sessions prune`` builds them) or ``never_active_days`` (``--never-active``).",
+        "description": "Exactly one of ``filters`` (``SessionDB.prune_sessions`` keyword filters, as\n``hermes sessions prune`` builds them), ``never_active_days`` (``--never-active``),\n``empty`` (empty-session sweep), or ``ids`` (bulk session delete).",
         "properties": {
           "filters": {
             "anyOf": [
@@ -39545,6 +39545,33 @@
             ],
             "default": null,
             "title": "Never Active Days"
+          },
+          "empty": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Empty"
+          },
+          "ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ids"
           }
         },
         "title": "SessionPruneParams",
@@ -39580,6 +39607,21 @@
             ],
             "default": null,
             "title": "Skipped"
+          },
+          "skipped_active": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Skipped Active"
           }
         },
         "required": [

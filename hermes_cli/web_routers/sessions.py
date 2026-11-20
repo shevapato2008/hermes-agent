@@ -74,9 +74,7 @@ _PRUNE_NUM_FILTERS = (
 _PRUNE_ROW_KEYS = ("id", "source", "title", "model", "started_at", "last_active", "message_count")
 
 
-def _prune_sessions(body: SessionPrune):
-    """Delete ended sessions matching filters (mirrors `hermes sessions prune`)."""
-    from hermes_cli.config import get_hermes_home
+def _prune_filters(body: SessionPrune) -> dict:
     has_window = body.started_before is not None or body.started_after is not None
     if body.older_than_days is not None and body.older_than_days < 1 and not has_window:
         raise HTTPException(status_code=400, detail="older_than_days must be >= 1")
@@ -88,15 +86,21 @@ def _prune_sessions(body: SessionPrune):
     effective_older_than = body.older_than_days
     if has_window or (attr_filters_set and "older_than_days" not in body.model_fields_set):
         effective_older_than = None
+    return {
+        "older_than_days": effective_older_than, "started_before": body.started_before,
+        "started_after": body.started_after,
+        "archived": None if body.include_archived else False,
+        **{f: (getattr(body, f) or None) for f in _PRUNE_STR_FILTERS},
+        **{f: getattr(body, f) for f in _PRUNE_NUM_FILTERS}}
+
+
+def _prune_sessions(body: SessionPrune):
+    """Delete ended sessions matching filters (mirrors `hermes sessions prune`)."""
+    from hermes_cli.config import get_hermes_home
+    filters = _prune_filters(body)
     profile_home = _cron_profile_home(body.profile)[1] if body.profile else get_hermes_home()
     db = _open_session_db_for_profile(body.profile, read_only=body.dry_run)
     try:
-        filters = {
-            "older_than_days": effective_older_than, "started_before": body.started_before,
-            "started_after": body.started_after,
-            "archived": None if body.include_archived else False,
-            **{f: (getattr(body, f) or None) for f in _PRUNE_STR_FILTERS},
-            **{f: getattr(body, f) for f in _PRUNE_NUM_FILTERS}}
         skipped_open = db.count_open_prune_matches(**filters)
         if body.dry_run:
             # Same whole-lineage selection prune_sessions applies, so the preview lists what it deletes.
@@ -464,7 +468,7 @@ async def search_sessions(
 
 
 @manage_router.post("/api/sessions/bulk-delete")
-async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
+async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions, request: Request = None):
     """Delete every session in ``body.ids`` in one transaction (POST: many
     clients refuse a DELETE body).
 
@@ -482,11 +486,21 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
     if len(body.ids) > 500:
         raise HTTPException(status_code=400, detail="ids must contain at most 500 entries")
     profile = destructive_profile(body.profile, "POST /api/sessions/bulk-delete")
-    skipped: list[str] = []  # rows a live turn/compression still owns; the UI must keep them listed
-    deleted = await asyncio.to_thread(_with_db, profile, lambda db: db.delete_sessions(
-        body.ids, exclude_active_write_guards=True, skipped_ids=skipped,
-        include_compression_chain=True), read_only=False)
-    return {"ok": True, "deleted": deleted, "skipped_active": skipped}
+    from hermes_cli.web_server_sessions import _prune_via_gateway_owner
+
+    def _offline():
+        skipped: list[str] = []  # rows a live turn/compression still owns; the UI must keep them listed
+        db = _open_session_db_for_profile(profile, read_only=False)
+        try:
+            deleted = db.delete_sessions(
+                body.ids, exclude_active_write_guards=True, skipped_ids=skipped,
+                include_compression_chain=True)
+        finally:
+            db.close()
+        return {"deleted": deleted, "skipped_active": skipped}
+
+    res = await _prune_via_gateway_owner(request, profile, {"ids": list(body.ids)}, _offline)
+    return {"ok": True, "deleted": res["deleted"], "skipped_active": res.get("skipped_active", [])}
 
 
 @manage_router.post("/api/sessions/import")
@@ -517,7 +531,7 @@ async def count_empty_sessions_endpoint(profile: Optional[str] = None):
 
 
 @manage_router.delete("/api/sessions/empty")
-async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
+async def delete_empty_sessions_endpoint(request: Request = None, profile: Optional[str] = None):
     """Delete every empty, ended, non-archived session in one transaction.
 
     "Empty" means NO ``messages`` rows at all — a rewound/compacted chat reads
@@ -529,10 +543,18 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     parents are orphaned, not cascade-deleted. See #95868.
     """
     profile = destructive_profile(profile, "DELETE /api/sessions/empty")
-    deleted = await asyncio.to_thread(
-        _with_db, profile,
-        lambda db: db.delete_empty_sessions(sessions_dir=_session_files_dir(profile)), read_only=False)
-    return {"ok": True, "deleted": deleted}
+    from hermes_cli.web_server_sessions import _prune_via_gateway_owner
+
+    def _offline():
+        db = _open_session_db_for_profile(profile, read_only=False)
+        try:
+            deleted = db.delete_empty_sessions(sessions_dir=_session_files_dir(profile))
+        finally:
+            db.close()
+        return {"deleted": deleted}
+
+    res = await _prune_via_gateway_owner(request, profile, {"empty": True}, _offline)
+    return {"ok": True, "deleted": res["deleted"]}
 
 
 @manage_router.get("/api/sessions/stats")
@@ -982,13 +1004,22 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
 
 
 @manage_router.post("/api/sessions/prune")
-async def prune_sessions_endpoint(body: SessionPrune):
+async def prune_sessions_endpoint(body: SessionPrune, request: Request = None):
     """Delete ended sessions matching filters without blocking the event loop."""
     if body.dry_run:
         return await asyncio.to_thread(_prune_sessions, body)
+    filters = _prune_filters(body)
     # Same destructive rule as the rest of the family; a dry run deletes nothing, so it
     # keeps working unnamed (it is the preview the confirm dialog reads).
-    body = body.model_copy(update={
-        "profile": destructive_profile(body.profile, "POST /api/sessions/prune")})
-    from hermes_cli.web_server_sessions import _with_session_maintenance
-    return await asyncio.to_thread(_with_session_maintenance, body.profile, _prune_sessions, body)
+    profile = destructive_profile(body.profile, "POST /api/sessions/prune")
+    body = body.model_copy(update={"profile": profile})
+    from hermes_cli.web_server_sessions import _prune_via_gateway_owner
+    res = await _prune_via_gateway_owner(
+        request, profile, {"filters": filters},
+        lambda: {"deleted": (out := _prune_sessions(body))["removed"], "skipped_open": out["skipped_open"]})
+    if "skipped_open" in res:
+        skipped_open = res["skipped_open"]
+    else:
+        skipped_open = await asyncio.to_thread(
+            _with_db, profile, lambda db: db.count_open_prune_matches(**filters), read_only=True)
+    return {"ok": True, "removed": res["deleted"], "skipped_open": skipped_open}

@@ -1846,7 +1846,7 @@ class SessionSessionsMixin:
     def delete_sessions(
         self, session_ids: list[str], sessions_dir: Optional[Path] = None,
         exclude_active_write_guards: bool = False, skipped_ids: Optional[list[str]] = None,
-        include_compression_chain: bool = False,
+        include_compression_chain: bool = False, deleted_ids: Optional[list[str]] = None,
     ) -> int:
         """Bulk delete with :meth:`delete_session` semantics per row, in ONE transaction. Unknown ids
         are skipped (UI selection can race another tab's delete). With ``exclude_active_write_guards``, rows
@@ -1931,6 +1931,8 @@ class SessionSessionsMixin:
         collect_retired_media(self)
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
+        if deleted_ids is not None:
+            deleted_ids.extend(removed_ids)
         return count
 
     # Shared by count_empty_sessions / delete_empty_sessions so badge and sweep agree. message_count
@@ -1946,7 +1948,7 @@ class SessionSessionsMixin:
         """Count of empty, ended, non-archived sessions; ended_at guards a fresh session's first message."""
         return self._read_one(f"SELECT COUNT(*) FROM sessions WHERE {self._EMPTY_SESSION_WHERE}")[0]
 
-    def delete_empty_sessions(self, sessions_dir: Optional[Path] = None) -> int:
+    def delete_empty_sessions(self, sessions_dir: Optional[Path] = None, deleted_ids: Optional[list[str]] = None) -> int:
         """Delete every empty, ended, non-archived session in one transaction, orphaning (not cascading)
         children; transcript files are swept too."""
         removed_ids: list[str] = []
@@ -1975,6 +1977,8 @@ class SessionSessionsMixin:
         collect_retired_media(self)
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
+        if deleted_ids is not None:
+            deleted_ids.extend(removed_ids)
         return count
 
     def archive_sessions(

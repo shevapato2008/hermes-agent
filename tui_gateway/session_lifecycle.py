@@ -390,7 +390,7 @@ def _transfer_active_session_slot(sid: str, session: dict, *, new_session_id: st
 # the CLI's own sessions are NOT gateway-owned. See #60609.
 _NON_GATEWAY_SOURCES = frozenset({
     "", "tui", "cli", "webui", "desktop", "cron", "kanban", "subagent", "test",
-    "local", "acp", "webhook", "api_server", "msgraph_webhook"})
+    "local", "acp", "webhook", "api_server", "msgraph_webhook", "smartbox_voice"})
 
 
 def _is_gateway_owned_source(source: str) -> bool:

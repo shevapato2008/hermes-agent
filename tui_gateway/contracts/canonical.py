@@ -115,16 +115,20 @@ canonical_method("session.mutate", params=SessionMutateParams, result=SessionMut
 
 class SessionPruneParams(Params):
     """Exactly one of ``filters`` (``SessionDB.prune_sessions`` keyword filters, as
-    ``hermes sessions prune`` builds them) or ``never_active_days`` (``--never-active``)."""
+    ``hermes sessions prune`` builds them), ``never_active_days`` (``--never-active``),
+    ``empty`` (empty-session sweep), or ``ids`` (bulk session delete)."""
 
     filters: dict[str, JsonValue] | None = None
     never_active_days: float | None = None
+    empty: bool | None = None
+    ids: list[str] | None = None
 
 
 class SessionPruneResult(Result):
     deleted: int
     routing_deleted: int | None = None
     skipped: int | None = None
+    skipped_active: list[str] | None = None
 
 
 canonical_method("session.prune", params=SessionPruneParams, result=SessionPruneResult,
