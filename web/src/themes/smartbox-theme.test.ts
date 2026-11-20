@@ -19,7 +19,7 @@ describe("SmartBox 7-inch default theme and KaiTi font stacks", () => {
       "smartbox-7inch-c",
     ]);
     expect(BUILTIN_THEMES["smartbox-7inch"]).toBe(smartbox7InchTheme);
-    expect(smartbox7InchTheme.label).toBe("智星盒 7″ · 方案A 大字 (20px)");
+    expect(smartbox7InchTheme.label).toBe("字体大小 20px");
     expect(smartbox7InchTheme.typography.baseSize).toBe("20px");
     expect(smartbox7InchTheme.typography.lineHeight).toBe("1.55");
     expect(smartbox7InchTheme.terminalFontSize).toBe(19);
@@ -28,7 +28,7 @@ describe("SmartBox 7-inch default theme and KaiTi font stacks", () => {
     expect(smartbox7InchTheme.terminalForeground).toBe("#fff2df");
 
     const preset18 = BUILTIN_THEMES["smartbox-7inch-18"];
-    expect(preset18.label).toBe("智星盒 7″ · 标准字号 (18px)");
+    expect(preset18.label).toBe("字体大小 18px");
     expect(preset18.typography.baseSize).toBe("18px");
     expect(preset18.typography.lineHeight).toBe("1.58");
     expect(preset18.terminalFontSize).toBe(18);
@@ -37,7 +37,7 @@ describe("SmartBox 7-inch default theme and KaiTi font stacks", () => {
     expect(preset18.customCSS).toContain("--text-xs: max(0.75rem, 14px)");
 
     const presetB = BUILTIN_THEMES["smartbox-7inch-b"];
-    expect(presetB.label).toBe("智星盒 7″ · 方案B 特大 (22px)");
+    expect(presetB.label).toBe("字体大小 22px");
     expect(presetB.typography.baseSize).toBe("22px");
     expect(presetB.typography.lineHeight).toBe("1.52");
     expect(presetB.terminalFontSize).toBe(21);
@@ -47,7 +47,7 @@ describe("SmartBox 7-inch default theme and KaiTi font stacks", () => {
     expect(presetB.customCSS).toContain("font-size: 20px");
 
     const presetC = BUILTIN_THEMES["smartbox-7inch-c"];
-    expect(presetC.label).toBe("智星盒 7″ · 方案C 适老 (24px)");
+    expect(presetC.label).toBe("字体大小 24px");
     expect(presetC.typography.baseSize).toBe("24px");
     expect(presetC.typography.lineHeight).toBe("1.48");
     expect(presetC.terminalFontSize).toBe(23);

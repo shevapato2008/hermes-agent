@@ -35,7 +35,7 @@ def test_builtin_themes_font_choices_and_config_schema_synced():
         "smartbox-7inch-b",
         "smartbox-7inch-c",
     ]
-    assert _BUILTIN_DASHBOARD_THEMES[0]["label"] == "智星盒 7″ · 方案A 大字 (20px)"
+    assert _BUILTIN_DASHBOARD_THEMES[0]["label"] == "字体大小 20px"
     assert "kaiti" in _FONT_CHOICES
     schema_options = list(CONFIG_SCHEMA["dashboard.theme"]["options"])
     assert schema_options[:4] == [

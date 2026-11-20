@@ -343,8 +343,8 @@ const SMARTBOX_7INCH_OPTION_C_CSS = buildSmartbox7InchCustomCss({
 
 export const smartbox7InchTheme: DashboardTheme = {
   name: "smartbox-7inch",
-  label: "智星盒 7″ · 方案A 大字 (20px)",
-  description: "7-inch 1024×600 high-contrast KaiTi touch layout (20px Option A)",
+  label: "字体大小 20px",
+  description: "7 英寸触控大字布局（推荐 20px）",
   palette: defaultTheme.palette,
   typography: {
     ...DEFAULT_TYPOGRAPHY,
@@ -365,8 +365,8 @@ export const smartbox7InchTheme: DashboardTheme = {
 
 export const smartbox7Inch18Theme: DashboardTheme = {
   name: "smartbox-7inch-18",
-  label: "智星盒 7″ · 标准字号 (18px)",
-  description: "7-inch 1024×600 high-contrast KaiTi touch layout (18px Standard)",
+  label: "字体大小 18px",
+  description: "7 英寸触控标准字号（18px）",
   palette: defaultTheme.palette,
   typography: {
     ...DEFAULT_TYPOGRAPHY,
@@ -387,8 +387,8 @@ export const smartbox7Inch18Theme: DashboardTheme = {
 
 export const smartbox7InchBTheme: DashboardTheme = {
   name: "smartbox-7inch-b",
-  label: "智星盒 7″ · 方案B 特大 (22px)",
-  description: "7-inch 1024×600 high-contrast KaiTi touch layout (22px Option B)",
+  label: "字体大小 22px",
+  description: "7 英寸触控特大字号（22px）",
   palette: defaultTheme.palette,
   typography: {
     ...DEFAULT_TYPOGRAPHY,
@@ -409,8 +409,8 @@ export const smartbox7InchBTheme: DashboardTheme = {
 
 export const smartbox7InchCTheme: DashboardTheme = {
   name: "smartbox-7inch-c",
-  label: "智星盒 7″ · 方案C 适老 (24px)",
-  description: "7-inch 1024×600 high-contrast KaiTi touch layout (24px Option C)",
+  label: "字体大小 24px",
+  description: "7 英寸触控超大字号（24px）",
   palette: defaultTheme.palette,
   typography: {
     ...DEFAULT_TYPOGRAPHY,

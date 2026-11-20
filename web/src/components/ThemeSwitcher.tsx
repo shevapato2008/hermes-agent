@@ -69,19 +69,22 @@ export function ThemeSwitcher({ collapsed = false, dropUp = false }: ThemeSwitch
         className={cn(
           collapsed
             ? "text-text-secondary hover:text-foreground hover:bg-transparent"
-            : "px-2 py-1.5 normal-case tracking-normal font-normal text-xs text-text-secondary hover:text-foreground",
+            : cn(
+                dropUp ? "px-0" : "px-2",
+                "py-1.5 normal-case tracking-normal font-normal text-xs text-text-secondary hover:text-foreground",
+              ),
         )}
         title={`${t.theme?.switchTheme ?? "Switch theme"}: ${label}`}
         aria-label={t.theme?.switchTheme ?? "Switch theme"}
         aria-expanded={open}
         aria-haspopup="listbox"
       >
-        <span className="inline-flex items-center gap-1.5">
-          <Palette className="h-3.5 w-3.5" />
-
-          {!collapsed && (
+        <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+          {collapsed ? (
+            <Palette className="h-3.5 w-3.5 shrink-0" />
+          ) : (
             <Typography
-              className="hidden sm:inline text-display tracking-wide text-xs"
+              className="inline whitespace-nowrap text-display tracking-normal text-[min(var(--text-xs,0.75rem),17px)]"
             >
               {label}
             </Typography>

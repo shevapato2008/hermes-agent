@@ -72,13 +72,14 @@ export function LanguageSwitcher({ collapsed = false, dropUp = false }: Language
         aria-haspopup="listbox"
         aria-expanded={open}
         className={cn(
-          "px-2 py-1.5 normal-case tracking-normal font-normal text-xs text-text-secondary hover:text-foreground",
+          dropUp && !collapsed ? "px-0" : "px-2",
+          "py-1.5 normal-case tracking-normal font-normal text-xs text-text-secondary hover:text-foreground",
           collapsed && "hover:bg-transparent",
         )}
       >
-        <span className="inline-flex items-center gap-1.5">
+        <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
           <Typography
-            className="hidden sm:inline text-display tracking-wide text-xs"
+            className="inline whitespace-nowrap text-display tracking-normal text-[min(var(--text-xs,0.75rem),17px)]"
           >
             {locale === "en" ? "EN" : current.name}
           </Typography>

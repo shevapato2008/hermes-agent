@@ -679,18 +679,18 @@ export default function App() {
 
             <div
               className={cn(
-                "flex shrink-0 items-center gap-2",
-                "px-3 py-2",
+                "flex shrink-0 items-center gap-1",
+                "px-[20px] py-2",
                 "border-t border-current/20",
                 isDesktopCollapsed
-                  ? "lg:flex-col lg:items-start lg:gap-3 lg:py-3"
+                  ? "lg:flex-col lg:items-start lg:gap-3 lg:px-3 lg:py-3"
                   : "justify-between",
               )}
             >
               <div
                 className={cn(
-                  "flex min-w-0 items-center gap-2",
-                  isDesktopCollapsed && "lg:flex-col lg:items-start",
+                  "flex w-full min-w-0 items-center justify-between gap-1",
+                  isDesktopCollapsed && "lg:w-auto lg:flex-col lg:items-start",
                 )}
               >
                 <PluginSlot name="header-right" />

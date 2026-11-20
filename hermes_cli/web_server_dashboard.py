@@ -303,7 +303,7 @@ def mount_spa(application: FastAPI):
             and file_path.exists()
             and file_path.is_file()
         ):
-            return FileResponse(file_path)
+            return FileResponse(file_path, headers=None if is_static_asset_path(full_path) else _NO_STORE)
         if is_static_asset_path(full_path):
             font = public_font_file(dist, WEB_DIST, full_path)
             if font is not None:
@@ -318,10 +318,10 @@ def mount_spa(application: FastAPI):
 
 # Built-in themes — label + description only; colors live in web/src/themes/presets.ts.
 _BUILTIN_DASHBOARD_THEMES = [
-    {"name": "smartbox-7inch",    "label": "智星盒 7″ · 方案A 大字 (20px)", "description": "7-inch 1024×600 high-contrast KaiTi touch layout (20px Option A)"},
-    {"name": "smartbox-7inch-18", "label": "智星盒 7″ · 标准字号 (18px)",   "description": "7-inch 1024×600 high-contrast KaiTi touch layout (18px Standard)"},
-    {"name": "smartbox-7inch-b",  "label": "智星盒 7″ · 方案B 特大 (22px)", "description": "7-inch 1024×600 high-contrast KaiTi touch layout (22px Option B)"},
-    {"name": "smartbox-7inch-c",  "label": "智星盒 7″ · 方案C 适老 (24px)", "description": "7-inch 1024×600 high-contrast KaiTi touch layout (24px Option C)"},
+    {"name": "smartbox-7inch",    "label": "字体大小 20px", "description": "7 英寸触控大字布局（推荐 20px）"},
+    {"name": "smartbox-7inch-18", "label": "字体大小 18px", "description": "7 英寸触控标准字号（18px）"},
+    {"name": "smartbox-7inch-b",  "label": "字体大小 22px", "description": "7 英寸触控特大字号（22px）"},
+    {"name": "smartbox-7inch-c",  "label": "字体大小 24px", "description": "7 英寸触控超大字号（24px）"},
     {"name": "default",       "label": "Hermes Teal",         "description": "Classic dark teal — the canonical Hermes look"},
     {"name": "default-large", "label": "Hermes Teal (Large)", "description": "Hermes Teal with bigger fonts and roomier spacing"},
     {"name": "nous-blue",     "label": "Nous Blue",           "description": "Light mode — vivid Nous-blue accents on cream canvas"},
