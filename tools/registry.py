@@ -100,7 +100,7 @@ def _module_registers_tools(module_path: Path) -> bool:
         if "registry" not in source or "register" not in source:
             return False
         tree = ast.parse(source, filename=str(module_path))
-    except (OSError, SyntaxError):
+    except (OSError, SyntaxError, UnicodeDecodeError):
         return False
     # Table-driven modules register several tools from one loop, still at import time.
     return any(
@@ -114,7 +114,10 @@ def _tool_module_candidates(tools_path: Path) -> list[Path]:
     sorted list. Only ``tool.py`` is scanned in a package, so every other file in it is a library
     by construction. Sorted after merging: ``register()`` lets a same-name, same-toolset duplicate
     overwrite silently, so the import order must not depend on file depth."""
-    candidates = list(tools_path.glob("*.py")) + list(tools_path.glob("*/tool.py"))
+    candidates = [
+        p for p in (list(tools_path.glob("*.py")) + list(tools_path.glob("*/tool.py")))
+        if not p.name.startswith(".") and not p.parent.name.startswith(".")
+    ]
     return sorted(candidates)
 
 
